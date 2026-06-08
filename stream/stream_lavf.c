@@ -15,8 +15,11 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <limits.h>
+
 #include <libavformat/avformat.h>
 #include <libavformat/avio.h>
+#include <libavutil/base64.h>
 #include <libavutil/opt.h>
 
 #include "options/path.h"
@@ -53,6 +56,11 @@ const struct m_sub_options stream_lavf_conf = {
 
 static const char *const http_like[] =
     {"http", "https", "mmsh", "mmshttp", "httproxy", NULL};
+
+#define DATA_URI_PREFIX "data:"
+#define DATA_URI_DEFAULT_MIME_TYPE "text/plain"
+#define DATA_URI_BASE64_OPTION "base64"
+#define DATA_URI_MAX_DECODED_SIZE ((size_t)(INT_MAX - 1) / 4 * 3)
 
 static int open_f(stream_t *stream);
 static struct mp_tags *read_icy(stream_t *stream);
@@ -266,11 +274,14 @@ static char **get_safe_protocols(void)
         }
     }
 
+    MP_TARRAY_APPEND(NULL, protocols, num, talloc_strdup(protocols, "proxy"));
+
     // rtsp is a demuxer not protocol in ffmpeg so it is handled separately
     for (int i = 0; ffmpeg_demuxers[i]; i++) {
         if (strcmp("rtsp", ffmpeg_demuxers[i]) == 0) {
             MP_TARRAY_APPEND(NULL, protocols, num, talloc_strdup(protocols, "rtsp"));
             MP_TARRAY_APPEND(NULL, protocols, num, talloc_strdup(protocols, "rtsps"));
+            MP_TARRAY_APPEND(NULL, protocols, num, talloc_strdup(protocols, "rtspt"));
             break;
         }
     }
@@ -331,6 +342,151 @@ static char *normalize_url(void *ta_parent, const char *filename)
     return (char *)filename;
 }
 
+static int data_uri_hex_to_int(unsigned char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static bool decode_data_uri_base64(void *ta_parent, bstr payload, bstr *out)
+{
+    if (payload.len > INT_MAX)
+        return false;
+
+    char *encoded = talloc_size(ta_parent, payload.len + 1);
+    size_t encoded_len = 0;
+    for (size_t n = 0; n < payload.len; n++) {
+        unsigned char c = payload.start[n];
+        if (c == '\r' || c == '\n' || c == '\t' || c == ' ')
+            continue;
+        encoded[encoded_len++] = c;
+    }
+    encoded[encoded_len] = '\0';
+
+    if (encoded_len > INT_MAX)
+        return false;
+
+    int decoded_size = (int)AV_BASE64_DECODE_SIZE(encoded_len) + 4;
+    uint8_t *decoded = talloc_size(ta_parent, decoded_size);
+    int decoded_len = av_base64_decode(decoded, encoded, decoded_size);
+    if (decoded_len < 0)
+        return false;
+
+    *out = (bstr){decoded, decoded_len};
+    return true;
+}
+
+static bool decode_data_uri_url(void *ta_parent, bstr payload, bstr *out)
+{
+    if (payload.len > DATA_URI_MAX_DECODED_SIZE)
+        return false;
+
+    unsigned char *decoded = talloc_size(ta_parent, payload.len + 1);
+    size_t decoded_len = 0;
+
+    for (size_t n = 0; n < payload.len; n++) {
+        unsigned char c = payload.start[n];
+        if (c == '+') {
+            decoded[decoded_len++] = ' ';
+        } else if (c == '%') {
+            if (n + 2 >= payload.len)
+                return false;
+            int hi = data_uri_hex_to_int(payload.start[n + 1]);
+            int lo = data_uri_hex_to_int(payload.start[n + 2]);
+            if (hi < 0 || lo < 0)
+                return false;
+            decoded[decoded_len++] = hi * 16 + lo;
+            n += 2;
+        } else {
+            decoded[decoded_len++] = c;
+        }
+    }
+
+    decoded[decoded_len] = '\0';
+    *out = (bstr){decoded, decoded_len};
+    return true;
+}
+
+static void set_stream_url(stream_t *stream, const char *url)
+{
+    talloc_free(stream->url);
+    stream->url = talloc_strdup(stream, url);
+}
+
+static bool normalize_data_uri_for_lavf(stream_t *stream, void *ta_parent,
+                                        const char **filename)
+{
+    bstr body = bstr0(*filename);
+    bstr prefix = bstr0(DATA_URI_PREFIX);
+    if (!bstr_case_startswith(body, prefix))
+        return true;
+    body = bstr_cut(body, prefix.len);
+    bstr_eatstart0(&body, "//");
+
+    bstr meta;
+    bstr payload;
+    if (!bstr_split_tok(body, ",", &meta, &payload)) {
+        MP_ERR(stream, "Invalid data URI: missing comma delimiter.\n");
+        return false;
+    }
+
+    bstr mime;
+    bstr options;
+    bstr_split_tok(meta, ";", &mime, &options);
+    char *mime_type = mime.len ? bstrto0(ta_parent, mime)
+                               : talloc_strdup(ta_parent, DATA_URI_DEFAULT_MIME_TYPE);
+
+    bool base64 = false;
+    while (options.len) {
+        bstr option;
+        bstr_split_tok(options, ";", &option, &options);
+        if (!bstrcasecmp0(option, DATA_URI_BASE64_OPTION))
+            base64 = true;
+    }
+
+    bstr decoded;
+    bool ok = base64 ? decode_data_uri_base64(ta_parent, payload, &decoded)
+                     : decode_data_uri_url(ta_parent, payload, &decoded);
+    if (!ok || decoded.len > DATA_URI_MAX_DECODED_SIZE) {
+        MP_ERR(stream, "Invalid data URI payload.\n");
+        return false;
+    }
+
+    int encoded_size = AV_BASE64_SIZE(decoded.len);
+    char *encoded = talloc_size(ta_parent, encoded_size);
+    if (!av_base64_encode(encoded, encoded_size, decoded.start, decoded.len)) {
+        MP_ERR(stream, "Failed to encode normalized data URI.\n");
+        return false;
+    }
+
+    char *normalized = talloc_asprintf(ta_parent, "data:%s;base64,%s",
+                                       mime_type, encoded);
+    *filename = normalized;
+    if (!stream->mime_type)
+        stream->mime_type = talloc_strdup(stream, mime_type);
+    set_stream_url(stream, normalized);
+    return true;
+}
+
+static void normalize_rtspt_url(stream_t *stream, void *ta_parent,
+                                const char **filename)
+{
+    bstr rest;
+    bstr proto = mp_split_proto(bstr0(*filename), &rest);
+    if (bstrcasecmp0(proto, "rtspt") != 0)
+        return;
+
+    char *normalized = talloc_asprintf(ta_parent, "rtsp://%.*s", BSTR_P(rest));
+    *filename = normalized;
+    stream->lavf_force_rtsp_tcp = true;
+    set_stream_url(stream, normalized);
+}
+
 static int open_f(stream_t *stream)
 {
     AVIOContext *avio = NULL;
@@ -351,6 +507,17 @@ static int open_f(stream_t *stream)
     for (int i = 0; i < MP_ARRAY_SIZE(prefix); i++)
         if (!strncmp(filename, prefix[i], strlen(prefix[i])))
             filename += strlen(prefix[i]);
+
+    char *rewritten = mp_rewrite_proxy_url(temp, stream->global, filename);
+    if (rewritten) {
+        MP_VERBOSE(stream, "Rewriting proxy URL to %s\n", rewritten);
+        filename = rewritten;
+        set_stream_url(stream, filename);
+    }
+    if (!normalize_data_uri_for_lavf(stream, temp, &filename))
+        goto out;
+    normalize_rtspt_url(stream, temp, &filename);
+
     if (!strncmp(filename, "rtsp:", 5) || !strncmp(filename, "rtsps:", 6)) {
         /* This is handled as a special demuxer, without a separate
          * stream layer. demux_lavf will do all the real work. Note

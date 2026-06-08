@@ -170,7 +170,8 @@ char *mp_normalize_path(void *talloc_ctx, const char *path)
     if (!path)
         return NULL;
 
-    if (mp_is_url(bstr0(path)) || !strcmp(path, "-"))
+    bstr bpath = bstr0(path);
+    if (mp_is_url(bpath) || mp_is_data_uri(bpath) || !strcmp(path, "-"))
         return talloc_strdup(talloc_ctx, path);
 
     void *tmp = talloc_new(NULL);
@@ -266,6 +267,11 @@ bool mp_path_isdir(const char *path)
 {
     struct stat st;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool mp_is_data_uri(bstr path)
+{
+    return bstr_case_startswith(path, bstr0("data:"));
 }
 
 // Return false if it's considered a normal local filesystem path.

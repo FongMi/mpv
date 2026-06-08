@@ -1293,9 +1293,8 @@ PROTOCOLS
     either aliases to documented protocols, or are just redirections to
     protocols implemented and documented in FFmpeg.
 
-    ``data:`` is supported, but needs to be in the format ``data://``.
-    This is done to avoid ambiguity with filenames. You
-    can also prefix it with ``lavf://`` or ``ffmpeg://``.
+    ``data:`` is supported. The legacy ``data://`` form is also accepted.
+    You can also prefix it with ``lavf://`` or ``ffmpeg://``.
 
 ``ytdl://...``
 

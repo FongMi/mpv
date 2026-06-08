@@ -60,6 +60,7 @@ char *mp_normalize_path(void *talloc_ctx, const char *path);
 bool mp_path_exists(const char *path);
 bool mp_path_isdir(const char *path);
 
+bool mp_is_data_uri(bstr path);
 bool mp_is_url(bstr path);
 
 bstr mp_split_proto(bstr path, bstr *out_url);
