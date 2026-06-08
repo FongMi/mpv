@@ -2053,6 +2053,42 @@ static int track_channels(struct track *track)
     return track->stream ? track->stream->codec->channels.num : 0;
 }
 
+static struct demux_packet *track_attached_picture(struct track *track)
+{
+    struct demux_packet *picture =
+        track->stream ? track->stream->attached_picture : NULL;
+    if (!track->attached_picture || !picture || picture->is_cached ||
+        picture->is_wrapped_avframe || !picture->buffer || !picture->len)
+        return NULL;
+    return picture;
+}
+
+static int track_albumart_data(struct track *track, int action, void *arg)
+{
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    }
+
+    struct demux_packet *picture = track_attached_picture(track);
+    if (!picture)
+        return M_PROPERTY_UNAVAILABLE;
+
+    switch (action) {
+    case M_PROPERTY_GET_NODE: {
+        struct mpv_node *node = arg;
+        node_init(node, MPV_FORMAT_BYTE_ARRAY, NULL);
+        struct mpv_byte_array *ba = node->u.ba;
+        ba->data = talloc_memdup(ba, picture->buffer, picture->len);
+        if (!ba->data)
+            return M_PROPERTY_ERROR;
+        ba->size = picture->len;
+        return M_PROPERTY_OK;
+    }
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 static int get_track_entry(int item, int action, void *arg, void *ctx)
 {
     struct MPContext *mpctx = ctx;
@@ -2172,6 +2208,10 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
     switch (action) {
     case M_PROPERTY_KEY_ACTION: ;
         struct m_property_action_arg *ka = arg;
+        if (strcmp(ka->key, "albumart-data") == 0) {
+            ret = track_albumart_data(track, ka->action, ka->arg);
+            goto done;
+        }
         if (!strncmp(ka->key, "metadata/", 9)) {
             bstr key = {0};
             const char *rem = "";
