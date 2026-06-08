@@ -27,6 +27,33 @@ struct priv {
     struct mpvk_ctx vk;
 };
 
+static VkSurfaceKHR android_create_surface(struct ra_ctx *ctx,
+                                           ANativeWindow *native_window,
+                                           int msgl)
+{
+    struct priv *p = ctx->priv;
+    struct mpvk_ctx *vk = &p->vk;
+    if (!native_window) {
+        MP_MSG(ctx, msgl, "Missing Android native window\n");
+        return VK_NULL_HANDLE;
+    }
+
+    VkAndroidSurfaceCreateInfoKHR info = {
+         .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+         .window = native_window,
+    };
+
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VkResult res = vkCreateAndroidSurfaceKHR(vk->vkinst->instance, &info,
+                                             NULL, &surface);
+    if (res != VK_SUCCESS) {
+        MP_MSG(ctx, msgl, "Failed creating Android surface\n");
+        return VK_NULL_HANDLE;
+    }
+
+    return surface;
+}
+
 static void android_uninit(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
@@ -34,6 +61,12 @@ static void android_uninit(struct ra_ctx *ctx)
     mpvk_uninit(&p->vk);
 
     vo_android_uninit(ctx->vo);
+}
+
+static bool android_check_visible(struct ra_ctx *ctx)
+{
+    return vo_android_has_native_window(ctx->vo) &&
+           ra_vk_ctx_has_surface(ctx);
 }
 
 static bool android_init(struct ra_ctx *ctx)
@@ -48,19 +81,14 @@ static bool android_init(struct ra_ctx *ctx)
     if (!mpvk_init(vk, ctx, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME))
         goto fail;
 
-    VkAndroidSurfaceCreateInfoKHR info = {
-         .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
-         .window = vo_android_native_window(ctx->vo)
+    struct ra_ctx_params params = {
+        .check_visible = android_check_visible,
     };
 
-    struct ra_ctx_params params = {0};
-
-    VkInstance inst = vk->vkinst->instance;
-    VkResult res = vkCreateAndroidSurfaceKHR(inst, &info, NULL, &vk->surface);
-    if (res != VK_SUCCESS) {
-        MP_MSG(ctx, msgl, "Failed creating Android surface\n");
+    vk->surface = android_create_surface(ctx, vo_android_native_window(ctx->vo),
+                                         msgl);
+    if (vk->surface == VK_NULL_HANDLE)
         goto fail;
-    }
 
     if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
         goto fail;
@@ -73,6 +101,9 @@ fail:
 
 static bool android_reconfig(struct ra_ctx *ctx)
 {
+    if (!vo_android_has_native_window(ctx->vo))
+        return true;
+
     int w, h;
     if (!vo_android_surface_size(ctx->vo, &w, &h))
         return false;
@@ -88,8 +119,56 @@ static bool android_reconfig(struct ra_ctx *ctx)
     return true;
 }
 
+static bool android_detach_window(struct ra_ctx *ctx)
+{
+    if (!ra_vk_ctx_detach_surface(ctx))
+        return false;
+
+    vo_android_set_native_window(ctx->vo, NULL);
+    return true;
+}
+
+static bool android_update_window(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    struct mpvk_ctx *vk = &p->vk;
+    if (ctx->vo->opts->WinID == 0 || ctx->vo->opts->WinID == -1)
+        return android_detach_window(ctx);
+
+    ANativeWindow *native_window = vo_android_create_native_window(ctx->vo);
+    if (!native_window)
+        return false;
+
+    VkSurfaceKHR surface = android_create_surface(ctx, native_window, MSGL_ERR);
+    if (surface == VK_NULL_HANDLE)
+        goto fail;
+
+    if (!ra_vk_ctx_replace_surface(ctx, surface, VK_PRESENT_MODE_FIFO_KHR)) {
+        vkDestroySurfaceKHR(vk->vkinst->instance, surface, NULL);
+        goto fail;
+    }
+
+    vo_android_set_native_window(ctx->vo, native_window);
+    if (!android_reconfig(ctx))
+        return false;
+
+    return true;
+
+fail:
+    ANativeWindow_release(native_window);
+    return false;
+}
+
 static int android_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 {
+    switch (request) {
+    case VOCTRL_UPDATE_WINDOW:
+        if (!android_update_window(ctx))
+            return VO_FALSE;
+        *events |= VO_EVENT_RESIZE | VO_EVENT_EXPOSE;
+        return VO_TRUE;
+    }
+
     return VO_NOTIMPL;
 }
 

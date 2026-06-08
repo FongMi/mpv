@@ -123,6 +123,9 @@ enum mp_voctrl {
     /* private to vo_gpu and vo_gpu_next */
     VOCTRL_EXTERNAL_RESIZE,
 
+    // Replace or detach the platform window without recreating the VO.
+    VOCTRL_UPDATE_WINDOW,
+
     // Begin VO dragging.
     VOCTRL_BEGIN_DRAGGING,
 

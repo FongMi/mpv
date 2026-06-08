@@ -151,14 +151,32 @@ struct priv {
 };
 
 static const struct ra_swapchain_fns vulkan_swapchain;
+static pl_swapchain ra_vk_ctx_create_swapchain(struct ra_ctx *ctx,
+                                               struct priv *p,
+                                               VkSurfaceKHR surface,
+                                               VkPresentModeKHR preferred_mode);
 
-struct mpvk_ctx *ra_vk_ctx_get(struct ra_ctx *ctx)
+static struct priv *ra_vk_ctx_priv(struct ra_ctx *ctx)
 {
     if (!ctx->swapchain || ctx->swapchain->fns != &vulkan_swapchain)
         return NULL;
 
-    struct priv *p = ctx->swapchain->priv;
-    return p->vk;
+    return ctx->swapchain->priv;
+}
+
+static void ra_vk_ctx_destroy_surface(struct mpvk_ctx *vk)
+{
+    if (vk->swapchain)
+        pl_swapchain_destroy(&vk->swapchain);
+    if (vk->surface != VK_NULL_HANDLE)
+        vkDestroySurfaceKHR(vk->vkinst->instance, vk->surface, NULL);
+    vk->surface = VK_NULL_HANDLE;
+}
+
+struct mpvk_ctx *ra_vk_ctx_get(struct ra_ctx *ctx)
+{
+    struct priv *p = ra_vk_ctx_priv(ctx);
+    return p ? p->vk : NULL;
 }
 
 void ra_vk_ctx_uninit(struct ra_ctx *ctx)
@@ -171,7 +189,7 @@ void ra_vk_ctx_uninit(struct ra_ctx *ctx)
 
     if (ctx->ra) {
         pl_gpu_finish(vk->gpu);
-        pl_swapchain_destroy(&vk->swapchain);
+        ra_vk_ctx_destroy_surface(vk);
         ctx->ra->fns->destroy(ctx->ra);
         ctx->ra = NULL;
     }
@@ -440,18 +458,8 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
     if (!ctx->ra)
         goto error;
 
-    // Create the swapchain
-    struct pl_vulkan_swapchain_params pl_params = {
-        .surface = vk->surface,
-        .present_mode = preferred_mode,
-        .swapchain_depth = ctx->vo->opts->swapchain_depth,
-        .alpha_bits = ctx->opts.want_alpha ? 8 : 0,
-    };
-
-    if (p->opts->swap_mode >= 0) // user override
-        pl_params.present_mode = p->opts->swap_mode;
-
-    vk->swapchain = pl_vulkan_create_swapchain(vk->vulkan, &pl_params);
+    vk->swapchain = ra_vk_ctx_create_swapchain(ctx, p, vk->surface,
+                                               preferred_mode);
     if (!vk->swapchain)
         goto error;
 
@@ -462,9 +470,79 @@ error:
     return false;
 }
 
+static pl_swapchain ra_vk_ctx_create_swapchain(struct ra_ctx *ctx,
+                                               struct priv *p,
+                                               VkSurfaceKHR surface,
+                                               VkPresentModeKHR preferred_mode)
+{
+    struct pl_vulkan_swapchain_params pl_params = {
+        .surface = surface,
+        .present_mode = preferred_mode,
+        .swapchain_depth = ctx->vo->opts->swapchain_depth,
+        .alpha_bits = ctx->opts.want_alpha ? 8 : 0,
+    };
+
+    if (p->opts->swap_mode >= 0) // user override
+        pl_params.present_mode = p->opts->swap_mode;
+
+    return pl_vulkan_create_swapchain(p->vk->vulkan, &pl_params);
+}
+
+bool ra_vk_ctx_replace_surface(struct ra_ctx *ctx, VkSurfaceKHR surface,
+                               VkPresentModeKHR preferred_mode)
+{
+    struct priv *p = ra_vk_ctx_priv(ctx);
+    if (!p || !ctx->ra || surface == VK_NULL_HANDLE)
+        return false;
+
+    struct mpvk_ctx *vk = p->vk;
+    if (!vk->vulkan || !vk->gpu)
+        return false;
+
+    pl_gpu_finish(vk->gpu);
+    pl_swapchain swapchain = ra_vk_ctx_create_swapchain(ctx, p, surface,
+                                                        preferred_mode);
+    if (!swapchain)
+        return false;
+
+    ra_vk_ctx_destroy_surface(vk);
+    vk->surface = surface;
+    vk->swapchain = swapchain;
+    return true;
+}
+
+bool ra_vk_ctx_detach_surface(struct ra_ctx *ctx)
+{
+    struct priv *p = ra_vk_ctx_priv(ctx);
+    if (!p)
+        return false;
+
+    struct mpvk_ctx *vk = p->vk;
+    if (!vk->vulkan || !vk->gpu)
+        return false;
+
+    pl_gpu_finish(vk->gpu);
+    ra_vk_ctx_destroy_surface(vk);
+    return true;
+}
+
+bool ra_vk_ctx_has_surface(struct ra_ctx *ctx)
+{
+    struct mpvk_ctx *vk = ra_vk_ctx_get(ctx);
+    return vk && vk->surface != VK_NULL_HANDLE && vk->swapchain;
+}
+
 bool ra_vk_ctx_resize(struct ra_ctx *ctx, int width, int height)
 {
-    struct priv *p = ctx->swapchain->priv;
+    struct priv *p = ra_vk_ctx_priv(ctx);
+    if (!p)
+        return false;
+
+    if (!p->vk->swapchain) {
+        ctx->vo->dwidth = width;
+        ctx->vo->dheight = height;
+        return true;
+    }
 
     bool ok = pl_swapchain_resize(p->vk->swapchain, &width, &height);
     ctx->vo->dwidth = width;
@@ -505,9 +583,12 @@ static bool start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
     if (p->params.check_visible)
         visible = p->params.check_visible(sw->ctx);
 
+    if (!p->vk->swapchain || !visible)
+        return false;
+
     // If out_fbo is NULL, this was called from vo_gpu_next. Bail out.
-    if (out_fbo == NULL || !visible)
-        return visible;
+    if (out_fbo == NULL)
+        return true;
 
     if (!pl_swapchain_start_frame(p->vk->swapchain, &frame))
         return false;
@@ -525,12 +606,18 @@ static bool start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
 static bool submit_frame(struct ra_swapchain *sw, const struct vo_frame *frame)
 {
     struct priv *p = sw->priv;
+    if (!p->vk->swapchain)
+        return false;
+
     return pl_swapchain_submit_frame(p->vk->swapchain);
 }
 
 static void swap_buffers(struct ra_swapchain *sw)
 {
     struct priv *p = sw->priv;
+    if (!p->vk->swapchain)
+        return;
+
     pl_swapchain_swap_buffers(p->vk->swapchain);
     if (p->params.swap_buffers)
         p->params.swap_buffers(sw->ctx);
@@ -555,7 +642,7 @@ static bool set_color(struct ra_swapchain *sw, struct mp_image_params *params)
     // that set_color is used outside of Wayland.
     bool supported = PL_API_VER >= 361 || !waylandvk;
     if (supported && p->params.set_color) {
-        if (waylandvk && params) {
+        if (waylandvk && params && p->vk->swapchain) {
           // Request VK_COLOR_SPACE_PASS_THROUGH_EXT, and also force immediate
           // cleanup of swapchain retired by pl_swapchain_colorspace_hint,
           // otherwise there's a possibility the Wayland color surface will be

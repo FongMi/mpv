@@ -62,6 +62,10 @@
 #include "osdep/windows_utils.h"
 #endif
 
+#if HAVE_VULKAN
+#include "video/out/vulkan/context.h"
+#endif
+
 
 struct osd_entry {
     pl_tex tex;
@@ -252,6 +256,17 @@ static pl_buf get_dr_buf(struct priv *p, const uint8_t *ptr)
 
     mp_mutex_unlock(&p->dr_lock);
     return NULL;
+}
+
+static pl_swapchain get_active_swapchain(struct priv *p)
+{
+#if HAVE_VULKAN
+    struct mpvk_ctx *vk = ra_vk_ctx_get(p->ra_ctx);
+    if (vk)
+        return vk->swapchain;
+#endif
+
+    return p->sw;
 }
 
 static void free_dr_buf(void *opaque, uint8_t *data)
@@ -1024,6 +1039,7 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
 static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
 {
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    pl_swapchain pl_sw = get_active_swapchain(p);
 
     struct mp_image_params params = {
         .color = hint ? *hint : pl_color_space_srgb,
@@ -1040,7 +1056,8 @@ static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
             return true;
         }
     }
-    pl_swapchain_colorspace_hint(p->sw, hint);
+    if (pl_sw)
+        pl_swapchain_colorspace_hint(pl_sw, hint);
     return false;
 }
 
@@ -1288,7 +1305,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     struct pl_swapchain_frame swframe;
     bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
-    if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
+    pl_swapchain pl_sw = get_active_swapchain(p);
+    if (!pl_sw || !should_draw || !pl_swapchain_start_frame(pl_sw, &swframe)) {
         if (frame->current) {
             // Advance the queue state to the current PTS to discard unused frames
             struct pl_queue_params qparams = *pl_queue_params(
@@ -1512,9 +1530,10 @@ static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    pl_swapchain pl_sw = get_active_swapchain(p);
 
     if (p->frame_pending) {
-        if (!pl_swapchain_submit_frame(p->sw))
+        if (pl_sw && !pl_swapchain_submit_frame(pl_sw))
             MP_ERR(vo, "Failed presenting frame!\n");
         p->frame_pending = false;
     }

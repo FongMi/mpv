@@ -8280,12 +8280,17 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
     }
 
     if (flags & UPDATE_VO && mpctx->video_out) {
-        struct track *track = mpctx->current_track[0][STREAM_VIDEO];
-        uninit_video_out(mpctx);
-        handle_force_window(mpctx, true);
-        reinit_video_chain(mpctx);
-        if (track)
-            queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
+        bool update_window = opt_ptr == &opts->vo->WinID;
+        if (!update_window ||
+            vo_control(mpctx->video_out, VOCTRL_UPDATE_WINDOW, NULL) <= 0)
+        {
+            struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+            uninit_video_out(mpctx);
+            handle_force_window(mpctx, true);
+            reinit_video_chain(mpctx);
+            if (track)
+                queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
+        }
 
         mp_wakeup_core(mpctx);
     }

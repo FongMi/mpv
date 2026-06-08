@@ -28,12 +28,79 @@ struct priv {
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
+    EGLConfig egl_config;
+    EGLint egl_native_visual_id;
 };
 
 static void android_swap_buffers(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
+    if (!vo_android_has_native_window(ctx->vo) ||
+        p->egl_surface == EGL_NO_SURFACE)
+        return;
+
     eglSwapBuffers(p->egl_display, p->egl_surface);
+}
+
+static void android_destroy_egl_surface(struct ra_ctx *ctx, EGLSurface surface)
+{
+    struct priv *p = ctx->priv;
+    if (!surface || surface == EGL_NO_SURFACE)
+        return;
+
+    eglDestroySurface(p->egl_display, surface);
+}
+
+static void android_destroy_current_egl_surface(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    if (!p->egl_surface || p->egl_surface == EGL_NO_SURFACE)
+        return;
+
+    eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
+    android_destroy_egl_surface(ctx, p->egl_surface);
+    p->egl_surface = EGL_NO_SURFACE;
+}
+
+static EGLSurface android_create_egl_surface(struct ra_ctx *ctx,
+                                            ANativeWindow *native_window)
+{
+    struct priv *p = ctx->priv;
+    if (!native_window) {
+        MP_ERR(ctx, "Missing native window\n");
+        return EGL_NO_SURFACE;
+    }
+
+    ANativeWindow_setBuffersGeometry(native_window, 0, 0,
+                                     p->egl_native_visual_id);
+
+    EGLSurface egl_surface = eglCreateWindowSurface(p->egl_display,
+                                                    p->egl_config,
+                                                    (EGLNativeWindowType)native_window,
+                                                    NULL);
+    if (egl_surface == EGL_NO_SURFACE)
+        MP_ERR(ctx, "Could not create EGL surface!\n");
+
+    return egl_surface;
+}
+
+static bool android_make_current(struct ra_ctx *ctx, EGLSurface surface)
+{
+    struct priv *p = ctx->priv;
+    if (!eglMakeCurrent(p->egl_display, surface, surface, p->egl_context)) {
+        MP_ERR(ctx, "Failed to set context!\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool android_check_visible(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    return vo_android_has_native_window(ctx->vo) &&
+           p->egl_surface != EGL_NO_SURFACE;
 }
 
 static void android_uninit(struct ra_ctx *ctx)
@@ -41,11 +108,7 @@ static void android_uninit(struct ra_ctx *ctx)
     struct priv *p = ctx->priv;
     ra_gl_ctx_uninit(ctx);
 
-    if (p->egl_surface) {
-        eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                       EGL_NO_CONTEXT);
-        eglDestroySurface(p->egl_display, p->egl_surface);
-    }
+    android_destroy_current_egl_surface(ctx);
     if (p->egl_context)
         eglDestroyContext(p->egl_display, p->egl_context);
 
@@ -68,29 +131,21 @@ static bool android_init(struct ra_ctx *ctx)
     EGLConfig config;
     if (!mpegl_create_context(ctx, p->egl_display, &p->egl_context, &config))
         goto fail;
+    p->egl_config = config;
 
+    eglGetConfigAttrib(p->egl_display, p->egl_config, EGL_NATIVE_VISUAL_ID,
+                       &p->egl_native_visual_id);
     ANativeWindow *native_window = vo_android_native_window(ctx->vo);
-    EGLint format;
-    eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID, &format);
-    ANativeWindow_setBuffersGeometry(native_window, 0, 0, format);
-
-    p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
-                                    (EGLNativeWindowType)native_window, NULL);
-
-    if (p->egl_surface == EGL_NO_SURFACE) {
-        MP_FATAL(ctx, "Could not create EGL surface!\n");
+    p->egl_surface = android_create_egl_surface(ctx, native_window);
+    if (p->egl_surface == EGL_NO_SURFACE)
         goto fail;
-    }
-
-    if (!eglMakeCurrent(p->egl_display, p->egl_surface, p->egl_surface,
-                        p->egl_context)) {
-        MP_FATAL(ctx, "Failed to set context!\n");
+    if (!android_make_current(ctx, p->egl_surface))
         goto fail;
-    }
 
     mpegl_load_functions(&p->gl, ctx->log);
 
     struct ra_ctx_params params = {
+        .check_visible = android_check_visible,
         .swap_buffers = android_swap_buffers,
     };
 
@@ -105,6 +160,9 @@ fail:
 
 static bool android_reconfig(struct ra_ctx *ctx)
 {
+    if (!vo_android_has_native_window(ctx->vo))
+        return true;
+
     int w, h;
     if (!vo_android_surface_size(ctx->vo, &w, &h))
         return false;
@@ -122,8 +180,55 @@ static bool android_reconfig(struct ra_ctx *ctx)
     return true;
 }
 
+static bool android_detach_window(struct ra_ctx *ctx)
+{
+    android_destroy_current_egl_surface(ctx);
+    vo_android_set_native_window(ctx->vo, NULL);
+    return true;
+}
+
+static bool android_update_window(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    if (ctx->vo->opts->WinID == 0 || ctx->vo->opts->WinID == -1)
+        return android_detach_window(ctx);
+
+    ANativeWindow *native_window = vo_android_create_native_window(ctx->vo);
+    if (!native_window)
+        return false;
+
+    EGLSurface old_surface = p->egl_surface;
+    EGLSurface new_surface = android_create_egl_surface(ctx, native_window);
+    if (new_surface == EGL_NO_SURFACE)
+        goto fail;
+    if (!android_make_current(ctx, new_surface)) {
+        android_destroy_egl_surface(ctx, new_surface);
+        goto fail;
+    }
+
+    p->egl_surface = new_surface;
+    android_destroy_egl_surface(ctx, old_surface);
+    vo_android_set_native_window(ctx->vo, native_window);
+    if (!android_reconfig(ctx))
+        return false;
+
+    return true;
+
+fail:
+    ANativeWindow_release(native_window);
+    return false;
+}
+
 static int android_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 {
+    switch (request) {
+    case VOCTRL_UPDATE_WINDOW:
+        if (!android_update_window(ctx))
+            return VO_FALSE;
+        *events |= VO_EVENT_RESIZE | VO_EVENT_EXPOSE;
+        return VO_TRUE;
+    }
+
     return VO_NOTIMPL;
 }
 
