@@ -65,6 +65,7 @@
 
 struct priv {
     dvdnav_t *dvdnav;                   // handle to libdvdnav stuff
+    stream_t *iso_stream;               // backing stream for ISO images
     struct mp_log *log;                 // borrowed from the stream
     struct mp_log *lib_log;             // used by libdvdnav's log callback
     bool probing;                       // open is an .iso auto-detection probe
@@ -1075,6 +1076,9 @@ static void stream_dvdnav_close(stream_t *s)
     if (priv->dvdnav)
         dvdnav_close(priv->dvdnav);
     priv->dvdnav = NULL;
+    if (priv->iso_stream)
+        free_stream(priv->iso_stream);
+    priv->iso_stream = NULL;
     if (priv->dvd_speed)
         dvd_set_speed(s, priv->filename, -1);
     mp_mutex_destroy(&priv->lock);
@@ -1137,6 +1141,64 @@ static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
     return priv;
 }
 
+static int dvdnav_stream_seek(void *handle, uint64_t pos)
+{
+    stream_t *source = handle;
+    if (!source || pos > INT64_MAX)
+        return -1;
+    return stream_seek(source, (int64_t)pos) ? 0 : -1;
+}
+
+static int dvdnav_stream_read(void *handle, void *buffer, int size)
+{
+    stream_t *source = handle;
+    if (!source || size < 0)
+        return -1;
+    return stream_read(source, buffer, size);
+}
+
+static dvdnav_stream_cb dvdnav_stream_callbacks = {
+    .pf_seek = dvdnav_stream_seek,
+    .pf_read = dvdnav_stream_read,
+    .pf_readv = NULL,
+};
+
+extern const stream_info_t stream_info_ffmpeg;
+
+static int open_dvdnav_iso_stream(stream_t *stream, const char *url)
+{
+    struct priv *priv = stream->priv;
+    struct stream_open_args args = {
+        .global = stream->global,
+        .cancel = stream->cancel,
+        .url = url,
+        .flags = STREAM_READ | (stream->stream_origin & STREAM_ORIGIN_MASK),
+        .sinfo = &stream_info_ffmpeg,
+    };
+
+    if (stream_create_with_args(&args, &priv->iso_stream) != STREAM_OK ||
+        !priv->iso_stream)
+        return STREAM_ERROR;
+
+    if (!priv->iso_stream->seekable) {
+        MP_ERR(stream, "DVD ISO stream must be seekable.\n");
+        return STREAM_UNSUPPORTED;
+    }
+
+    if (dvdnav_open_stream(&priv->dvdnav, priv->iso_stream,
+                           &dvdnav_stream_callbacks) != DVDNAV_STATUS_OK)
+        return STREAM_UNSUPPORTED;
+
+    if (!priv->dvdnav)
+        return STREAM_UNSUPPORTED;
+
+    dvdnav_set_readahead_flag(priv->dvdnav, 1);
+    if (dvdnav_set_PGC_positioning_flag(priv->dvdnav, 1) != DVDNAV_STATUS_OK)
+        MP_ERR(stream, "stream_dvdnav, failed to set PGC positioning\n");
+
+    return STREAM_OK;
+}
+
 static int open_s_internal(stream_t *stream)
 {
     struct priv *priv, *p;
@@ -1153,17 +1215,19 @@ static int open_s_internal(stream_t *stream)
 
     p->opts = mp_get_config_group(stream, stream->global, &dvd_conf);
 
-    if (p->device && p->device[0])
-        filename = p->device;
-    else if (p->opts->device && p->opts->device[0])
-        filename = p->opts->device;
-    else
-        filename = DEFAULT_OPTICAL_DEVICE;
-    if (!new_dvdnav_stream(stream, filename)) {
-        if (!priv->probing)
-            MP_ERR(stream, "Couldn't open DVD device: %s\n", filename);
-        ret = priv->probing ? STREAM_UNSUPPORTED : STREAM_ERROR;
-        goto err;
+    if (!priv->dvdnav) {
+        if (p->device && p->device[0])
+            filename = p->device;
+        else if (p->opts->device && p->opts->device[0])
+            filename = p->opts->device;
+        else
+            filename = DEFAULT_OPTICAL_DEVICE;
+        if (!new_dvdnav_stream(stream, filename)) {
+            if (!priv->probing)
+                MP_ERR(stream, "Couldn't open DVD device: %s\n", filename);
+            ret = priv->probing ? STREAM_UNSUPPORTED : STREAM_ERROR;
+            goto err;
+        }
     }
     priv->probing = false;
 
@@ -1269,6 +1333,40 @@ const stream_info_t stream_info_dvdnav = {
     .protocols = (const char*const[]){ "dvd", "dvdnav", NULL },
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
+
+int stream_open_dvd_iso(stream_t *stream, const char *url, bool local_path)
+{
+    struct priv *priv = talloc_zero(stream, struct priv);
+    stream->priv = priv;
+    priv->probing = true;
+
+    struct MPOpts *opts = mp_get_config_group(stream, stream->global, &mp_opt_root);
+    priv->track = opts->edition_id >= 0 ? opts->edition_id :
+                  (opts->disc_menu ? TITLE_MENU : TITLE_LONGEST);
+    talloc_free(opts);
+
+    if (local_path) {
+        priv->device = talloc_strdup(priv, url);
+    } else {
+        int r = open_dvdnav_iso_stream(stream, url);
+        if (r != STREAM_OK) {
+            if (priv->dvdnav)
+                dvdnav_close(priv->dvdnav);
+            if (priv->iso_stream)
+                free_stream(priv->iso_stream);
+            talloc_free(priv);
+            stream->priv = NULL;
+            return r;
+        }
+    }
+
+    int r = open_s_internal(stream);
+    if (r != STREAM_OK) {
+        talloc_free(priv);
+        stream->priv = NULL;
+    }
+    return r;
+}
 
 static bool check_ifo(const char *path)
 {

@@ -195,6 +195,7 @@ sources = files(
     'stream/stream_concat.c',
     'stream/stream_edl.c',
     'stream/stream_file.c',
+    'stream/stream_iso.c',
     'stream/stream_lavf.c',
     'stream/stream_memory.c',
     'stream/stream_mf.c',

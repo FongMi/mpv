@@ -352,6 +352,8 @@ int stream_create_with_args(struct stream_open_args *args, struct stream **ret);
 struct stream *stream_create(const char *url, int flags,
                              struct mp_cancel *c, struct mpv_global *global);
 stream_t *open_output_stream(const char *filename, struct mpv_global *global);
+int stream_open_bluray_iso(stream_t *stream, const char *url, bool local_path);
+int stream_open_dvd_iso(stream_t *stream, const char *url, bool local_path);
 
 void mp_url_unescape_inplace(char *buf);
 char *mp_url_unescape(void *talloc_ctx, const char *url);

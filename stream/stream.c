@@ -52,6 +52,7 @@ extern const stream_info_t stream_info_ffmpeg;
 extern const stream_info_t stream_info_ffmpeg_unsafe;
 extern const stream_info_t stream_info_avdevice;
 extern const stream_info_t stream_info_file;
+extern const stream_info_t stream_info_iso;
 extern const stream_info_t stream_info_slice;
 extern const stream_info_t stream_info_fd;
 extern const stream_info_t stream_info_ifo_dvdnav;
@@ -75,6 +76,7 @@ static const stream_info_t *const stream_list[] = {
 #if HAVE_DVBIN
     &stream_info_dvb,
 #endif
+    &stream_info_iso,
 #if HAVE_DVDA
     &stream_info_ifo_dvda,
     &stream_info_dvda,
