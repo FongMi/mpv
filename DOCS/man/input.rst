@@ -2350,6 +2350,19 @@ Property list
     ``duration/full``
         ``duration`` with milliseconds.
 
+``media-live``
+    Whether the current media is live. The property is unavailable until the
+    demuxer can determine the value. HLS, DASH, and RTSP/SDP use
+    protocol-specific signalling when supported by the linked libavformat;
+    otherwise the property remains unavailable for these formats. Other
+    libavformat inputs follow progressive playback semantics: an input is
+    considered live when both its byte length and duration are unknown.
+    Consequently, a finite progressive input that provides neither value is
+    also reported as live.
+
+    This property does not describe seekability or whether the available media
+    window changes over time.
+
 ``avsync``
     Last A/V synchronization difference. Unavailable if audio or video is
     disabled.

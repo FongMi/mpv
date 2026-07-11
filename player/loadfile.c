@@ -447,6 +447,10 @@ void update_demuxer_properties(struct MPContext *mpctx)
         mp_notify_property(mpctx, "current-edition");
         mp_notify_property(mpctx, "editions");
     }
+    if (events & DEMUX_EVENT_LIVE)
+        mp_notify_property(mpctx, "media-live");
+    if (events & DEMUX_EVENT_SEEKABLE)
+        mp_notify_property(mpctx, "seekable");
     demuxer->events = 0;
 }
 

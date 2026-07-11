@@ -727,6 +727,18 @@ static int mp_property_duration(void *ctx, struct m_property *prop,
     return property_time(action, arg, len);
 }
 
+static int mp_property_media_live(void *ctx, struct m_property *prop,
+                                  int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (!mpctx->demuxer ||
+        mpctx->demuxer->live_state == DEMUX_LIVE_UNKNOWN)
+        return M_PROPERTY_UNAVAILABLE;
+
+    return m_property_bool_ro(action, arg,
+                              mpctx->demuxer->live_state == DEMUX_LIVE_YES);
+}
+
 static int mp_property_avsync(void *ctx, struct m_property *prop,
                               int action, void *arg)
 {
@@ -4700,6 +4712,7 @@ static const struct m_property mp_properties_base[] = {
     {"stream-pos", mp_property_stream_pos},
     {"stream-end", mp_property_stream_end},
     {"duration", mp_property_duration},
+    {"media-live", mp_property_media_live},
     {"avsync", mp_property_avsync},
     {"total-avsync-change", mp_property_total_avsync_change},
     {"mistimed-frame-count", mp_property_mistimed_frame_count},
