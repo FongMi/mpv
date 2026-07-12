@@ -761,11 +761,16 @@ static bool stream_seek_unbuffered(stream_t *s, int64_t newpos)
             MP_ERR(s, "Cannot seek forward in this stream\n");
             return false;
         }
-        if (newpos < s->pos && !s->seekable) {
+        int r;
+        if (s->seekable) {
+            r = s->seek(s, newpos);
+        } else if (newpos == 0 && s->rewind) {
+            r = s->rewind(s);
+        } else {
             MP_ERR(s, "Cannot seek backward in linear streams!\n");
             return false;
         }
-        if (s->seek(s, newpos) <= 0) {
+        if (r <= 0) {
             int level = mp_cancel_test(s->cancel) ? MSGL_V : MSGL_ERR;
             MP_MSG(s, level, "Seek failed (to %lld, size %lld)\n",
                    (long long)newpos, (long long)stream_get_size(s));

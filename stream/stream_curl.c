@@ -891,6 +891,11 @@ static int curl_seek(struct stream *s, int64_t pos)
     return 1;
 }
 
+static int curl_rewind(struct stream *s)
+{
+    return curl_seek(s, 0);
+}
+
 static int64_t curl_get_size(struct stream *s)
 {
     struct priv *p = s->priv;
@@ -1022,6 +1027,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     s->fast_skip = true;
     s->fill_buffer = curl_fill_buffer;
     s->seek = p->seekable ? curl_seek : NULL;
+    s->rewind = curl_rewind;
     s->get_size = curl_get_size;
     s->control = curl_control;
     s->close = curl_close;
