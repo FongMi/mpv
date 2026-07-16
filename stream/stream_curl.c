@@ -175,6 +175,8 @@ struct priv {
     uint64_t request_received; // bytes received in the current request
     uint64_t request_end;      // exclusive byte cap (0 = unbounded)
     int retry_count;           // consecutive failed attempts at request_start
+    bool request_uses_range;   // current request includes a Range header
+    bool range_fallback_used;  // retried the initial request without Range
     bool active;               // handle is currently active in the multi
     bool finished;             // current request has reached EOF
 
@@ -612,6 +614,21 @@ static bool is_recoverable_error(CURLcode code)
     }
 }
 
+static bool should_retry_without_range(struct priv *p, CURLcode code,
+                                       bool aborted)
+{
+    long response_code = 0;
+    bool eligible = !aborted && code == CURLE_BAD_CONTENT_ENCODING &&
+                    p->scheme->proto == MP_CURL_PROTO_HTTP &&
+                    p->request_uses_range && !p->seekable &&
+                    p->request_start == 0 && p->request_received == 0 &&
+                    p->request_end == 0 && !p->range_fallback_used;
+    return eligible &&
+           curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE,
+                             &response_code) == CURLE_OK &&
+           response_code == 206;
+}
+
 static void start_request(struct priv *p)
 {
     if (p->finished) {
@@ -639,6 +656,7 @@ static void start_request(struct priv *p)
         return;
     }
 
+    p->request_uses_range = ranged;
     char range[64];
     if (chunked || capped) {
         uint64_t end = UINT64_MAX;
@@ -688,6 +706,14 @@ static void on_done(struct priv *p, CURLcode code)
         p->probed = true;
         mp_cond_broadcast(&p->cond);
         mp_mutex_unlock(&p->mtx);
+        return;
+    }
+
+    if (should_retry_without_range(p, code, aborted)) {
+        p->range_fallback_used = true;
+        MP_WARN(p, "unsupported content encoding in ranged response, "
+                "retrying without range\n");
+        start_request(p);
         return;
     }
 
