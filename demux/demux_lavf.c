@@ -191,6 +191,7 @@ static const struct format_hack format_hacks[] = {
     {"sdp", .clear_filepos = true, .is_network = true, .no_seek = true},
     {"mpeg", .use_stream_ids = true},
     {"mpegts", .use_stream_ids = true},
+    {"mmttlv", .use_stream_ids = true, .no_seek = true},
     {"mxf", .use_stream_ids = true},
     {"avi", .use_stream_ids = true},
     {"asf", .use_stream_ids = true},
