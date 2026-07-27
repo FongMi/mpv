@@ -43,6 +43,7 @@
 #include "filters/f_decoder_wrapper.h"
 #include "filters/filter_internal.h"
 #include "video/hwdec.h"
+#include "video/decode/vd_lavc.h"
 #include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
@@ -74,6 +75,35 @@ static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
 
 // Surfaces referenced outside of libavcodec on top of what the VO declares
 #define HWDEC_EXTRA_INFLIGHT_FRAMES 3
+
+static void set_decoder_avopts(struct mp_log *log, AVCodecContext *avctx,
+                               char **kv, bool native_dovi_sink)
+{
+    for (int n = 0; kv && kv[n * 2]; n++) {
+        char *option[] = {kv[n * 2], kv[n * 2 + 1], NULL};
+        // The active VO, rather than a user avopt or the decoder default,
+        // determines whether MediaCodec has a native Dolby Vision sink.
+        if (strcmp(option[0], "dovi_sink_support") == 0) {
+            bool requested = strcmp(option[1], "1") == 0;
+            if (requested != native_dovi_sink) {
+                mp_verbose(log, "Ignoring dovi_sink_support=%s; the active "
+                                "video output requires %d.\n",
+                           option[1], native_dovi_sink);
+            }
+            continue;
+        }
+        mp_set_avopts(log, avctx, option);
+    }
+
+    if (av_opt_find(avctx, "dovi_sink_support", NULL, 0,
+                    AV_OPT_SEARCH_CHILDREN))
+    {
+        char *sink_option[] = {
+            "dovi_sink_support", native_dovi_sink ? "1" : "0", NULL
+        };
+        mp_set_avopts(log, avctx, sink_option);
+    }
+}
 
 #define OPT_BASE_STRUCT struct vd_lavc_params
 
@@ -179,6 +209,22 @@ const struct m_sub_options hwdec_conf = {
     },
 };
 
+static bool hwdec_codec_allowed_by_options(const char *allowed_codecs,
+                                           const char *codec)
+{
+    if (!codec)
+        return false;
+
+    bstr codecs = bstr0(allowed_codecs);
+    while (codecs.len) {
+        bstr item;
+        bstr_split_tok(codecs, ",", &item, &codecs);
+        if (bstr_equals0(item, "all") || bstr_equals0(item, codec))
+            return true;
+    }
+    return false;
+}
+
 struct hwdec_info {
     char name[64];
     char method_name[24]; // non-unique name describing the hwdec method
@@ -262,6 +308,33 @@ enum {
     HWDEC_FLAG_AUTO         = (1 << 0), // prioritize in autoprobe order
     HWDEC_FLAG_WHITELIST    = (1 << 1), // whitelist for auto
 };
+
+struct hwdec_request {
+    bool enabled;
+    bool auto_probe;
+    bool safe;
+    bool require_copy;
+};
+
+static struct hwdec_request parse_hwdec_request(bstr opt)
+{
+    bool safe = bstr_equals0(opt, "auto") ||
+                bstr_equals0(opt, "auto-safe") ||
+                bstr_equals0(opt, "auto-copy") ||
+                bstr_equals0(opt, "auto-copy-safe") ||
+                bstr_equals0(opt, "yes") ||
+                bstr_equals0(opt, "");
+    bool require_copy = bstr_equals0(opt, "auto-copy") ||
+                        bstr_equals0(opt, "auto-copy-safe") ||
+                        bstr_equals0(opt, "auto-copy-unsafe");
+    return (struct hwdec_request) {
+        .enabled = !bstr_equals0(opt, "no"),
+        .auto_probe = safe || require_copy ||
+                      bstr_equals0(opt, "auto-unsafe"),
+        .safe = safe,
+        .require_copy = require_copy,
+    };
+}
 
 struct autoprobe_info {
     const char *method_name;
@@ -447,17 +520,56 @@ static void add_all_hwdec_methods(struct hwdec_info **infos, int *num_infos)
     qsort(*infos, *num_infos, sizeof(struct hwdec_info), hwdec_compare);
 }
 
+bool vd_lavc_hwdec_api_preferred(const struct MPOpts *opts, const char *api,
+                                 const char *codec)
+{
+    if (!api || !hwdec_codec_allowed_by_options(
+                    opts->hwdec_opts->hwdec_codecs, codec))
+        return false;
+
+    struct hwdec_info *hwdecs = NULL;
+    int num_hwdecs = 0;
+    add_all_hwdec_methods(&hwdecs, &num_hwdecs);
+
+    bool preferred = false;
+    char **hwdec_api = opts->hwdec_opts->hwdec_api;
+    for (int i = 0; hwdec_api && hwdec_api[i]; i++) {
+        bstr opt = bstr0(hwdec_api[i]);
+        struct hwdec_request request = parse_hwdec_request(opt);
+        if (!request.enabled)
+            break;
+
+        for (int n = 0; n < num_hwdecs; n++) {
+            struct hwdec_info *hwdec = &hwdecs[n];
+            if (!request.auto_probe &&
+                !bstr_equals0(opt, hwdec->method_name) &&
+                !bstr_equals0(opt, hwdec->name))
+                continue;
+
+            const char *hw_codec = mp_codec_from_av_codec_id(hwdec->codec->id);
+            if (!hw_codec || strcmp(hw_codec, codec) != 0)
+                continue;
+            if (request.safe && !(hwdec->flags & HWDEC_FLAG_WHITELIST))
+                continue;
+            if (request.require_copy && !hwdec->copying)
+                continue;
+
+            preferred = !hwdec->copying &&
+                        strcmp(hwdec->method_name, api) == 0;
+            goto done;
+        }
+    }
+
+done:
+    talloc_free(hwdecs);
+    return preferred;
+}
+
 static bool hwdec_codec_allowed(struct mp_filter *vd, const char *codec)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
-    bstr s = bstr0(ctx->hwdec_opts->hwdec_codecs);
-    while (s.len) {
-        bstr item;
-        bstr_split_tok(s, ",", &item, &s);
-        if (bstr_equals0(item, "all") || bstr_equals0(item, codec))
-            return true;
-    }
-    return false;
+    return hwdec_codec_allowed_by_options(ctx->hwdec_opts->hwdec_codecs,
+                                          codec);
 }
 
 static AVBufferRef *hwdec_create_dev(struct mp_filter *vd,
@@ -504,6 +616,8 @@ static void select_and_set_hwdec(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
     const char *codec = ctx->codec->codec;
+    bool native_dovi_sink =
+        ctx->vo && (ctx->vo->driver->caps & VO_CAP_NATIVE_DOVI);
 
     m_config_cache_update(ctx->hwdec_opts_cache);
 
@@ -514,21 +628,9 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     char **hwdec_api = ctx->hwdec_opts->hwdec_api;
     for (int i = 0; hwdec_api && hwdec_api[i]; i++) {
         bstr opt = bstr0(hwdec_api[i]);
+        struct hwdec_request request = parse_hwdec_request(opt);
 
-        bool hwdec_requested = !bstr_equals0(opt, "no");
-        bool hwdec_auto_safe = bstr_equals0(opt, "auto") ||
-                            bstr_equals0(opt, "auto-safe") ||
-                            bstr_equals0(opt, "auto-copy") ||
-                            bstr_equals0(opt, "auto-copy-safe") ||
-                            bstr_equals0(opt, "yes") ||
-                            bstr_equals0(opt, "");
-        bool hwdec_auto_unsafe = bstr_equals0(opt, "auto-unsafe");
-        bool hwdec_auto_copy = bstr_equals0(opt, "auto-copy") ||
-                            bstr_equals0(opt, "auto-copy-safe") ||
-                            bstr_equals0(opt, "auto-copy-unsafe");
-        bool hwdec_auto = hwdec_auto_unsafe || hwdec_auto_copy || hwdec_auto_safe;
-
-        if (!hwdec_requested) {
+        if (!request.enabled) {
             MP_VERBOSE(vd, "No hardware decoding requested.\n");
             break;
         } else if (!hwdec_codec_allowed(vd, codec)) {
@@ -539,12 +641,13 @@ static void select_and_set_hwdec(struct mp_filter *vd)
             MP_VERBOSE(vd, "Not trying to use hardware decoding: disallowed\n");
             break;
         } else {
-            bool hwdec_name_supported = false;  // relevant only if !hwdec_auto
+            bool hwdec_name_supported = false;
             for (int n = 0; n < num_hwdecs; n++) {
                 struct hwdec_info *hwdec = &hwdecs[n];
 
-                if (!hwdec_auto && !(bstr_equals0(opt, hwdec->method_name) ||
-                                    bstr_equals0(opt, hwdec->name)))
+                if (!request.auto_probe &&
+                    !bstr_equals0(opt, hwdec->method_name) &&
+                    !bstr_equals0(opt, hwdec->name))
                     continue;
                 hwdec_name_supported = true;
 
@@ -560,11 +663,17 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                 if (already_attempted)
                     continue;
 
+                if (native_dovi_sink && hwdec->copying) {
+                    MP_VERBOSE(vd, "Native Dolby Vision output cannot use a "
+                                   "copying hardware decoder.\n");
+                    continue;
+                }
+
                 const char *hw_codec = mp_codec_from_av_codec_id(hwdec->codec->id);
                 if (!hw_codec || strcmp(hw_codec, codec) != 0)
                     continue;
 
-                if (hwdec_auto_safe && !(hwdec->flags & HWDEC_FLAG_WHITELIST))
+                if (request.safe && !(hwdec->flags & HWDEC_FLAG_WHITELIST))
                     continue;
 
                 MP_VERBOSE(vd, "Looking at hwdec %s...\n", hwdec->name);
@@ -579,13 +688,14 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                                  ctx->num_attempted_hwdecs,
                                  bstrdup(ctx, bstr0(hwdec->name)));
 
-                if (hwdec_auto_copy && !hwdec->copying) {
+                if (request.require_copy && !hwdec->copying) {
                     MP_VERBOSE(vd, "Not using this for auto-copy.\n");
                     continue;
                 }
 
                 if (hwdec->lavc_device) {
-                    ctx->hwdec_dev = hwdec_create_dev(vd, hwdec, hwdec_auto);
+                    ctx->hwdec_dev =
+                        hwdec_create_dev(vd, hwdec, request.auto_probe);
                     if (!ctx->hwdec_dev) {
                         MP_VERBOSE(vd, "Could not create device.\n");
                         continue;
@@ -602,7 +712,7 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                         continue;
                     }
                     if (fns && fns->is_emulated && fns->is_emulated(ctx->hwdec_dev)) {
-                        if (hwdec_auto) {
+                        if (request.auto_probe) {
                             MP_VERBOSE(vd, "Not using emulated API.\n");
                             av_buffer_unref(&ctx->hwdec_dev);
                             continue;
@@ -615,7 +725,7 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                     if (ctx->hwdec_devs) {
                         struct hwdec_imgfmt_request params = {
                             .imgfmt = pixfmt2imgfmt(hwdec->pix_fmt),
-                            .probing = hwdec_auto,
+                            .probing = request.auto_probe,
                         };
                         hwdec_devices_request_for_img_fmt(
                             ctx->hwdec_devs, &params);
@@ -628,7 +738,7 @@ static void select_and_set_hwdec(struct mp_filter *vd)
             }
             if (ctx->use_hwdec)
                 break;
-            else if (!hwdec_auto && !hwdec_name_supported)
+            else if (!request.auto_probe && !hwdec_name_supported)
                 MP_WARN(vd, "Unsupported hwdec: %.*s\n", BSTR_P(opt));
         }
     }
@@ -643,7 +753,12 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     } else {
         // If software fallback is disabled and we get here, all hwdec must
         // have failed. Tell the ctx to always force an eof.
-        if (ctx->hwdec_opts->software_fallback == INT_MAX) {
+        if (native_dovi_sink) {
+            MP_WARN(ctx, "Native Dolby Vision output requires hardware "
+                         "decoding; retrying with the configured video "
+                         "output.\n");
+            ctx->force_eof = true;
+        } else if (ctx->hwdec_opts->software_fallback == INT_MAX) {
             MP_WARN(ctx, "Software decoding fallback is disabled.\n");
             ctx->force_eof = true;
         } else {
@@ -689,7 +804,8 @@ static void force_fallback(struct mp_filter *vd)
     mp_msg(vd->log, lev, "Attempting next decoding method after failure of %.*s.\n",
            BSTR_P(ctx->attempted_hwdecs[ctx->num_attempted_hwdecs - 1]));
     select_and_set_hwdec(vd);
-    init_avctx(vd);
+    if (!ctx->force_eof)
+        init_avctx(vd);
 }
 
 static void reinit(struct mp_filter *vd)
@@ -707,15 +823,17 @@ static void reinit(struct mp_filter *vd)
     TA_FREEP(&ctx->attempted_hwdecs);
     ctx->num_attempted_hwdecs = 0;
     ctx->hwdec_notified = false;
+    ctx->force_eof = false;
 
     select_and_set_hwdec(vd);
 
     bool use_hwdec = ctx->use_hwdec;
-    init_avctx(vd);
+    if (!ctx->force_eof)
+        init_avctx(vd);
     if (!ctx->avctx && use_hwdec) {
         do {
             force_fallback(vd);
-        } while (!ctx->avctx);
+        } while (!ctx->avctx && !ctx->force_eof);
     }
 
     // Wait for the first keyframe after reinit to ensure the decoder state is
@@ -857,7 +975,10 @@ static void init_avctx(struct mp_filter *vd)
         break;
     }
 
-    mp_set_avopts(vd->log, avctx, lavc_param->avopts);
+    bool native_dovi_sink =
+        ctx->vo && (ctx->vo->driver->caps & VO_CAP_NATIVE_DOVI);
+    set_decoder_avopts(vd->log, avctx, lavc_param->avopts,
+                       native_dovi_sink);
 
     // Do this after the above avopt handling in case it changes values
     ctx->skip_frame = avctx->skip_frame;
@@ -1453,6 +1574,9 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
         *(char **)arg = ctx->use_hwdec ? ctx->hwdec.method_name : NULL;
         return CONTROL_TRUE;
     }
+    case VDCTRL_GET_SELECTED_HWDEC:
+        *(char **)arg = ctx->use_hwdec ? ctx->hwdec.method_name : NULL;
+        return CONTROL_TRUE;
     case VDCTRL_FORCE_HWDEC_FALLBACK:
         if (ctx->use_hwdec) {
             force_fallback(vd);
@@ -1504,6 +1628,14 @@ static struct mp_decoder *create(struct mp_filter *parent,
                                  struct mp_codec_params *codec,
                                  const char *decoder)
 {
+    struct mp_stream_info *info = mp_filter_find_stream_info(parent);
+    const AVCodec *lavc_codec = avcodec_find_decoder_by_name(decoder);
+    // Hardware wrapper decoders bypass the normal hwaccel selection below.
+    if (info && info->force_swdec && lavc_codec &&
+        (lavc_codec->capabilities &
+         (AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_HYBRID)))
+        return NULL;
+
     struct mp_filter *vd = mp_filter_create(parent, &vd_lavc_filter);
     if (!vd)
         return NULL;
@@ -1530,7 +1662,6 @@ static struct mp_decoder *create(struct mp_filter *parent,
     mp_mutex_init(&ctx->dr_lock);
 
     // hwdec/DR
-    struct mp_stream_info *info = mp_filter_find_stream_info(vd);
     if (info) {
         ctx->hwdec_devs = info->hwdec_devs;
         ctx->vo = info->dr_vo;

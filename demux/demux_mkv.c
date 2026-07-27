@@ -1811,7 +1811,8 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track, int idx)
                               track->dovi_config->el_present_flag;
     }
 
-#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(62, 35, 100)
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(62, 35, 100) || \
+    defined(AV_HAVE_HEVC_CONF_SIDE_DATA)
     if (track->hvce.len > 0) {
         void *data = av_memdup(track->hvce.start, track->hvce.len);
         MP_HANDLE_OOM(data);
@@ -2285,6 +2286,7 @@ static void pair_dovi_tracks(demuxer_t *demuxer)
     for (int i = 0; i < mkv_d->num_tracks; i++) {
         mkv_track_t *track = mkv_d->tracks[i];
         if (!track->stream || track->stream->type != STREAM_VIDEO ||
+            track->stream->group ||
             !track->codec_id || strcmp(track->codec_id, "V_MPEGH/ISO/HEVC"))
             continue;
 

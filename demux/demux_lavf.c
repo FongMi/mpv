@@ -1363,7 +1363,8 @@ static void handle_lcevc_group(demuxer_t *demuxer, AVStreamGroup *stg)
 }
 #endif
 
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 19, 100)
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 19, 100) || \
+    defined(AV_HAVE_DOLBY_VISION_STREAM_GROUP)
 // Base layer + Enhancement layer separate track stream group
 static void handle_layered_video_group(demuxer_t *demuxer, AVStreamGroup *stg)
 {
@@ -1431,7 +1432,8 @@ static void handle_stream_groups(demuxer_t *demuxer)
             handle_lcevc_group(demuxer, stg);
             break;
 #endif
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 19, 100)
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 19, 100) || \
+    defined(AV_HAVE_DOLBY_VISION_STREAM_GROUP)
         case AV_STREAM_GROUP_PARAMS_DOLBY_VISION:
             handle_layered_video_group(demuxer, stg);
             break;

@@ -17,16 +17,18 @@
 
 #pragma once
 
-#include <android/native_window_jni.h>
+#include <stdbool.h>
+#include <stdint.h>
 
-#include "common/common.h"
-
+struct android_osd_overlay;
 struct vo;
 
-bool vo_android_init(struct vo *vo);
-void vo_android_uninit(struct vo *vo);
-ANativeWindow *vo_android_create_native_window(struct vo *vo);
-void vo_android_set_native_window(struct vo *vo, ANativeWindow *native_window);
-ANativeWindow *vo_android_native_window(struct vo *vo);
-bool vo_android_has_native_window(struct vo *vo);
-bool vo_android_surface_size(struct vo *vo, int *w, int *h);
+struct android_osd_overlay *android_osd_overlay_create(struct vo *vo);
+bool android_osd_overlay_set_surface(struct android_osd_overlay *ctx,
+                                     int64_t wid);
+void android_osd_overlay_invalidate_geometry(struct android_osd_overlay *ctx);
+bool android_osd_overlay_render(struct android_osd_overlay *ctx, double pts);
+bool android_osd_overlay_present(struct android_osd_overlay *ctx);
+bool android_osd_overlay_get_size(struct android_osd_overlay *ctx,
+                                  int *w, int *h);
+void android_osd_overlay_destroy(struct android_osd_overlay *ctx);

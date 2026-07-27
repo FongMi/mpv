@@ -193,9 +193,6 @@ struct gl_next_opts {
     struct user_lut lut;
     struct user_lut image_lut;
     struct user_lut target_lut;
-    int target_hint;
-    int target_hint_mode;
-    bool target_hint_strict;
     char **raw_opts;
 };
 
@@ -228,9 +225,6 @@ const struct m_sub_options gl_next_conf = {
         {"image-lut", OPT_STRING(image_lut.opt), .flags = M_OPT_FILE},
         {"image-lut-type", OPT_CHOICE_C(image_lut.type, lut_types)},
         {"target-lut", OPT_STRING(target_lut.opt), .flags = M_OPT_FILE},
-        {"target-colorspace-hint", OPT_CHOICE(target_hint, {"auto", -1}, {"no", 0}, {"yes", 1})},
-        {"target-colorspace-hint-mode", OPT_CHOICE(target_hint_mode, {"target", 0}, {"source", 1}, {"source-dynamic", 2})},
-        {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -240,8 +234,6 @@ const struct m_sub_options gl_next_conf = {
         .background_blur_radius = 16.0f,
         .inter_preserve = true,
         .image_subs_hdr_peak = 1000,
-        .target_hint = -1,
-        .target_hint_strict = true,
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -261,6 +253,12 @@ static pl_buf get_dr_buf(struct priv *p, const uint8_t *ptr)
 
     mp_mutex_unlock(&p->dr_lock);
     return NULL;
+}
+
+static pl_swapchain get_active_swapchain(struct priv *p)
+{
+    pl_swapchain sw;
+    return ra_ctx_get_pl_swapchain(p->ra_ctx, &sw) ? sw : p->sw;
 }
 
 static void free_dr_buf(void *opaque, uint8_t *data)
@@ -1294,9 +1292,14 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
 static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
 {
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    pl_swapchain pl_sw = get_active_swapchain(p);
+    if (!hint) {
+        ra_swapchain_set_color(sw, pl_sw, NULL);
+        return false;
+    }
 
     struct mp_image_params params = {
-        .color = hint ? *hint : pl_color_space_srgb,
+        .color = *hint,
         .repr = {
             .sys = PL_COLOR_SYSTEM_RGB,
             .levels = p->output_levels ? p->output_levels : PL_COLOR_LEVELS_FULL,
@@ -1304,14 +1307,11 @@ static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
         },
     };
 
-    if (sw->fns->set_color && sw->fns->set_color(sw, hint ? &params : NULL)) {
-        if (hint) {
-            *hint = params.color;
-            return true;
-        }
-    }
-    pl_swapchain_colorspace_hint(p->sw, hint);
-    return false;
+    enum ra_color_hint_result result = ra_swapchain_set_color(
+        sw, pl_sw, &params);
+    if (result == RA_COLOR_HINT_EXTERNAL)
+        *hint = params.color;
+    return result == RA_COLOR_HINT_EXTERNAL;
 }
 
 static void update_tm_viz(struct pl_color_map_params *params,
@@ -1431,94 +1431,20 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // TODO: Implement this for all backends
     if (sw->fns->target_csp)
         target_csp = sw->fns->target_csp(sw);
-    if (target_csp.primaries == PL_COLOR_PRIM_UNKNOWN)
-        target_csp.primaries = mp_get_best_prim_container(&target_csp.hdr.prim);
-    if (!pl_color_transfer_is_hdr(target_csp.transfer)) {
-        // limit min_luma to 1000:1 contrast ratio in SDR mode
-        if (target_csp.hdr.min_luma > PL_COLOR_SDR_WHITE / PL_COLOR_SDR_CONTRAST)
-            target_csp.hdr.min_luma = 0;
-    }
-    // maxFALL in display metadata is in fact MaxFullFrameLuminance. Wayland
-    // reports it as maxFALL directly, but this doesn't mean the same thing.
-    target_csp.hdr.max_fall = 0;
-
-    struct pl_color_space hint = {0};
-    bool target_hint = p->next_opts->target_hint == 1 ||
-                       (p->next_opts->target_hint == -1 &&
-                        target_csp.transfer != PL_COLOR_TRC_UNKNOWN);
-    // Assume HDR is supported, if target_csp() is not available
-    // TODO: Remove this fallback when all backends support target_csp()
     bool target_unknown = target_csp.transfer == PL_COLOR_TRC_UNKNOWN;
-    float target_ref_luma = 0;
-    if (target_unknown) {
-        target_csp = (struct pl_color_space){
-            .transfer = opts->target_trc ? opts->target_trc : pl_color_space_hdr10.transfer };
-    } else {
-        target_ref_luma = get_ref_luma(p);
-    }
+    float target_ref_luma = target_unknown ? 0 : get_ref_luma(p);
+
+    const struct pl_color_space *source =
+        frame->current ? &frame->current->params.color : NULL;
+    struct pl_color_space hint = {0};
+    enum gl_target_hint_status hint_status = gl_video_prepare_target_hint(
+        opts, source, &target_csp,
+        p->ra_ctx->supports_auto_colorspace_hint, &hint);
+    bool target_hint = hint_status != GL_TARGET_HINT_DISABLED;
     bool external_params = false;
-    if (target_hint && frame->current) {
-        const struct pl_color_space *source = &frame->current->params.color;
-        const struct pl_color_space *target = &target_csp;
-        hint = *source;
-        // Apply target contrast to the hint, this is important for SDR, because
-        // libplacebo defaults to 1000:1 contrast ratio otherwise.
-        if (!hint.hdr.min_luma)
-            hint.hdr.min_luma = target->hdr.min_luma;
-        if (p->next_opts->target_hint_mode == 0) {
-            hint = *target;
-            if (pl_color_transfer_is_hdr(hint.transfer) && !pl_primaries_valid(&hint.hdr.prim))
-                pl_color_space_merge(&hint, source);
-            if (target_unknown && !opts->target_trc && !pl_color_transfer_is_hdr(source->transfer))
-                hint = *source;
-            // Restore target luminance if it was present, note that we check
-            // max_luma only, this make sure that max_cll/max_fall is not take
-            // from source.
-            if (target->hdr.max_luma) {
-                hint.hdr.max_luma = target->hdr.max_luma;
-                hint.hdr.min_luma = target->hdr.min_luma;
-                hint.hdr.max_cll  = target->hdr.max_cll;
-                hint.hdr.max_fall = target->hdr.max_fall;
-            }
-        }
-        if (p->next_opts->target_hint_mode == 2) { // source-dynamic
-            pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
-                .color      = &hint,
-                .metadata   = PL_HDR_METADATA_ANY,
-                .scaling    = PL_HDR_NITS,
-                .out_min    = !hint.hdr.min_luma ? &hint.hdr.min_luma : NULL,
-                .out_max    = &hint.hdr.max_luma,
-            ));
-            // Set maxCLL to dynamic max luminance. Note that libplacebo uses
-            // max luminace as maxCLL in practice.
-            hint.hdr.max_cll = hint.hdr.max_luma;
-            // Keep maxFALL from static metadata, unless its value is too high.
-            // Could be set to 0, but let's keep it for now.
-            if (hint.hdr.max_fall > hint.hdr.max_cll)
-                hint.hdr.max_fall = 0;
-        }
-        // Infer missing bits now. This is important so that we don't lose
-        // information after user option overrides. For example, if the user
-        // sets target_trc to PQ, but the hint(source) is SDR, we want to fill
-        // in SDR luminance values instead of the default PQ range.
-        struct pl_color_space source_csp = *source;
-        pl_color_space_infer_map(&source_csp, &hint);
-        // Always prefer target luminance and transfer for inverse tone mapping
-        if (pl_color_transfer_is_hdr(target->transfer) && opts->tone_map.inverse) {
-            hint.transfer     = target->transfer;
-            hint.hdr.max_luma = target->hdr.max_luma;
-            hint.hdr.min_luma = target->hdr.min_luma;
-            hint.hdr.max_cll  = target->hdr.max_cll;
-            hint.hdr.max_fall = target->hdr.max_fall;
-        }
-        if (opts->target_prim)
-            hint.primaries = opts->target_prim;
+    if (hint_status == GL_TARGET_HINT_VALID) {
         if (opts->target_gamut)
             mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &hint.hdr.prim);
-        if (opts->target_trc)
-            hint.transfer = opts->target_trc;
-        if (opts->target_peak)
-            hint.hdr.max_luma = opts->target_peak;
         if (target_ref_luma && use_ref_luma(&hint, &target_csp))
             hint.hdr.max_luma = target_ref_luma;
         // Always set maxCLL, display uses this metadata and we shouldn't let it
@@ -1553,7 +1479,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         if (p->icc_profile)
             hint = p->icc_profile->csp;
         external_params = set_colorspace_hint(p, &hint);
-    } else if (!target_hint) {
+    } else if (hint_status == GL_TARGET_HINT_DISABLED) {
         if (!hint.hdr.min_luma)
             hint.hdr.min_luma = target_csp.hdr.min_luma;
         external_params = set_colorspace_hint(p, NULL);
@@ -1561,7 +1487,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     struct pl_swapchain_frame swframe;
     bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
-    if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
+    pl_swapchain pl_sw = get_active_swapchain(p);
+    if (!pl_sw || !should_draw || !pl_swapchain_start_frame(pl_sw, &swframe)) {
         if (frame->current) {
             // Advance the queue state to the current PTS to discard unused frames
             struct pl_queue_params qparams = *pl_queue_params(
@@ -1583,7 +1510,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     pl_frame_from_swapchain(&target, &swframe);
     if (external_params)
         target.color = hint;
-    bool strict_sw_params = target_hint && p->next_opts->target_hint_strict;
+    bool strict_sw_params = target_hint && opts->target_hint_strict;
     apply_target_options(p, &target, hint.hdr.min_luma, strict_sw_params,
                          target_ref_luma, &target_csp);
     bool clip_gamut = pl_primaries_valid(&target.color.hdr.prim);
@@ -1786,9 +1713,10 @@ static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    pl_swapchain pl_sw = get_active_swapchain(p);
 
     if (p->frame_pending) {
-        if (!pl_swapchain_submit_frame(p->sw))
+        if (pl_sw && !pl_swapchain_submit_frame(pl_sw))
             MP_ERR(vo, "Failed presenting frame!\n");
         p->frame_pending = false;
     }

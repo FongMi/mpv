@@ -491,10 +491,12 @@ endif
 
 features += {'android': host_machine.system() == 'android'}
 if features['android']
-    dependencies += cc.find_library('android')
+    dependencies += [cc.find_library('android'), cc.find_library('EGL'),
+                     cc.find_library('GLESv2')]
     sources += files('misc/jni.c',
                      'osdep/android/strnlen.c',
                      'video/out/android_common.c',
+                     'video/out/android_osd_overlay.c',
                      'video/out/vo_mediacodec_embed.c')
 endif
 

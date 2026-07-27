@@ -335,6 +335,7 @@ typedef struct MPContext {
     struct vo_chain *vo_chain;
 
     struct vo *video_out;
+    struct track *android_dolby_vision_direct_failed_track;
     // next_frame[0] is the next frame, next_frame[1] the one after that.
     // The +1 is for adding 1 additional frame in backstep mode.
     struct mp_image *next_frames[VO_MAX_REQ_FRAMES + 1];
@@ -571,7 +572,7 @@ struct track *select_default_track(struct MPContext *mpctx, int order,
                                    enum stream_type type);
 void prefetch_next(struct MPContext *mpctx);
 void update_lavfi_complex(struct MPContext *mpctx);
-void update_vo_chain_el_pair(struct MPContext *mpctx);
+void update_vo_chain_el_state(struct MPContext *mpctx);
 
 // main.c
 int mp_initialize(struct MPContext *mpctx, char **argv);
@@ -687,6 +688,11 @@ bool disc_nav_mouse_pos_to_src(struct MPContext *mpctx, int src_w, int src_h,
 // video.c
 void reset_video_state(struct MPContext *mpctx);
 int init_video_decoder(struct MPContext *mpctx, struct track *track);
+bool wants_android_dolby_vision_direct_output(struct MPContext *mpctx,
+                                              struct track *track);
+bool should_use_android_dolby_vision_direct_output(struct MPContext *mpctx,
+                                                   struct track *track);
+bool is_android_dolby_vision_direct_output_active(struct MPContext *mpctx);
 void reinit_video_chain(struct MPContext *mpctx);
 void reinit_video_chain_src(struct MPContext *mpctx, struct track *track);
 int reinit_video_filters(struct MPContext *mpctx);

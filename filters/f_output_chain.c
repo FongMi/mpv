@@ -48,6 +48,7 @@ struct chain {
     // no EL is paired.
     struct mp_user_filter *el_pair;
     struct sh_stream *el_sh;
+    bool el_force_swdec;
 
     struct vo *vo;
     struct ao *ao;
@@ -403,13 +404,15 @@ void mp_output_chain_set_vo(struct mp_output_chain *c, struct vo *vo)
 }
 
 void mp_output_chain_set_el_stream(struct mp_output_chain *c,
-                                   struct sh_stream *el_sh)
+                                   struct sh_stream *el_sh,
+                                   bool force_swdec)
 {
     struct chain *p = c->f->priv;
 
     mp_assert(p->type == MP_OUTPUT_CHAIN_VIDEO);
 
-    if (p->el_sh == el_sh && (!el_sh || p->el_pair))
+    if (p->el_sh == el_sh && p->el_force_swdec == force_swdec &&
+        (!el_sh || p->el_pair))
         return;
 
     if (p->el_pair) {
@@ -422,12 +425,13 @@ void mp_output_chain_set_el_stream(struct mp_output_chain *c,
         talloc_free(p->el_pair->wrapper);
         p->el_pair = NULL;
         p->el_sh = NULL;
+        p->el_force_swdec = false;
     }
 
     if (el_sh) {
         struct mp_user_filter *u = create_wrapper_filter(p);
         u->name = "el_pair";
-        u->f = mp_enhancement_pair_create(u->wrapper, el_sh);
+        u->f = mp_enhancement_pair_create(u->wrapper, el_sh, force_swdec);
         if (!u->f) {
             MP_WARN(p, "Failed to set up enhancement-layer pairing.\n");
             talloc_free(u->wrapper);
@@ -435,6 +439,7 @@ void mp_output_chain_set_el_stream(struct mp_output_chain *c,
             MP_TARRAY_APPEND(p, p->post_filters, p->num_post_filters, u);
             p->el_pair = u;
             p->el_sh = el_sh;
+            p->el_force_swdec = force_swdec;
         }
     }
 

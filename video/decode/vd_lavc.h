@@ -17,16 +17,11 @@
 
 #pragma once
 
-#include <android/native_window_jni.h>
+#include <stdbool.h>
 
-#include "common/common.h"
+struct MPOpts;
 
-struct vo;
-
-bool vo_android_init(struct vo *vo);
-void vo_android_uninit(struct vo *vo);
-ANativeWindow *vo_android_create_native_window(struct vo *vo);
-void vo_android_set_native_window(struct vo *vo, ANativeWindow *native_window);
-ANativeWindow *vo_android_native_window(struct vo *vo);
-bool vo_android_has_native_window(struct vo *vo);
-bool vo_android_surface_size(struct vo *vo, int *w, int *h);
+// Whether the ordered --hwdec list prefers a direct method from this API.
+// This follows selection order without probing device availability.
+bool vd_lavc_hwdec_api_preferred(const struct MPOpts *opts, const char *api,
+                                 const char *codec);

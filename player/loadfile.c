@@ -1636,15 +1636,36 @@ done:
     return success ? 1 : -1;
 }
 
-// Match the enhancement-layer pairing on the vo_chain to the currently
-// selected video track. Idempotent. Decoupled from lavfi-complex internals.
-void update_vo_chain_el_pair(struct MPContext *mpctx)
+// Match enhancement-layer selection and pairing to the active video output.
+// Native Dolby Vision consumes the original bitstream directly; GPU output
+// needs the dependent EL stream selected and paired with decoded BL frames.
+void update_vo_chain_el_state(struct MPContext *mpctx)
 {
     if (!mpctx->vo_chain || !mpctx->vo_chain->filter)
         return;
+
     struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    struct sh_stream *el =
+        track ? sh_stream_dependent_sibling(track->stream) : NULL;
+    bool use_el = el && !is_android_dolby_vision_direct_output_active(mpctx);
+    char *hwdec = NULL;
+    // Android zero-copy MediaCodec decoders share the VO's single output
+    // surface. Keep the dependent EL decoder off that surface.
+    bool force_el_swdec =
+        use_el && track && track->dec &&
+        mp_decoder_wrapper_control(track->dec, VDCTRL_GET_SELECTED_HWDEC,
+                                   &hwdec) == CONTROL_TRUE &&
+        hwdec && strcmp(hwdec, "mediacodec") == 0;
+
+    if (el) {
+        double pts = get_current_time(mpctx);
+        if (pts != MP_NOPTS_VALUE)
+            pts += get_track_seek_offset(mpctx, track);
+        demuxer_select_track(track->demuxer, el, pts, use_el);
+    }
+
     mp_output_chain_set_el_stream(mpctx->vo_chain->filter,
-        track ? sh_stream_dependent_sibling(track->stream) : NULL);
+                                  use_el ? el : NULL, force_el_swdec);
 }
 
 void update_lavfi_complex(struct MPContext *mpctx)
@@ -1654,7 +1675,7 @@ void update_lavfi_complex(struct MPContext *mpctx)
         if (r != 0)
             issue_refresh_seek(mpctx, MPSEEK_EXACT);
         if (r > 0)
-            update_vo_chain_el_pair(mpctx);
+            update_vo_chain_el_state(mpctx);
     }
 }
 
@@ -1822,6 +1843,7 @@ static void play_current_file(struct MPContext *mpctx)
     mpctx->speed_factor_a = mpctx->speed_factor_v = 1.0;
     mpctx->display_sync_error = 0.0;
     mpctx->display_sync_active = false;
+    mpctx->android_dolby_vision_direct_failed_track = NULL;
     // let get_current_time() show 0 as start time (before playback_pts is set)
     mpctx->last_seek_pts = 0.0;
     mpctx->seek = (struct seek_params){ 0 };
@@ -2007,7 +2029,7 @@ static void play_current_file(struct MPContext *mpctx)
     reinit_sub_all(mpctx);
     // For lavfi-complex mode reinit_video_chain skips chain setup, so set up
     // the enhancement-layer pairing here. No-op in non-lavfi-complex mode.
-    update_vo_chain_el_pair(mpctx);
+    update_vo_chain_el_state(mpctx);
 
     if (mpctx->encode_lavc_ctx) {
         if (mpctx->vo_chain)

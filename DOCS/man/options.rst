@@ -7202,6 +7202,48 @@ them.
 
     Android with ``--gpu-context=android`` only.
 
+``--android-dolby-vision-output=<configured|direct>``
+    Select how Dolby Vision video tracks are sent to an Android rendering
+    surface:
+
+    :configured: Keep the configured video output. This is the default.
+    :direct: Use ``vo=mediacodec_embed`` for Dolby Vision tracks so MediaCodec
+             renders directly to the application surface. Non-Dolby Vision
+             tracks continue to use the configured video output.
+
+    ``direct`` requires ``hwdec=mediacodec``, a SurfaceView-backed video
+    surface (``--wid``), and a transparent OSD surface
+    (``--android-osd-wid``). The video bypasses mpv's GPU renderer.
+    Subtitles and mpv OSD are rendered into the separate transparent surface,
+    including styled ASS/SSA, text subtitles, image subtitles, primary plus
+    secondary tracks, and script-provided OSD such as the stats overlay. Video
+    filters, screenshots, and GPU tone mapping remain unavailable while a
+    Dolby Vision track is using direct output. If the direct video surface,
+    decoder initialization, or overlay surface repeatedly fails, mpv retries
+    the track through the configured video output. Profiles without a
+    standards-compatible base layer then require software decoding; compatible
+    profiles may fall back to their base-layer HDR or SDR representation
+    instead of native Dolby Vision.
+
+    Android only.
+
+``--android-osd-wid=<ID>``
+    Android embedding option that supplies a retained Java ``Surface`` global
+    reference for the transparent OSD plane used by direct MediaCodec output.
+    It carries subtitles, mpv OSD, and script-provided overlays. The embedding
+    application owns the reference and must keep it valid until the option is
+    replaced or reset to ``0``.
+
+    Android only.
+
+``--android-osd-surface-size=<WxH>``
+    Set the dimensions of the transparent OSD surface used by direct
+    MediaCodec output. The embedding application should update this option
+    from the OSD surfaceChanged callback so subtitle and OSD geometry follows
+    runtime layout changes without waiting for a later buffer swap.
+
+    Android only.
+
 ``--d3d11-composition-size=<WxH>``
     Set size of the output for d3d11 composition mode.
     When use composition mode, there is no window, must set the output size by

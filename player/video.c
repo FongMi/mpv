@@ -20,6 +20,10 @@
 #include <inttypes.h>
 #include <math.h>
 #include <assert.h>
+#include <string.h>
+
+#include <libavcodec/codec_par.h>
+#include <libavutil/pixfmt.h>
 
 #include "mpv_talloc.h"
 
@@ -38,8 +42,10 @@
 #include "stream/stream.h"
 #include "sub/osd.h"
 #include "video/hwdec.h"
+#include "video/decode/vd_lavc.h"
 #include "filters/f_decoder_wrapper.h"
 #include "filters/f_enhancement_pair.h"
+#include "video/out/gpu/video.h"
 #include "video/out/vo.h"
 
 #include "core.h"
@@ -173,7 +179,8 @@ void uninit_video_chain(struct MPContext *mpctx)
     }
 }
 
-int init_video_decoder(struct MPContext *mpctx, struct track *track)
+static int try_init_video_decoder(struct MPContext *mpctx,
+                                  struct track *track)
 {
     mp_assert(!track->dec);
     if (!track->stream)
@@ -205,8 +212,15 @@ err_out:
     if (track->sink)
         mp_pin_disconnect(track->sink);
     track->sink = NULL;
-    error_on_track(mpctx, track);
     return 0;
+}
+
+int init_video_decoder(struct MPContext *mpctx, struct track *track)
+{
+    int result = try_init_video_decoder(mpctx, track);
+    if (!result)
+        error_on_track(mpctx, track);
+    return result;
 }
 
 void reinit_video_chain(struct MPContext *mpctx)
@@ -227,10 +241,110 @@ static void filter_update_subtitles(void *ctx, double pts)
         update_subtitles(mpctx, pts);
 }
 
+static bool is_android_dolby_vision_track(struct track *track)
+{
+#if HAVE_ANDROID
+    return track && track->stream && track->stream->codec &&
+           track->stream->codec->dovi;
+#else
+    return false;
+#endif
+}
+
+#if HAVE_ANDROID
+static bool should_prefer_android_hdr_output(struct MPContext *mpctx,
+                                             struct track *track)
+{
+    // An explicit target transfer is the output policy. With colorspace hints
+    // disabled, keep the default SDR surface. Otherwise infer from the source.
+    int target_trc = mpctx->opts->gl_video_opts->target_trc;
+    if (target_trc != PL_COLOR_TRC_UNKNOWN)
+        return pl_color_transfer_is_hdr(target_trc);
+    if (mpctx->opts->gl_video_opts->target_hint == GL_TARGET_HINT_OFF)
+        return false;
+
+    if (!track || !track->stream || !track->stream->codec)
+        return false;
+
+    struct mp_codec_params *codec = track->stream->codec;
+    if (codec->dovi || pl_color_transfer_is_hdr(codec->color.transfer))
+        return true;
+
+    // Lavf can keep stream-level PQ/HLG only in AVCodecParameters until the
+    // decoder produces its first frame. EGL output depth is chosen before then.
+    const AVCodecParameters *avp = codec->lav_codecpar;
+    return avp && (avp->color_trc == AVCOL_TRC_SMPTE2084 ||
+                   avp->color_trc == AVCOL_TRC_ARIB_STD_B67);
+}
+#endif
+
+bool wants_android_dolby_vision_direct_output(struct MPContext *mpctx,
+                                              struct track *track)
+{
+#if HAVE_ANDROID
+    return is_android_dolby_vision_track(track) &&
+           mpctx->opts->vo->android_dolby_vision_output ==
+               ANDROID_DOLBY_VISION_OUTPUT_DIRECT &&
+           vd_lavc_hwdec_api_preferred(mpctx->opts, "mediacodec",
+                                       track->stream->codec->codec) &&
+           mpctx->android_dolby_vision_direct_failed_track != track;
+#else
+    return false;
+#endif
+}
+
+bool should_use_android_dolby_vision_direct_output(struct MPContext *mpctx,
+                                                   struct track *track)
+{
+#if HAVE_ANDROID
+    bool video_surface_ready =
+        mpctx->opts->vo->WinID != 0 && mpctx->opts->vo->WinID != -1;
+    // The overlay can detach independently after direct output is active. The
+    // MediaCodec video Surface cannot: losing it tears the direct VO down.
+    bool osd_surface_ready =
+        (mpctx->opts->vo->android_osd_wid != 0 &&
+         mpctx->opts->vo->android_osd_wid != -1) ||
+        is_android_dolby_vision_direct_output_active(mpctx);
+    return wants_android_dolby_vision_direct_output(mpctx, track) &&
+           video_surface_ready && osd_surface_ready;
+#else
+    return false;
+#endif
+}
+
+bool is_android_dolby_vision_direct_output_active(struct MPContext *mpctx)
+{
+    return mpctx->video_out &&
+           (mpctx->video_out->driver->caps & VO_CAP_NATIVE_DOVI);
+}
+
+#if HAVE_ANDROID
+static bool is_android_opengl_output_active(struct MPContext *mpctx)
+{
+    return mpctx->video_out && mpctx->video_out->context_name &&
+           strcmp(mpctx->video_out->context_name, "android") == 0;
+}
+#endif
+
 // (track=NULL creates a blank chain, used for lavfi-complex)
 void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
 {
     mp_assert(!mpctx->vo_chain);
+
+    bool use_dovi_direct =
+        should_use_android_dolby_vision_direct_output(mpctx, track);
+    bool replace_video_out =
+        mpctx->video_out &&
+        is_android_dolby_vision_direct_output_active(mpctx) != use_dovi_direct;
+    bool prefer_hdr_output = false;
+#if HAVE_ANDROID
+    prefer_hdr_output = should_prefer_android_hdr_output(mpctx, track);
+    replace_video_out |=
+        is_android_opengl_output_active(mpctx) &&
+        mpctx->video_out->extra.prefer_hdr_output != prefer_hdr_output;
+#endif
+    if (replace_video_out)
+        uninit_video_out(mpctx);
 
     if (!mpctx->video_out) {
         struct vo_extra ex = {
@@ -239,8 +353,23 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
             .encode_lavc_ctx = mpctx->encode_lavc_ctx,
             .wakeup_cb = mp_wakeup_core_cb,
             .wakeup_ctx = mpctx,
+            .prefer_hdr_output = prefer_hdr_output,
         };
-        mpctx->video_out = init_best_video_out(mpctx->global, &ex);
+        if (use_dovi_direct) {
+            MP_INFO(mpctx, "Using direct MediaCodec Surface output for "
+                    "Dolby Vision.\n");
+            mpctx->video_out =
+                init_video_out_by_name(mpctx->global, &ex,
+                                       "mediacodec_embed");
+            if (!mpctx->video_out) {
+                MP_WARN(mpctx, "Direct Dolby Vision output is unavailable; "
+                               "falling back to the configured video output.\n");
+                mpctx->android_dolby_vision_direct_failed_track = track;
+            }
+        }
+        if (!mpctx->video_out) {
+            mpctx->video_out = init_best_video_out(mpctx->global, &ex);
+        }
         if (!mpctx->video_out) {
             MP_FATAL(mpctx, "Error opening/initializing "
                     "the selected video_out (--vo) device.\n");
@@ -265,7 +394,9 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
     if (track) {
         vo_c->track = track;
         track->vo_c = vo_c;
-        if (!init_video_decoder(mpctx, track))
+        // A direct Dolby Vision decoder failure must leave the track selected
+        // so the same track can be retried immediately through the configured VO.
+        if (!try_init_video_decoder(mpctx, track))
             goto err_out;
 
         vo_c->dec_src = track->dec->f->pins[0];
@@ -283,7 +414,7 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
         mp_pin_connect(vo_c->filter->f->pins[0], vo_c->dec_src);
     }
 
-    update_vo_chain_el_pair(mpctx);
+    update_vo_chain_el_state(mpctx);
 
     if (!recreate_video_filters(mpctx))
         goto err_out;
@@ -299,6 +430,18 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
     return;
 
 err_out:
+    if (is_android_dolby_vision_direct_output_active(mpctx) &&
+        should_use_android_dolby_vision_direct_output(mpctx, track))
+    {
+        MP_WARN(mpctx, "Direct Dolby Vision initialization failed; retrying "
+                       "this track through the configured video output.\n");
+        mpctx->android_dolby_vision_direct_failed_track = track;
+        uninit_video_out(mpctx);
+        mpctx->error_playing = 0;
+        handle_force_window(mpctx, true);
+        reinit_video_chain_src(mpctx, track);
+        return;
+    }
     uninit_video_chain(mpctx);
     error_on_track(mpctx, track);
     handle_force_window(mpctx, true);
@@ -597,6 +740,30 @@ static bool check_for_forced_eof(struct MPContext *mpctx)
 
     mp_decoder_wrapper_control(dec, VDCTRL_CHECK_FORCED_EOF, &forced_eof);
     return forced_eof;
+}
+
+static bool fallback_from_android_dolby_vision_direct(
+    struct MPContext *mpctx, struct track *track)
+{
+    if (!is_android_dolby_vision_direct_output_active(mpctx) ||
+        !should_use_android_dolby_vision_direct_output(mpctx, track))
+        return false;
+
+    MP_WARN(mpctx, "Direct Dolby Vision output failed; retrying this track "
+                   "through the configured video output.\n");
+    double last_pts = mpctx->video_pts;
+    if (track->dec && last_pts != MP_NOPTS_VALUE) {
+        mp_decoder_wrapper_suspend(track->dec);
+        queue_seek(mpctx, MPSEEK_ABSOLUTE, last_pts, MPSEEK_EXACT, 0);
+        execute_queued_seek(mpctx);
+    }
+    uninit_video_out(mpctx);
+    mpctx->android_dolby_vision_direct_failed_track = track;
+    mpctx->error_playing = 0;
+    handle_force_window(mpctx, true);
+    reinit_video_chain(mpctx);
+    mp_wakeup_core(mpctx);
+    return true;
 }
 
 /* Update avsync before a new video frame is displayed. Actually, this can be
@@ -1052,6 +1219,10 @@ void write_video(struct MPContext *mpctx)
     struct vo_chain *vo_c = mpctx->vo_chain;
     struct vo *vo = vo_c->vo;
 
+    if (is_android_dolby_vision_direct_output_active(mpctx) &&
+        vo_query_backend_error(vo))
+        goto error;
+
     if (vo_c->filter->reconfig_happened) {
         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
         vo_c->filter->reconfig_happened = false;
@@ -1093,6 +1264,8 @@ void write_video(struct MPContext *mpctx)
         if (check_for_hwdec_fallback(mpctx))
             return;
         if (check_for_forced_eof(mpctx)) {
+            if (fallback_from_android_dolby_vision_direct(mpctx, track))
+                return;
             uninit_video_chain(mpctx);
             handle_force_window(mpctx, true);
             return;
@@ -1344,6 +1517,8 @@ void write_video(struct MPContext *mpctx)
     return;
 
 error:
+    if (fallback_from_android_dolby_vision_direct(mpctx, track))
+        return;
     MP_FATAL(mpctx, "Could not initialize video chain.\n");
     uninit_video_chain(mpctx);
     error_on_track(mpctx, track);

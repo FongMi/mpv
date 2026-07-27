@@ -38,22 +38,10 @@ bool vo_android_init(struct vo *vo)
         .log = mp_log_new(ctx, vo->log, "android"),
     };
 
-    JNIEnv *env = MP_JNI_GET_ENV(ctx);
-    if (!env) {
-        MP_FATAL(ctx, "Could not attach java VM.\n");
+    ANativeWindow *native_window = vo_android_create_native_window(vo);
+    if (!native_window)
         goto fail;
-    }
-
-    if (vo->opts->WinID == 0 || vo->opts->WinID == -1) {
-        MP_FATAL(ctx, "Missing surface pointer\n");
-        goto fail;
-    }
-    jobject surface = (jobject)(intptr_t)vo->opts->WinID;
-    ctx->native_window = ANativeWindow_fromSurface(env, surface);
-    if (!ctx->native_window) {
-        MP_FATAL(ctx, "Failed to create ANativeWindow\n");
-        goto fail;
-    }
+    vo_android_set_native_window(vo, native_window);
 
     return true;
 fail:
@@ -75,15 +63,60 @@ void vo_android_uninit(struct vo *vo)
     vo->android = NULL;
 }
 
+ANativeWindow *vo_android_create_native_window(struct vo *vo)
+{
+    struct vo_android_state *ctx = vo->android;
+    if (!ctx)
+        return NULL;
+
+    JNIEnv *env = MP_JNI_GET_ENV(ctx);
+    if (!env) {
+        MP_ERR(ctx, "Could not attach java VM.\n");
+        return NULL;
+    }
+
+    if (vo->opts->WinID == 0 || vo->opts->WinID == -1) {
+        MP_ERR(ctx, "Missing surface pointer\n");
+        return NULL;
+    }
+
+    jobject surface = (jobject)(intptr_t)vo->opts->WinID;
+    ANativeWindow *native_window = ANativeWindow_fromSurface(env, surface);
+    if (!native_window)
+        MP_ERR(ctx, "Failed to create ANativeWindow\n");
+    return native_window;
+}
+
+void vo_android_set_native_window(struct vo *vo, ANativeWindow *native_window)
+{
+    struct vo_android_state *ctx = vo->android;
+    if (!ctx) {
+        if (native_window)
+            ANativeWindow_release(native_window);
+        return;
+    }
+
+    if (ctx->native_window)
+        ANativeWindow_release(ctx->native_window);
+    ctx->native_window = native_window;
+}
+
 ANativeWindow *vo_android_native_window(struct vo *vo)
 {
     struct vo_android_state *ctx = vo->android;
-    return ctx->native_window;
+    return ctx ? ctx->native_window : NULL;
+}
+
+bool vo_android_has_native_window(struct vo *vo)
+{
+    return vo_android_native_window(vo) != NULL;
 }
 
 bool vo_android_surface_size(struct vo *vo, int *out_w, int *out_h)
 {
     struct vo_android_state *ctx = vo->android;
+    if (!ctx || !ctx->native_window)
+        return false;
 
     int w = vo->opts->android_surface_size.w,
         h = vo->opts->android_surface_size.h;

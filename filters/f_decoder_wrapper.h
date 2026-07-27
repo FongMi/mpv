@@ -74,6 +74,8 @@ void mp_decoder_wrapper_set_start_pts(struct mp_decoder_wrapper *d, double pts);
 enum dec_ctrl {
     VDCTRL_FORCE_HWDEC_FALLBACK, // force software decoding fallback
     VDCTRL_GET_HWDEC,
+    // Return the selected hwdec before the first decoded frame is reported.
+    VDCTRL_GET_SELECTED_HWDEC,
     VDCTRL_REINIT,
     VDCTRL_GET_BFRAMES,
     // framedrop mode: 0=none, 1=standard, 2=hrseek

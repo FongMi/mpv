@@ -1055,6 +1055,16 @@ int handle_force_window(struct MPContext *mpctx, bool force)
     if (mpctx->vo_chain && !stalled_video)
         return 0;
 
+#if HAVE_ANDROID
+    // Android VOs require a real application Surface. Do not create a new GPU
+    // VO while the app is detached; a later wid update will restore it.
+    if (mpctx->opts->vo->WinID == 0 || mpctx->opts->vo->WinID == -1) {
+        if (!mpctx->vo_chain && mpctx->video_out)
+            uninit_video_out(mpctx);
+        return 0;
+    }
+#endif
+
     if (!mpctx->opts->force_vo) {
         if (act && !mpctx->vo_chain)
             uninit_video_out(mpctx);
@@ -1289,7 +1299,7 @@ void run_playloop(struct MPContext *mpctx)
 
     update_sparse_video(mpctx);
 
-    update_vo_chain_el_pair(mpctx);
+    update_vo_chain_el_state(mpctx);
 
     handle_cursor_autohide(mpctx);
     handle_vo_events(mpctx);

@@ -115,6 +115,11 @@ static void inherit_dovi_from_el(struct mp_image *bl, struct mp_image *el)
     bl->params.color.hdr.avg_pq_y = el->params.color.hdr.avg_pq_y;
 }
 
+static bool dovi_needs_el_pixels(const struct mp_image *img)
+{
+    return !img->params.repr.dovi || img->params.repr.dovi->nlq_active;
+}
+
 static void pair_process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
@@ -152,7 +157,7 @@ static void pair_process(struct mp_filter *f)
             struct mp_image *el = take_head(&p->el_pending, &p->num_el_pending);
             take_head(&p->bl_pending, &p->num_bl_pending);
             inherit_dovi_from_el(bl, el);
-            if (bl->params.no_enhancement_layer) {
+            if (bl->params.no_enhancement_layer || !dovi_needs_el_pixels(bl)) {
                 talloc_free(el);
             } else {
                 bl->enhancement_layer = el;
@@ -213,7 +218,8 @@ static const struct mp_filter_info pair_filter = {
 };
 
 struct mp_filter *mp_enhancement_pair_create(struct mp_filter *parent,
-                                             struct sh_stream *el_sh)
+                                             struct sh_stream *el_sh,
+                                             bool force_swdec)
 {
     if (!el_sh)
         return NULL;
@@ -225,6 +231,17 @@ struct mp_filter *mp_enhancement_pair_create(struct mp_filter *parent,
     mp_filter_add_pin(f, MP_PIN_OUT, "out");
 
     struct priv *p = f->priv;
+    if (force_swdec) {
+        struct mp_stream_info *parent_info = mp_filter_find_stream_info(f);
+        struct mp_stream_info *info = talloc_zero(f, struct mp_stream_info);
+        if (parent_info)
+            *info = *parent_info;
+        info->force_swdec = true;
+        f->stream_info = info;
+        MP_INFO(f, "Using software decoding for the Dolby Vision "
+                   "enhancement layer to avoid sharing a MediaCodec "
+                   "output surface.\n");
+    }
     p->el_dec = mp_decoder_wrapper_create(f, el_sh);
     if (p->el_dec)
         mp_decoder_wrapper_set_extra_hw_frames(p->el_dec, QUEUE_MAX);
