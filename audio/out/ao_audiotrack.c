@@ -33,6 +33,10 @@
 static mp_static_mutex jni_static_lock = MP_STATIC_MUTEX_INITIALIZER;
 static int jni_static_use_count = 0;
 
+enum {
+    ANDROID_API_LEVEL_S = 31,
+};
+
 struct priv {
     jobject audiotrack;
     jint samplerate;
@@ -233,6 +237,18 @@ static const struct MPJniField AudioFormatBuilder_mapping[] = {
 };
 #undef OFFSET
 
+static struct JNIBuildVersion {
+    jclass clazz;
+    jint SDK_INT;
+} BuildVersion;
+#define OFFSET(member) offsetof(struct JNIBuildVersion, member)
+static const struct MPJniField BuildVersion_mapping[] = {
+    {"android/os/Build$VERSION", NULL, MP_JNI_CLASS, OFFSET(clazz), 1},
+    {"SDK_INT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(SDK_INT), 1},
+    {0}
+};
+#undef OFFSET
+
 static struct JNIAudioManager {
     jclass clazz;
     jint ERROR_DEAD_OBJECT;
@@ -274,6 +290,7 @@ static const struct {
     ENTRY(AudioAttributesBuilder),
     ENTRY(AudioFormat),
     ENTRY(AudioFormatBuilder),
+    ENTRY(BuildVersion),
     ENTRY(AudioManager),
     ENTRY(AudioTimestamp),
 };
@@ -673,7 +690,7 @@ static int init(struct ao *ao)
         p->format = AudioFormat.ENCODING_PCM_16BIT;
     }
 
-    if (AudioTrack.getNativeOutputSampleRate) {
+    if (!af_fmt_is_spdif(ao->format) && AudioTrack.getNativeOutputSampleRate) {
         jint samplerate = MP_JNI_CALL_STATIC_INT(
             AudioTrack.clazz,
             AudioTrack.getNativeOutputSampleRate,
@@ -712,6 +729,9 @@ static int init(struct ao *ao)
     static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
     if (p->format == AudioFormat.ENCODING_IEC61937) {
         p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
+        // Android accepts an 8-channel IEC61937 carrier from API 31 onward.
+        if (BuildVersion.SDK_INT >= ANDROID_API_LEVEL_S && ao->channels.num == 8)
+            p->channel_config = AudioFormat.CHANNEL_OUT_7POINT1_SURROUND;
     } else {
         struct mp_chmap_sel sel = {0};
         for (int i = 0; i < MP_ARRAY_SIZE(layouts); i++) {
