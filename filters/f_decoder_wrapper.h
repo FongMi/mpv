@@ -86,6 +86,12 @@ enum dec_ctrl {
 int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
                                enum dec_ctrl cmd, void *arg);
 
+// Keep an asynchronous decoder from consuming packets while the caller seeks
+// and reinitializes it. Resume it before playback continues, unless the wrapper
+// is destroyed as part of the reinitialization.
+void mp_decoder_wrapper_suspend(struct mp_decoder_wrapper *d);
+void mp_decoder_wrapper_resume(struct mp_decoder_wrapper *d);
+
 // Force it to reevaluate output parameters (for overrides like aspect).
 void mp_decoder_wrapper_reset_params(struct mp_decoder_wrapper *d);
 

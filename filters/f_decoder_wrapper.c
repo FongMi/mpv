@@ -222,6 +222,7 @@ struct priv {
     struct mp_async_queue *queue; // decoded frame output queue
     struct mp_dispatch_queue *dec_dispatch; // non-NULL if decoding thread used
     bool dec_thread_lock; // debugging (esp. for no-thread case)
+    bool queue_suspended;
     mp_thread dec_thread;
     bool dec_thread_valid;
     mp_mutex cache_lock;
@@ -306,11 +307,9 @@ static void thread_unlock(struct priv *p)
         mp_dispatch_unlock(p->dec_dispatch);
 }
 
-// This resets only the decoder. Unlike a full reset(), this doesn't imply a
-// seek reset. This distinction exists only when using timeline stuff (EDL and
-// ordered chapters). timeline stuff needs to reset the decoder state, but keep
-// some of the user-relevant state.
-static void reset_decoder(struct priv *p)
+// Reset decoder-wrapper state without resetting the decoder filter itself.
+// mp_filter_reset() already resets children before invoking decf_reset().
+static void reset_decoder_state(struct priv *p)
 {
     p->first_packet_pdts = MP_NOPTS_VALUE;
     p->start_pts = MP_NOPTS_VALUE;
@@ -326,7 +325,13 @@ static void reset_decoder(struct priv *p)
     talloc_free(p->new_segment);
     p->new_segment = NULL;
     p->start = p->end = MP_NOPTS_VALUE;
+}
 
+// Timeline segment changes reset only the decoder and wrapper state, without
+// implying the user-visible state changes of a full seek reset.
+static void reset_decoder(struct priv *p)
+{
+    reset_decoder_state(p);
     if (p->decoder)
         mp_filter_reset(p->decoder->f);
 }
@@ -353,7 +358,7 @@ static void decf_reset(struct mp_filter *f)
     p->reverse_queue_byte_size = 0;
     p->reverse_queue_complete = false;
 
-    reset_decoder(p);
+    reset_decoder_state(p);
 }
 
 int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
@@ -386,6 +391,36 @@ int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
     }
     thread_unlock(p);
     return res;
+}
+
+void mp_decoder_wrapper_suspend(struct mp_decoder_wrapper *d)
+{
+    struct priv *p = d->f->priv;
+    if (p->is_group) {
+        for (int i = 0; i < p->num_children; i++)
+            mp_decoder_wrapper_suspend(p->children[i]);
+        return;
+    }
+
+    mp_assert(!p->queue_suspended);
+    p->queue_suspended = true;
+    if (p->queue)
+        mp_async_queue_reset(p->queue);
+}
+
+void mp_decoder_wrapper_resume(struct mp_decoder_wrapper *d)
+{
+    struct priv *p = d->f->priv;
+    if (p->is_group) {
+        for (int i = 0; i < p->num_children; i++)
+            mp_decoder_wrapper_resume(p->children[i]);
+        return;
+    }
+
+    mp_assert(p->queue_suspended);
+    p->queue_suspended = false;
+    if (p->queue)
+        mp_async_queue_resume(p->queue);
 }
 
 static void decf_destroy(struct mp_filter *f)
@@ -425,7 +460,7 @@ static bool reinit_decoder(struct priv *p)
         talloc_free(p->decoder->f);
     p->decoder = NULL;
 
-    reset_decoder(p);
+    reset_decoder_state(p);
     p->has_broken_packet_pts = -10; // needs 10 packets to reach decision
 
     const struct mp_decoder_fns *driver = NULL;
@@ -1218,7 +1253,8 @@ static void public_f_reset(struct mp_filter *f)
         mp_filter_reset(p->dec_root_filter);
         mp_dispatch_interrupt(p->dec_dispatch);
         thread_unlock(p);
-        mp_async_queue_resume(p->queue);
+        if (!p->queue_suspended)
+            mp_async_queue_resume(p->queue);
     }
 }
 
