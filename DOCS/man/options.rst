@@ -7340,11 +7340,15 @@ them.
     depending on the GPU context and platform this may affect compositor/display.
     This can be used for "HDR passthrough" and to set the output colorspace
     for SDR content. In ``auto`` mode, the target colorspace is only set if the
-    current display parameters are known. Currently, this is supported on
-    Wayland, D3D11 and winvk contexts. The ``yes`` option will always try to set
+    current display parameters are known, or if the output context can safely
+    negotiate the requested colorspace. Currently, this is supported on Wayland,
+    winvk, androidvk and Android/EGL contexts with ``--vo=gpu`` or
+    ``--vo=gpu-next``, and on D3D11 with ``--vo=gpu-next``. Android/EGL requires
+    the requested EGL colorspace extension. If the display parameters are
+    unknown, ``auto`` uses source metadata and respects the colorspace actually
+    negotiated by the output context. The ``yes`` option will always try to set
     the colorspace, you may need to adjust the ``--target-*`` options to match
-    your display capabilities.
-    Requires a supporting driver and ``--vo=gpu-next``. (Default: ``auto``)
+    your display capabilities. (Default: ``auto``)
 
     .. note::
         Auto detected target colorspace metadata is not guaranteed to be always
@@ -7353,7 +7357,6 @@ them.
 
 ``--target-colorspace-hint-mode=<target|source|source-dynamic>``
     Select which metadata to use for the ``--target-colorspace-hint``.
-    (Only for ``--vo=gpu-next``)
 
     target
         Uses metadata based on the target display's actual capabilities. This
@@ -7446,7 +7449,7 @@ them.
     hint, while the negotiated swapchain format is used for rendering output.
     This ensures correct results, since downstream processing depends on the
     signaled colorspace. When disabled, the swapchain colorspace will be
-    overridden to match the ``--target-*`` options. (Only for ``--vo=gpu-next``)
+    overridden to match the ``--target-*`` options.
 
 ``--target-prim=<value>``
     Specifies the primaries of the display. Video colors will be adapted to

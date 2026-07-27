@@ -130,6 +130,18 @@ struct gl_tone_map_opts {
     bool visualize;
 };
 
+enum gl_target_hint_setting {
+    GL_TARGET_HINT_AUTO = -1,
+    GL_TARGET_HINT_OFF,
+    GL_TARGET_HINT_ON,
+};
+
+enum gl_target_hint_mode {
+    GL_TARGET_HINT_TARGET,
+    GL_TARGET_HINT_SOURCE,
+    GL_TARGET_HINT_SOURCE_DYNAMIC,
+};
+
 struct gl_video_opts {
     int dumb_mode;
     struct scaler_config scaler[4];
@@ -138,6 +150,9 @@ struct gl_video_opts {
     int target_prim;
     int target_trc;
     int target_peak;
+    int target_hint;
+    int target_hint_mode;
+    bool target_hint_strict;
     int hdr_reference_white;
     int sdr_adjust_gamma;
     int treat_srgb_as_power22;
@@ -181,6 +196,19 @@ struct gl_video_opts {
 };
 
 extern const struct m_sub_options gl_video_conf;
+
+enum gl_target_hint_status {
+    GL_TARGET_HINT_DISABLED,
+    GL_TARGET_HINT_NO_SOURCE,
+    GL_TARGET_HINT_VALID,
+};
+
+enum gl_target_hint_status gl_video_prepare_target_hint(
+    const struct gl_video_opts *opts,
+    const struct pl_color_space *source,
+    struct pl_color_space *target,
+    bool supports_auto_hint,
+    struct pl_color_space *hint);
 
 struct gl_video;
 struct vo_frame;
@@ -243,5 +271,6 @@ struct mp_image *gl_video_get_image(struct gl_video *p, int imgfmt, int w, int h
                                     int stride_align, int flags);
 
 struct mp_image_params *gl_video_get_target_params_ptr(struct gl_video *p);
+enum pl_color_levels gl_video_get_output_levels(struct gl_video *p);
 
 #endif

@@ -410,6 +410,8 @@ static const struct gl_video_opts gl_video_opts_def = {
     .shader_cache = true,
     .hwdec_interop = "auto",
     .treat_srgb_as_power22 = 1|2|4, // auto
+    .target_hint = GL_TARGET_HINT_AUTO,
+    .target_hint_strict = true,
 };
 
 static OPT_STRING_VALIDATE_FUNC(validate_error_diffusion_opt);
@@ -445,6 +447,15 @@ const struct m_sub_options gl_video_conf = {
         {"target-trc", OPT_CHOICE_C(target_trc, pl_csp_trc_names)},
         {"target-peak", OPT_CHOICE(target_peak, {"auto", 0}),
             M_RANGE(10, 10000)},
+        {"target-colorspace-hint", OPT_CHOICE(target_hint,
+            {"auto", GL_TARGET_HINT_AUTO},
+            {"no", GL_TARGET_HINT_OFF},
+            {"yes", GL_TARGET_HINT_ON})},
+        {"target-colorspace-hint-mode", OPT_CHOICE(target_hint_mode,
+            {"target", GL_TARGET_HINT_TARGET},
+            {"source", GL_TARGET_HINT_SOURCE},
+            {"source-dynamic", GL_TARGET_HINT_SOURCE_DYNAMIC})},
+        {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
         {"hdr-reference-white", OPT_CHOICE(hdr_reference_white, {"auto", 0}),
             M_RANGE(10, 10000)},
         {"sdr-adjust-gamma", OPT_CHOICE(sdr_adjust_gamma,
@@ -567,6 +578,90 @@ const struct m_sub_options gl_video_conf = {
     .defaults = &gl_video_opts_def,
     .change_flags = UPDATE_VIDEO,
 };
+
+enum gl_target_hint_status gl_video_prepare_target_hint(
+    const struct gl_video_opts *opts,
+    const struct pl_color_space *source,
+    struct pl_color_space *target,
+    bool supports_auto_hint,
+    struct pl_color_space *hint)
+{
+    bool target_unknown = target->transfer == PL_COLOR_TRC_UNKNOWN;
+    if (target->primaries == PL_COLOR_PRIM_UNKNOWN)
+        target->primaries = mp_get_best_prim_container(&target->hdr.prim);
+    if (!pl_color_transfer_is_hdr(target->transfer) &&
+        target->hdr.min_luma > PL_COLOR_SDR_WHITE / PL_COLOR_SDR_CONTRAST)
+        target->hdr.min_luma = 0;
+    // Display maxFALL is MaxFullFrameLuminance, not content maxFALL.
+    target->hdr.max_fall = 0;
+    // Assume HDR support when the backend cannot report target metadata.
+    if (target_unknown) {
+        target->transfer = opts->target_trc ? opts->target_trc
+                                            : pl_color_space_hdr10.transfer;
+    }
+
+    bool auto_hint = opts->target_hint == GL_TARGET_HINT_AUTO;
+    bool auto_source_hint = auto_hint && target_unknown && supports_auto_hint;
+    bool enabled = opts->target_hint == GL_TARGET_HINT_ON ||
+                   (auto_hint && (!target_unknown || auto_source_hint));
+    if (!enabled)
+        return GL_TARGET_HINT_DISABLED;
+    if (!source)
+        return GL_TARGET_HINT_NO_SOURCE;
+
+    int mode = auto_source_hint ? GL_TARGET_HINT_SOURCE
+                                : opts->target_hint_mode;
+    *hint = *source;
+    if (!hint->hdr.min_luma)
+        hint->hdr.min_luma = target->hdr.min_luma;
+    if (mode == GL_TARGET_HINT_TARGET) {
+        *hint = *target;
+        if (pl_color_transfer_is_hdr(hint->transfer) &&
+            !pl_primaries_valid(&hint->hdr.prim))
+            pl_color_space_merge(hint, source);
+        if (target_unknown && !opts->target_trc &&
+            !pl_color_transfer_is_hdr(source->transfer))
+            *hint = *source;
+        if (target->hdr.max_luma) {
+            hint->hdr.max_luma = target->hdr.max_luma;
+            hint->hdr.min_luma = target->hdr.min_luma;
+            hint->hdr.max_cll  = target->hdr.max_cll;
+            hint->hdr.max_fall = target->hdr.max_fall;
+        }
+    } else if (mode == GL_TARGET_HINT_SOURCE_DYNAMIC) {
+        pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+            .color    = hint,
+            .metadata = PL_HDR_METADATA_ANY,
+            .scaling  = PL_HDR_NITS,
+            .out_min  = !hint->hdr.min_luma ? &hint->hdr.min_luma : NULL,
+            .out_max  = &hint->hdr.max_luma,
+        ));
+        // Signal the dynamic content peak as maxCLL.
+        hint->hdr.max_cll = hint->hdr.max_luma;
+        if (hint->hdr.max_fall > hint->hdr.max_cll)
+            hint->hdr.max_fall = 0;
+    }
+
+    struct pl_color_space source_csp = *source;
+    // Infer source defaults before applying explicit target overrides.
+    pl_color_space_infer_map(&source_csp, hint);
+    // Inverse tone mapping follows the HDR target unless explicitly overridden.
+    if (pl_color_transfer_is_hdr(target->transfer) && opts->tone_map.inverse) {
+        hint->transfer     = target->transfer;
+        hint->hdr.max_luma = target->hdr.max_luma;
+        hint->hdr.min_luma = target->hdr.min_luma;
+        hint->hdr.max_cll  = target->hdr.max_cll;
+        hint->hdr.max_fall = target->hdr.max_fall;
+    }
+    if (opts->target_prim)
+        hint->primaries = opts->target_prim;
+    if (opts->target_trc)
+        hint->transfer = opts->target_trc;
+    if (opts->target_peak)
+        hint->hdr.max_luma = opts->target_peak;
+
+    return GL_TARGET_HINT_VALID;
+}
 
 static void uninit_rendering(struct gl_video *p);
 static void uninit_scaler(struct gl_video *p, struct scaler *scaler);
@@ -2764,7 +2859,8 @@ static void pass_scale_main(struct gl_video *p)
 // by previous passes (i.e. linear scaling)
 static void pass_colormanage(struct gl_video *p, struct pl_color_space src,
                              enum mp_csp_light src_light,
-                             const struct pl_color_space *fbo_csp, int flags, bool osd)
+                             const struct pl_color_space *fbo_csp, bool strict,
+                             int flags, bool osd)
 {
     struct ra *ra = p->ra;
 
@@ -2773,12 +2869,15 @@ static void pass_colormanage(struct gl_video *p, struct pl_color_space src,
     // is set. If values are set to _AUTO, the most likely intended
     // values are guesstimated later in this function.
     struct pl_color_space dst = {
-        .transfer = p->opts.target_trc == PL_COLOR_TRC_UNKNOWN ?
-                        fbo_csp->transfer : p->opts.target_trc,
-        .primaries = p->opts.target_prim == PL_COLOR_PRIM_UNKNOWN ?
-                     fbo_csp->primaries : p->opts.target_prim,
-        .hdr.max_luma = !p->opts.target_peak ?
-                        fbo_csp->hdr.max_luma : p->opts.target_peak,
+        .transfer = p->opts.target_trc &&
+                    (!strict || !fbo_csp->transfer) ?
+                        p->opts.target_trc : fbo_csp->transfer,
+        .primaries = p->opts.target_prim &&
+                     (!strict || !fbo_csp->primaries) ?
+                        p->opts.target_prim : fbo_csp->primaries,
+        .hdr.max_luma = p->opts.target_peak &&
+                        (!strict || !fbo_csp->hdr.max_luma) ?
+                            p->opts.target_peak : fbo_csp->hdr.max_luma,
     };
 
     if (!p->colorspace_override_warned &&
@@ -2932,16 +3031,15 @@ static void pass_colormanage(struct gl_video *p, struct pl_color_space src,
     pass_color_map(p->sc, p->use_linear && !osd, &src, &dst, src_light, dst_light, &tone_map);
 
     if (!osd) {
-        struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
-        mp_csp_equalizer_state_get(p->video_eq, &cparams);
-        if (cparams.levels_out == PL_COLOR_LEVELS_UNKNOWN)
-            cparams.levels_out = PL_COLOR_LEVELS_FULL;
         p->target_params = (struct mp_image_params){
             .imgfmt_name = p->fbo_format ? p->fbo_format->name : "unknown",
             .w = mp_rect_w(p->dst_rect),
             .h = mp_rect_h(p->dst_rect),
             .color = dst,
-            .repr = {.sys = PL_COLOR_SYSTEM_RGB, .levels = cparams.levels_out},
+            .repr = {
+                .sys = PL_COLOR_SYSTEM_RGB,
+                .levels = gl_video_get_output_levels(p),
+            },
             .rotate = p->image_params.rotate,
         };
     }
@@ -3138,7 +3236,8 @@ static void pass_draw_osd(struct gl_video *p, int osd_flags, int frame_flags,
         // (for lack of anything saner to do)
         if (cms) {
             pass_colormanage(p, pl_color_space_srgb, MP_CSP_LIGHT_DISPLAY,
-                             &fbo->color_space, frame_flags, true);
+                             &fbo->color_space, fbo->color_space_strict,
+                             frame_flags, true);
         }
         mpgl_osd_draw_finish(p->osd, n, p->sc, fbo);
     }
@@ -3291,7 +3390,7 @@ static void pass_draw_to_screen(struct gl_video *p, const struct ra_fbo *fbo, in
     }
 
     pass_colormanage(p, p->image_params.color, p->image_params.light,
-                     &fbo->color_space, flags, false);
+                     &fbo->color_space, fbo->color_space_strict, flags, false);
 
     // Since finish_pass_fbo doesn't work with compute shaders, and neither
     // does the checkerboard/dither code, we may need an indirection via
@@ -3613,7 +3712,11 @@ void gl_video_render_frame(struct gl_video *p, struct vo_frame *frame,
                                       fmt);
                 }
                 const struct ra_fbo *dest_fbo =
-                    r ? &(struct ra_fbo) { .tex = p->output_tex, .color_space = fbo->color_space } : fbo;
+                    r ? &(struct ra_fbo) {
+                        .tex = p->output_tex,
+                        .color_space = fbo->color_space,
+                        .color_space_strict = fbo->color_space_strict,
+                    } : fbo;
                 p->output_tex_valid = r;
                 pass_draw_to_screen(p, dest_fbo, flags);
             }
@@ -4534,4 +4637,13 @@ void gl_video_load_hwdecs_for_img_fmt(struct gl_video *p, struct mp_hwdec_device
 struct mp_image_params *gl_video_get_target_params_ptr(struct gl_video *p)
 {
     return &p->target_params;
+}
+
+enum pl_color_levels gl_video_get_output_levels(struct gl_video *p)
+{
+    struct mp_csp_params params = MP_CSP_PARAMS_DEFAULTS;
+    mp_csp_equalizer_state_get(p->video_eq, &params);
+    return params.levels_out == PL_COLOR_LEVELS_UNKNOWN
+               ? PL_COLOR_LEVELS_FULL
+               : params.levels_out;
 }

@@ -42,6 +42,7 @@
 struct gpu_priv {
     struct mp_log *log;
     struct ra_ctx *ctx;
+    struct m_config_cache *opts_cache;
 
     char *context_name;
     char *context_type;
@@ -49,6 +50,47 @@ struct gpu_priv {
 
     int events;
 };
+
+static enum ra_color_hint_result set_target_hint(
+    struct gpu_priv *p, struct vo_frame *frame,
+    struct pl_color_space *color, bool *strict)
+{
+    struct ra_swapchain *sw = p->ctx->swapchain;
+    pl_swapchain pl_sw;
+    ra_ctx_get_pl_swapchain(p->ctx, &pl_sw);
+    m_config_cache_update(p->opts_cache);
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+
+    struct pl_color_space target = {0};
+    if (sw->fns->target_csp)
+        target = sw->fns->target_csp(sw);
+
+    struct pl_color_space hint = {0};
+    enum gl_target_hint_status status = gl_video_prepare_target_hint(
+        opts, frame->current ? &frame->current->params.color : NULL,
+        &target, p->ctx->supports_auto_colorspace_hint, &hint);
+    if (status != GL_TARGET_HINT_VALID)
+        return ra_swapchain_set_color(sw, pl_sw, NULL);
+    if (!hint.hdr.max_cll)
+        hint.hdr.max_cll = hint.hdr.max_luma;
+
+    struct mp_image_params params = {
+        .color = hint,
+        .repr = {
+            .sys = PL_COLOR_SYSTEM_RGB,
+            .levels = gl_video_get_output_levels(p->renderer),
+            .alpha = p->ctx->opts.want_alpha ? PL_ALPHA_INDEPENDENT
+                                              : PL_ALPHA_NONE,
+        },
+    };
+    enum ra_color_hint_result result =
+        ra_swapchain_set_color(sw, pl_sw, &params);
+    if (result == RA_COLOR_HINT_EXTERNAL)
+        *color = params.color;
+    *strict = opts->target_hint_strict;
+    return result;
+}
+
 static void resize(struct vo *vo)
 {
     struct gpu_priv *p = vo->priv;
@@ -75,9 +117,18 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     struct gpu_priv *p = vo->priv;
     struct ra_swapchain *sw = p->ctx->swapchain;
 
-    struct ra_fbo fbo;
+    struct pl_color_space target = {0};
+    bool strict = false;
+    enum ra_color_hint_result target_hint =
+        set_target_hint(p, frame, &target, &strict);
+
+    struct ra_fbo fbo = {0};
     if (!sw->fns->start_frame(sw, &fbo))
         return VO_FALSE;
+    if (target_hint == RA_COLOR_HINT_EXTERNAL)
+        fbo.color_space = target;
+    if (target_hint != RA_COLOR_HINT_NONE)
+        fbo.color_space_strict = strict;
 
     gl_video_render_frame(p->renderer, frame, &fbo, RENDER_FRAME_DEF);
     if (!sw->fns->submit_frame(sw, frame)) {
@@ -296,6 +347,7 @@ static int preinit(struct vo *vo)
 {
     struct gpu_priv *p = vo->priv;
     p->log = vo->log;
+    p->opts_cache = m_config_cache_alloc(p, vo->global, &gl_video_conf);
 
     struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
     update_ra_ctx_options(vo, ctx_opts);
