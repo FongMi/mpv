@@ -38,6 +38,7 @@
 #include "video/mp_image.h"
 #include "dec_sub.h"
 #include "ass_mp.h"
+#include "img_convert.h"
 #include "packer.h"
 #include "sd.h"
 
@@ -47,6 +48,12 @@ struct sd_ass_priv {
     struct ass_track *ass_track;
     struct ass_track *shadow_track; // for --sub-ass=no rendering
     bool ass_configured;
+    bool transform_layout;
+    bool layout_change_pending;
+    bool active_event_cache_valid;
+    bool active_events_positioned;
+    long long active_events_from;
+    long long active_events_until;
     bool is_converted;
     struct lavc_conv *converter;
     struct sd_filter **filters;
@@ -387,6 +394,7 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
     ass_process_chunk(ctx->ass_track, pkt->buffer, pkt->len,
                       floor(pkt->pts * 1000 + 1e-6),
                       floor(pkt->duration * 1000 + 1e-6));
+    ctx->active_event_cache_valid = false;
 
     // This bookkeeping only has any practical use for ASS subs
     // over a VO with no video.
@@ -521,7 +529,8 @@ static float get_libass_scale_height(struct mp_osd_res *dim, bool use_margins)
 }
 
 static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
-                          bool converted, ASS_Track *track)
+                          bool converted, bool transform_layout,
+                          ASS_Track *track)
 {
     struct mp_subtitle_opts *opts = sd->opts;
     struct mp_subtitle_shared_opts *shared_opts = sd->shared_opts;
@@ -555,7 +564,10 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
         set_line_spacing = opts->sub_line_spacing;
         set_hinting = opts->sub_hinting;
     }
-    if (total_override || shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_SCALE) {
+    if ((!transform_layout || !opts->sub_scale_signs) &&
+        (total_override ||
+         shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_SCALE))
+    {
         set_font_scale = shared_opts->sub_scale[sd->order];
     }
     if (set_scale_with_window) {
@@ -657,6 +669,42 @@ static bool has_overrides(char *s)
 
 #define END(ev) ((ev)->Start + (ev)->Duration)
 
+static bool active_events_are_positioned(struct sd_ass_priv *ctx,
+                                         ASS_Track *track, long long ts)
+{
+    if (ctx->active_event_cache_valid &&
+        ts >= ctx->active_events_from &&
+        ts < ctx->active_events_until)
+    {
+        return ctx->active_events_positioned;
+    }
+
+    bool found = false;
+    bool all_positioned = true;
+    long long valid_until = LLONG_MAX;
+    for (int n = 0; n < track->n_events; n++) {
+        ASS_Event *event = &track->events[n];
+        if (ts < event->Start) {
+            valid_until = MPMIN(valid_until, event->Start);
+            continue;
+        }
+        if (ts >= END(event))
+            continue;
+        valid_until = MPMIN(valid_until, END(event));
+        if (!event->Text ||
+            (!strstr(event->Text, "\\pos") && !strstr(event->Text, "\\move")))
+        {
+            all_positioned = false;
+        }
+        found = true;
+    }
+    ctx->active_event_cache_valid = true;
+    ctx->active_events_positioned = found && all_positioned;
+    ctx->active_events_from = ts;
+    ctx->active_events_until = valid_until;
+    return ctx->active_events_positioned;
+}
+
 static long long find_timestamp(struct sd *sd, double pts)
 {
     struct sd_ass_priv *priv = sd->priv;
@@ -723,6 +771,31 @@ static long long find_timestamp(struct sd *sd, double pts)
 
 #undef END
 
+static void transform_subtitle_layout(struct sub_bitmaps *res,
+                                      struct mp_osd_res dim, float position,
+                                      float scale)
+{
+    struct mp_rect bbox;
+    if (!mp_sub_bitmaps_bb(res, &bbox))
+        return;
+
+    double center_x = (bbox.x0 + bbox.x1) / 2.0;
+    double center_y = (bbox.y0 + bbox.y1) / 2.0;
+    double offset_y = (100.0 - position) / 100.0 * dim.h;
+    for (int n = 0; n < res->num_parts; n++) {
+        struct sub_bitmap *part = &res->parts[n];
+        int x = lrint(center_x + (part->x - center_x) * scale);
+        int y = lrint(center_y + (part->y - center_y) * scale - offset_y);
+        int x2 = lrint(center_x + (part->x + part->dw - center_x) * scale);
+        int y2 = lrint(center_y + (part->y + part->dh - center_y) * scale -
+                       offset_y);
+        part->x = x;
+        part->y = y;
+        part->dw = x2 - x;
+        part->dh = y2 - y;
+    }
+}
+
 static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
                                        int format, double pts)
 {
@@ -735,6 +808,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     ASS_Track *track = no_ass ? ctx->shadow_track : ctx->ass_track;
     ASS_Renderer *renderer = ctx->ass_renderer;
     struct sub_bitmaps *res = &(struct sub_bitmaps){0};
+    bool transform_layout = false;
 
     // Always update the osd_res
     struct mp_osd_res old_osd = ctx->osd;
@@ -760,9 +834,18 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
         if (isnormal(par))
             scale *= par;
     }
-    if (!ctx->ass_configured || !osd_res_equals(old_osd, ctx->osd)) {
-        configure_ass(sd, &dim, converted, track);
+    long long ts = find_timestamp(sd, pts);
+    // \pos and \move bypass line positioning and scale around their anchors.
+    transform_layout =
+        ctx->is_converted && strcmp(sd->codec->codec, "ttml") == 0 &&
+        !converted && shared_opts->ass_style_override[sd->order] &&
+        active_events_are_positioned(ctx, track, ts);
+    if (!ctx->ass_configured || !osd_res_equals(old_osd, ctx->osd) ||
+        ctx->transform_layout != transform_layout)
+    {
+        configure_ass(sd, &dim, converted, transform_layout, track);
         ctx->ass_configured = true;
+        ctx->transform_layout = transform_layout;
     }
     ass_set_pixel_aspect(renderer, scale);
     if (!converted && (!shared_opts->ass_style_override[sd->order] ||
@@ -772,7 +855,6 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     } else {
         ass_set_storage_size(renderer, 0, 0);
     }
-    long long ts = find_timestamp(sd, pts);
 
     if (no_ass)
         fill_plaintext(sd, pts);
@@ -784,6 +866,18 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
 done:
     // mangle_colors() modifies the color field, so copy the thing _before_.
     res = sub_bitmaps_copy(&ctx->copy_cache, res);
+
+    if (transform_layout && res) {
+        float layout_scale = opts->sub_scale_signs
+            ? shared_opts->sub_scale[sd->order] : 1.0f;
+        transform_subtitle_layout(res, dim,
+                                  shared_opts->sub_pos[sd->order],
+                                  layout_scale);
+        if (ctx->layout_change_pending) {
+            res->change_id++;
+            ctx->layout_change_pending = false;
+        }
+    }
 
     if (!converted && res)
         mangle_colors(sd, res);
@@ -995,6 +1089,7 @@ static void fill_plaintext(struct sd *sd, double pts)
 static void reset(struct sd *sd)
 {
     struct sd_ass_priv *ctx = sd->priv;
+    ctx->active_event_cache_valid = false;
     if (sd->opts->sub_clear_on_seek || ctx->clear_once) {
         ass_flush_events(ctx->ass_track);
         ctx->num_seen_packets = 0;
@@ -1094,6 +1189,7 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
             assobjects_init(sd);
         }
         ctx->ass_configured = false; // ass always needs to be reconfigured
+        ctx->layout_change_pending = true;
         return CONTROL_OK;
     }
     default:
