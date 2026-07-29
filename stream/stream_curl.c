@@ -41,6 +41,7 @@
 #include "misc/bstr.h"
 #include "misc/dispatch.h"
 #include "misc/path_utils.h"
+#include "misc/rendezvous.h"
 #include "misc/thread_tools.h"
 #include "mpv_talloc.h"
 #include "network.h"
@@ -301,11 +302,22 @@ static MP_THREAD_VOID curl_thread(void *arg)
     mp_thread_set_name("curl");
     struct curl_ctx *ctx = arg;
 
-    curl_global_init(CURL_GLOBAL_ALL);
-    ctx->multi = curl_multi_init();
-    curl_multi_setopt(ctx->multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+    CURLcode res = curl_global_init(CURL_GLOBAL_ALL);
+    if (res == CURLE_OK)
+        ctx->multi = curl_multi_init();
 
-    mp_dispatch_set_wakeup_fn(ctx->dispatch, curl_wakeup, ctx);
+    bool initialized = ctx->multi;
+    if (initialized) {
+        curl_multi_setopt(ctx->multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+        mp_dispatch_set_wakeup_fn(ctx->dispatch, curl_wakeup, ctx);
+    }
+
+    mp_rendezvous(ctx, initialized);
+    if (!initialized) {
+        if (res == CURLE_OK)
+            curl_global_cleanup();
+        MP_THREAD_RETURN();
+    }
 
     while (!ctx->exit) {
         mp_dispatch_queue_process(ctx->dispatch, 0);
@@ -351,10 +363,15 @@ static void mp_curl_destroy(void *ptr)
 void mp_curl_global_init(struct mpv_global *global)
 {
     struct curl_ctx *ctx = talloc_zero(global, struct curl_ctx);
-    talloc_set_destructor(ctx, mp_curl_destroy);
     ctx->dispatch = mp_dispatch_create(ctx);
-    global->curl = ctx;
     mp_require(!mp_thread_create(&ctx->thread, curl_thread, ctx));
+    if (!mp_rendezvous(ctx, 0)) {
+        mp_thread_join(ctx->thread);
+        talloc_free(ctx);
+        return;
+    }
+    talloc_set_destructor(ctx, mp_curl_destroy);
+    global->curl = ctx;
 }
 
 // Curl callbacks
