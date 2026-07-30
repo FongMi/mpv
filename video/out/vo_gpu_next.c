@@ -146,6 +146,7 @@ struct priv {
     struct osd_state osd_state;
 
     uint64_t last_id;
+    uint64_t reset_map_failed_id;
     uint64_t osd_sync;
     double last_pts;
     bool is_interpolated;
@@ -153,6 +154,8 @@ struct priv {
     bool flush_cache;
     bool frame_pending;
     bool paused;
+    bool hwdec_map_retry;
+    bool hwdec_map_failed;
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -558,6 +561,8 @@ struct frame_priv {
     struct osd_state subs;
     uint64_t osd_sync;
     struct ra_hwdec *hwdec;
+    bool mapped_coordinates;
+    struct mp_image_params mapped_params;
     // Optional Dolby Vision FEL.
     struct ra_hwdec *el_hwdec;
     pl_tex el_tex[4];
@@ -716,6 +721,70 @@ static void slot_uninit(struct priv *p, struct hwdec_slot *s)
     s->timer = NULL;
 }
 
+static bool hwdec_driver_uses_deferred_dst_params(
+    struct priv *p, const struct ra_hwdec_mapper_driver *driver)
+{
+    return driver && driver->needs_dst_params_probe &&
+           driver->needs_dst_params_probe(p->ra_ctx->ra);
+}
+
+static bool hwdec_mapper_uses_deferred_dst_params(
+    struct priv *p, const struct ra_hwdec_mapper *mapper)
+{
+    return mapper &&
+           hwdec_driver_uses_deferred_dst_params(p, mapper->driver);
+}
+
+static bool deferred_hwdec_path_active(struct priv *p)
+{
+    return hwdec_mapper_uses_deferred_dst_params(p, p->hwdec.mapper) ||
+           hwdec_mapper_uses_deferred_dst_params(p, p->el_hwdec.mapper);
+}
+
+static void note_hwdec_map_error(struct priv *p, int result,
+                                 const char *operation)
+{
+    bool retry = result == RA_HWDEC_MAP_RETRY;
+    p->hwdec_map_retry |= retry;
+    p->hwdec_map_failed |= !retry;
+    MP_MSG(p, retry ? MSGL_V : MSGL_ERR, "%s %s.\n", operation,
+           retry ? "is not ready" : "failed");
+}
+
+// Map an external frame before libplacebo starts using the queue entry. The
+// official slot remains the owner of the mapping, so acquire() can reuse it.
+static int slot_preload(struct priv *p, struct hwdec_slot *s,
+                        struct ra_hwdec *hwdec, struct mp_image *owner,
+                        struct mp_image *mpi, bool measure)
+{
+    if (!slot_reconfig(p, s, hwdec, &mpi->params))
+        return -1;
+    if (s->owner == owner)
+        return 1;
+    if (s->acquired) {
+        MP_ERR(p, "Hardware frame of this role is still in use.\n");
+        return -1;
+    }
+
+    slot_unmap(p, s);
+    if (measure) {
+        stats_time_start(p->stats, "hwdec-map");
+        timer_pool_start(s->timer);
+    }
+    int ret = ra_hwdec_mapper_map(s->mapper, mpi);
+    if (measure) {
+        timer_pool_stop(s->timer);
+        stats_time_end(p->stats, "hwdec-map");
+    }
+    if (ret < 0)
+        return ret;
+
+    if (measure)
+        s->perf = timer_pool_measure(s->timer);
+    s->owner = owner;
+    return 1;
+}
+
 // For RAs not based on ra_pl, this creates a new pl_tex wrapper.
 static pl_tex hwdec_get_tex(struct priv *p, struct ra_hwdec_mapper *mapper, int n)
 {
@@ -761,8 +830,18 @@ static pl_tex hwdec_get_tex(struct priv *p, struct ra_hwdec_mapper *mapper, int 
 // Fill `frame->num_planes` and per-plane component_mapping from an
 // hwdec-mapped imgfmt description.
 static void setup_hwdec_plane_mapping(struct pl_frame *frame,
-                                      const struct mp_imgfmt_desc *desc)
+                                      const struct mp_imgfmt_desc *desc,
+                                      const struct ra_hwdec_mapper *mapper)
 {
+    if (mapper->dst_num_components) {
+        struct pl_plane *plane = &frame->planes[0];
+        frame->num_planes = 1;
+        plane->components = mapper->dst_num_components;
+        memcpy(plane->component_mapping, mapper->dst_component_mapping,
+               sizeof(plane->component_mapping));
+        return;
+    }
+
     frame->num_planes = desc->num_planes;
     for (int n = 0; n < frame->num_planes; n++) {
         struct pl_plane *plane = &frame->planes[n];
@@ -802,15 +881,19 @@ static bool slot_acquire(struct priv *p, struct hwdec_slot *s,
         timer_pool_stop(s->timer);
         stats_time_end(p->stats, "hwdec-map");
         if (ret < 0) {
-            MP_ERR(p, "Mapping hardware decoded surface failed.\n");
+            note_hwdec_map_error(p, ret,
+                                 "Mapping hardware decoded surface");
             return false;
         }
         s->perf = timer_pool_measure(s->timer);
         s->owner = owner;
     }
 
-    if (ra_hwdec_mapper_begin_access(s->mapper) < 0)
+    if (ra_hwdec_mapper_begin_access(s->mapper) < 0) {
+        note_hwdec_map_error(p, -1,
+                             "Accessing hardware decoded surface");
         return false;
+    }
     // Set before handing out textures so that the release libplacebo issues
     // after a failed acquire ends the access again.
     s->acquired = true;
@@ -818,8 +901,10 @@ static bool slot_acquire(struct priv *p, struct hwdec_slot *s,
     for (int n = 0; n < frame->num_planes; n++) {
         if (!s->tex[n])
             s->tex[n] = hwdec_get_tex(p, s->mapper, n);
-        if (!s->tex[n])
+        if (!s->tex[n]) {
+            p->hwdec_map_failed = true;
             return false;
+        }
         frame->planes[n].texture = s->tex[n];
     }
 
@@ -839,8 +924,11 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
     struct priv *p = fp->vo->priv;
-    return slot_reconfig(p, &p->hwdec, fp->hwdec, &mpi->params) &&
-           slot_acquire(p, &p->hwdec, mpi, mpi, frame);
+    if (!slot_reconfig(p, &p->hwdec, fp->hwdec, &mpi->params)) {
+        p->hwdec_map_failed = true;
+        return false;
+    }
+    return slot_acquire(p, &p->hwdec, mpi, mpi, frame);
 }
 
 static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
@@ -859,8 +947,11 @@ static bool hwdec_acquire_el(pl_gpu gpu, struct pl_frame *frame)
     struct frame_priv *fp = bl_mpi->priv;
     struct priv *p = fp->vo->priv;
     // The EL image belongs to the BL queue entry, which therefore owns the slot.
-    return slot_reconfig(p, &p->el_hwdec, fp->el_hwdec, &el_mpi->params) &&
-           slot_acquire(p, &p->el_hwdec, bl_mpi, el_mpi, frame);
+    if (!slot_reconfig(p, &p->el_hwdec, fp->el_hwdec, &el_mpi->params)) {
+        p->hwdec_map_failed = true;
+        return false;
+    }
+    return slot_acquire(p, &p->el_hwdec, bl_mpi, el_mpi, frame);
 }
 
 static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
@@ -984,19 +1075,34 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
 
     fp->hwdec = ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt);
     if (fp->hwdec) {
-        // Note: We don't actually need the mapper to map the frame yet, we
-        // only reconfig the mapper here (potentially creating it) to access
-        // `dst_params`. In practice, though, this should not matter unless the
-        // image format changes mid-stream.
         if (!slot_reconfig(p, &p->hwdec, fp->hwdec, &mpi->params)) {
+            p->hwdec_map_failed = true;
             talloc_free(mpi);
             return false;
         }
 
+        // Most mappers expose dst_params during init. A mapper backed by an
+        // opaque external image may need to map the first frame first.
+        if (!p->hwdec.mapper->dst_params_ready) {
+            int ret = slot_preload(p, &p->hwdec, fp->hwdec, mpi, mpi, true);
+            if (ret < 0) {
+                note_hwdec_map_error(
+                    p, ret, "Mapping initial hardware decoded texture");
+                talloc_free(mpi);
+                return false;
+            }
+        }
+
         par = p->hwdec.mapper->dst_params;
+        fp->mapped_coordinates =
+            p->hwdec.mapper->dst_params_map_coordinates;
+        fp->mapped_params = par;
     }
 
+    struct pl_color_repr mapped_repr = par.repr;
     mp_image_params_guess_csp(&par);
+    if (fp->hwdec && p->hwdec.mapper->dst_params_preserve_repr)
+        par.repr = mapped_repr;
 
     *frame = (struct pl_frame) {
         .color = par.color,
@@ -1026,7 +1132,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(par.imgfmt);
         frame->acquire = hwdec_acquire;
         frame->release = hwdec_release;
-        setup_hwdec_plane_mapping(frame, &desc);
+        setup_hwdec_plane_mapping(frame, &desc, p->hwdec.mapper);
     } else { // swdec
         p->hwdec.perf.count = 0;
 
@@ -1058,13 +1164,30 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         bool el_ok = true;
         if (fp->el_hwdec) {
             if (slot_reconfig(p, &p->el_hwdec, fp->el_hwdec, &el->params)) {
+                if (!p->el_hwdec.mapper->dst_params_ready) {
+                    int ret = slot_preload(p, &p->el_hwdec, fp->el_hwdec,
+                                           mpi, el, false);
+                    if (ret < 0) {
+                        note_hwdec_map_error(
+                            p, ret,
+                            "Mapping initial enhancement-layer texture");
+                        slot_release_owner(p, &p->hwdec, mpi);
+                        talloc_free(mpi);
+                        return false;
+                    }
+                }
                 el_par = p->el_hwdec.mapper->dst_params;
             } else {
+                p->hwdec_map_failed = true;
                 fp->el_hwdec = NULL;
                 el_ok = false;
             }
         }
+        struct pl_color_repr mapped_el_repr = el_par.repr;
         mp_image_params_guess_csp(&el_par);
+        if (fp->el_hwdec &&
+            p->el_hwdec.mapper->dst_params_preserve_repr)
+            el_par.repr = mapped_el_repr;
 
         fp->el_frame = (struct pl_frame) {
             .color = el_par.color,
@@ -1076,7 +1199,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
             struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(el_par.imgfmt);
             fp->el_frame.acquire = hwdec_acquire_el;
             fp->el_frame.release = hwdec_release_el;
-            setup_hwdec_plane_mapping(&fp->el_frame, &desc);
+            setup_hwdec_plane_mapping(&fp->el_frame, &desc,
+                                      p->el_hwdec.mapper);
         } else if (el_ok) {
             el_ok = upload_planes_sw(vo, gpu, el, &fp->el_frame, fp->el_tex);
         }
@@ -1130,6 +1254,10 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
 static void discard_frame(const struct pl_source_frame *src)
 {
     struct mp_image *mpi = src->frame_data;
+    struct frame_priv *fp = mpi->priv;
+    struct priv *p = fp->vo->priv;
+    slot_release_owner(p, &p->hwdec, mpi);
+    slot_release_owner(p, &p->el_hwdec, mpi);
     talloc_free(mpi);
 }
 
@@ -1266,15 +1394,10 @@ static void apply_target_options(struct priv *p, struct pl_frame *target,
     target->icc = p->icc_profile;
 }
 
-static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
-                       int width, int height)
+static void apply_crop_rect(struct pl_frame *frame, struct pl_rect2df crop,
+                            int width, int height)
 {
-    frame->crop = (struct pl_rect2df) {
-        .x0 = crop.x0,
-        .y0 = crop.y0,
-        .x1 = crop.x1,
-        .y1 = crop.y1,
-    };
+    frame->crop = crop;
 
     // mpv gives us rotated/flipped rects, libplacebo expects unrotated
     pl_rect2df_rotate(&frame->crop, -frame->rotation);
@@ -1287,6 +1410,68 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
         frame->crop.y0 = height - frame->crop.y0;
         frame->crop.y1 = height - frame->crop.y1;
     }
+}
+
+static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
+                       int width, int height)
+{
+    apply_crop_rect(frame, (struct pl_rect2df) {
+        .x0 = crop.x0,
+        .y0 = crop.y0,
+        .x1 = crop.x1,
+        .y1 = crop.y1,
+    }, width, height);
+}
+
+static struct pl_rect2df map_source_rect(struct pl_frame *frame,
+                                         struct mp_rect rect,
+                                         int width, int height,
+                                         const struct frame_priv *fp)
+{
+    struct pl_rect2df mapped = {
+        .x0 = rect.x0,
+        .y0 = rect.y0,
+        .x1 = rect.x1,
+        .y1 = rect.y1,
+    };
+    int mapped_width = width;
+    int mapped_height = height;
+    if (fp->mapped_coordinates && width > 0 && height > 0) {
+        const struct mp_image_params *params = &fp->mapped_params;
+        struct mp_rect bounds = params->crop;
+        if (!mp_image_crop_valid(params))
+            bounds = (struct mp_rect) {0, 0, params->w, params->h};
+        float sx = mp_rect_w(bounds) / (float) width;
+        float sy = mp_rect_h(bounds) / (float) height;
+        mapped = (struct pl_rect2df) {
+            bounds.x0 + rect.x0 * sx,
+            bounds.y0 + rect.y0 * sy,
+            bounds.x0 + rect.x1 * sx,
+            bounds.y0 + rect.y1 * sy,
+        };
+        mapped_width = params->w;
+        mapped_height = params->h;
+    }
+
+    struct pl_frame rotated = *frame;
+    apply_crop_rect(&rotated, mapped, mapped_width, mapped_height);
+    return rotated.crop;
+}
+
+static struct pl_rect2df apply_source_crop(struct pl_frame *frame,
+                                           struct mp_rect crop,
+                                           int width, int height,
+                                           const struct frame_priv *fp)
+{
+    frame->crop = map_source_rect(frame, crop, width, height, fp);
+    if (!fp->mapped_coordinates) {
+        return (struct pl_rect2df) {
+            .x1 = width,
+            .y1 = height,
+        };
+    }
+    return map_source_rect(frame, (struct mp_rect) {0, 0, width, height},
+                           width, height, fp);
 }
 
 static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
@@ -1338,6 +1523,72 @@ static void update_tm_viz(struct pl_color_map_params *params,
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
+static void reset_frame_queue(struct priv *p)
+{
+    pl_queue_reset(p->queue);
+    p->last_pts = 0.0;
+    p->last_id = 0;
+    p->reset_map_failed_id = 0;
+    p->flush_cache = true;
+}
+
+static int preload_reset_frame(struct priv *p, struct frame_priv *fp,
+                               struct mp_image *mpi)
+{
+    fp->hwdec = ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt);
+    if (!fp->hwdec || !fp->hwdec->driver->mapper ||
+        !fp->hwdec->driver->mapper->map_on_reset)
+        return 0;
+
+    // Queued source frames release through the same mapper.
+    reset_frame_queue(p);
+    pl_renderer_flush_cache(p->rr);
+    p->flush_cache = false;
+
+    return slot_preload(p, &p->hwdec, fp->hwdec, mpi, mpi, true);
+}
+
+static int preload_deferred_hwdec_frame(struct priv *p,
+                                        struct frame_priv *fp,
+                                        struct mp_image *mpi)
+{
+    fp->hwdec = ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt);
+    if (!fp->hwdec ||
+        !hwdec_driver_uses_deferred_dst_params(
+            p, fp->hwdec->driver->mapper))
+        return 0;
+
+    // libplacebo cannot defer a frame after its render callback starts.
+    // Acquire external images before queueing so a transient producer delay
+    // leaves the current output untouched and retries the same source frame.
+    if (p->hwdec.owner != mpi) {
+        int ret = slot_preload(p, &p->hwdec, fp->hwdec, mpi, mpi, true);
+        if (ret < 0)
+            return ret;
+    }
+
+#if PL_API_VER >= 367
+    struct mp_image *el = mpi->enhancement_layer;
+    if (el) {
+        fp->el_hwdec = ra_hwdec_get(&p->hwdec_ctx, el->imgfmt);
+        if (fp->el_hwdec &&
+            hwdec_driver_uses_deferred_dst_params(
+                p, fp->el_hwdec->driver->mapper) &&
+            p->el_hwdec.owner != mpi)
+        {
+            int ret = slot_preload(p, &p->el_hwdec, fp->el_hwdec,
+                                   mpi, el, false);
+            if (ret < 0) {
+                slot_release_owner(p, &p->hwdec, mpi);
+                return ret;
+            }
+        }
+    }
+#endif
+
+    return 1;
+}
+
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
@@ -1388,16 +1639,47 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         }
     }
 
+    struct mp_image *preloaded = NULL;
+    if (p->want_reset && frame->num_frames &&
+        frame->frame_id > p->last_id)
+    {
+        if (frame->frame_id == p->reset_map_failed_id)
+            return VO_FALSE;
+
+        preloaded = mp_image_new_ref(frame->frames[0]);
+        struct frame_priv *fp = talloc_zero(preloaded, struct frame_priv);
+        preloaded->priv = fp;
+        fp->vo = vo;
+
+        int ret = preload_reset_frame(p, fp, preloaded);
+        if (ret < 0) {
+            talloc_free(preloaded);
+            if (ret == RA_HWDEC_MAP_RETRY) {
+                MP_VERBOSE(vo, "Deferring reset frame until the hardware "
+                               "surface is ready.\n");
+            } else {
+                p->reset_map_failed_id = frame->frame_id;
+                MP_ERR(vo, "Mapping reset hardware surface failed.\n");
+                if (deferred_hwdec_path_active(p))
+                    vo_report_backend_error(vo);
+            }
+            return VO_FALSE;
+        }
+        if (ret > 0) {
+            p->want_reset = false;
+        } else {
+            talloc_free(preloaded);
+            preloaded = NULL;
+        }
+    }
+
     // Push all incoming frames into the frame queue
     for (int n = 0; n < frame->num_frames; n++) {
         int id = frame->frame_id + n;
 
         if (p->want_reset) {
-            pl_queue_reset(p->queue);
-            p->last_pts = 0.0;
-            p->last_id = 0;
+            reset_frame_queue(p);
             p->want_reset = false;
-            p->flush_cache = true;
         }
 
         if (p->flush_cache) {
@@ -1408,10 +1690,29 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         if (id <= p->last_id)
             continue; // ignore already seen frames
 
-        struct mp_image *mpi = mp_image_new_ref(frame->frames[n]);
-        struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
-        mpi->priv = fp;
-        fp->vo = vo;
+        struct mp_image *mpi;
+        if (n == 0 && preloaded) {
+            mpi = preloaded;
+        } else {
+            mpi = mp_image_new_ref(frame->frames[n]);
+            struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
+            mpi->priv = fp;
+            fp->vo = vo;
+        }
+
+        struct frame_priv *fp = mpi->priv;
+        int ret = preload_deferred_hwdec_frame(p, fp, mpi);
+        if (ret < 0) {
+            talloc_free(mpi);
+            if (ret == RA_HWDEC_MAP_RETRY) {
+                MP_VERBOSE(vo, "Deferring queued frame until the hardware "
+                               "surface is ready.\n");
+            } else {
+                MP_ERR(vo, "Mapping queued hardware surface failed.\n");
+                vo_report_backend_error(vo);
+            }
+            return VO_FALSE;
+        }
 
         pl_queue_push(p->queue, &(struct pl_source_frame) {
             .pts = mpi->pts,
@@ -1594,9 +1895,19 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         }
         p->last_pts = qparams.pts;
 
+        p->hwdec_map_retry = false;
+        p->hwdec_map_failed = false;
         switch (pl_queue_update(p->queue, &mix, &qparams)) {
         case PL_QUEUE_ERR:
-            MP_ERR(vo, "Failed updating frames!\n");
+            if (p->hwdec_map_retry) {
+                MP_VERBOSE(vo, "Deferring render queue update until the "
+                               "hardware surface is ready.\n");
+            } else {
+                MP_ERR(vo, "Failed updating frames!\n");
+                if (p->hwdec_map_failed &&
+                    deferred_hwdec_path_active(p))
+                    vo_report_backend_error(vo);
+            }
             goto done;
         case PL_QUEUE_EOF:
             abort(); // we never signal EOF
@@ -1618,7 +1929,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             struct pl_frame *image = (struct pl_frame *) mix.frames[i];
             struct mp_image *mpi = image->user_data;
             struct frame_priv *fp = mpi->priv;
-            apply_crop(image, p->src, vo->params->w, vo->params->h);
+            struct pl_rect2df source_bounds =
+                apply_source_crop(image, p->src, vo->params->w,
+                                  vo->params->h, fp);
             if (opts->blend_subs) {
                 if (frame->redraw)
                     p->osd_sync++;
@@ -1630,10 +1943,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                     struct mp_osd_res res = {
                         .w = w,
                         .h = h,
-                        .ml = -image->crop.x0 * rx,
-                        .mr = (image->crop.x1 - vo->params->w) * rx,
-                        .mt = -image->crop.y0 * ry,
-                        .mb = (image->crop.y1 - vo->params->h) * ry,
+                        .ml = (source_bounds.x0 - image->crop.x0) * rx,
+                        .mr = (image->crop.x1 - source_bounds.x1) * rx,
+                        .mt = (source_bounds.y0 - image->crop.y0) * ry,
+                        .mb = (image->crop.y1 - source_bounds.y1) * ry,
                         .display_par = 1.0,
                     };
                     enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
@@ -1672,6 +1985,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     stats_time_end(p->stats, "render");
     if (!render_ok) {
         MP_ERR(vo, "Failed rendering frame!\n");
+        if (deferred_hwdec_path_active(p))
+            vo_report_backend_error(vo);
         goto done;
     }
 
@@ -1701,8 +2016,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // fall through
 
 done:
-    if (!valid) // clear with purple to indicate error
-        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
+    if (!valid)
+        pl_tex_clear(gpu, swframe.fbo, (float[4]){0.0, 0.0, 0.0, 1.0});
 
     pl_gpu_flush(gpu);
     p->frame_pending = true;
@@ -1735,8 +2050,39 @@ static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
 static int query_format(struct vo *vo, int format)
 {
     struct priv *p = vo->priv;
-    if (ra_hwdec_get(&p->hwdec_ctx, format))
+    struct ra_hwdec *hwdec = ra_hwdec_get(&p->hwdec_ctx, format);
+    if (hwdec) {
+        const struct ra_hwdec_mapper_driver *mapper = hwdec->driver->mapper;
+        bool direct_external =
+            hwdec_driver_uses_deferred_dst_params(p, mapper);
+        const struct gl_video_opts *opts = p->opts_cache->opts;
+        if (direct_external && opts->interpolation) {
+            MP_WARN(vo, "Vulkan external-format MediaCodec frames do not "
+                        "support interpolation; using a copy path.\n");
+            return false;
+        }
+        if (direct_external &&
+            opts->scaler[SCALER_CSCALE].kernel.function != SCALER_INHERIT) {
+            MP_WARN(vo, "Vulkan external-format MediaCodec frames use the "
+                        "device YCbCr sampler; using a copy path for --cscale.\n");
+            return false;
+        }
+        if (direct_external) {
+            const enum pl_hook_stage plane_hooks =
+                PL_HOOK_LUMA_INPUT |
+                PL_HOOK_CHROMA_INPUT |
+                PL_HOOK_CHROMA_SCALED;
+            for (int n = 0; n < p->pars->params.num_hooks; n++) {
+                if (p->pars->params.hooks[n]->stages & plane_hooks) {
+                    MP_WARN(vo, "Vulkan external-format MediaCodec frames do "
+                                "not expose separate luma/chroma planes; using "
+                                "a copy path for the configured shader.\n");
+                    return false;
+                }
+            }
+        }
         return true;
+    }
 
     bool supported = format_supported(vo, format, false);
     if (!supported)
@@ -1962,7 +2308,9 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         target.color.transfer = PL_COLOR_TRC_GAMMA22;
     }
 
-    apply_crop(&image, src, mpi->params.w, mpi->params.h);
+    struct frame_priv *fp = mpi->priv;
+    struct pl_rect2df source_bounds =
+        apply_source_crop(&image, src, mpi->params.w, mpi->params.h, fp);
     apply_crop(&target, dst, fbo->params.w, fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
 
@@ -1972,7 +2320,6 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
     if (!args->osd)
         osd_flags |= OSD_DRAW_SUB_ONLY;
 
-    struct frame_priv *fp = mpi->priv;
     if (opts->blend_subs) {
         float w = pl_rect_w(opts->blend_subs == BLEND_SUBS_VIDEO ? image.crop : target.crop);
         float h = pl_rect_h(opts->blend_subs == BLEND_SUBS_VIDEO ? image.crop : target.crop);
@@ -1981,10 +2328,10 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         struct mp_osd_res res = {
             .w = w,
             .h = h,
-            .ml = -image.crop.x0 * rx,
-            .mr = (image.crop.x1 - vo->params->w) * rx,
-            .mt = -image.crop.y0 * ry,
-            .mb = (image.crop.y1 - vo->params->h) * ry,
+            .ml = (source_bounds.x0 - image.crop.x0) * rx,
+            .mr = (image.crop.x1 - source_bounds.x1) * rx,
+            .mt = (source_bounds.y0 - image.crop.y0) * ry,
+            .mb = (image.crop.y1 - source_bounds.y1) * ry,
             .display_par = 1.0,
         };
         enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
@@ -2131,6 +2478,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_RESET:
         // Defer until the first new frame (unique ID) actually arrives
         p->want_reset = true;
+        p->reset_map_failed_id = 0;
         return VO_TRUE;
 
     case VOCTRL_PERFORMANCE_DATA: {

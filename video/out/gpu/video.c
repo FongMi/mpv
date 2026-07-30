@@ -4368,8 +4368,14 @@ bool gl_video_check_format(struct gl_video *p, int mp_format)
     if (ra_get_imgfmt_desc(p->ra, mp_format, &desc) &&
         is_imgfmt_desc_supported(p, &desc))
         return true;
-    if (ra_hwdec_get(&p->hwdec_ctx, mp_format))
+    struct ra_hwdec *hwdec = ra_hwdec_get(&p->hwdec_ctx, mp_format);
+    if (hwdec) {
+        const struct ra_hwdec_mapper_driver *mapper = hwdec->driver->mapper;
+        if (mapper && mapper->needs_dst_params_probe &&
+            mapper->needs_dst_params_probe(p->ra))
+            return false;
         return true;
+    }
     return false;
 }
 

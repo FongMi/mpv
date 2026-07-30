@@ -713,11 +713,11 @@ static int video_output_image(struct MPContext *mpctx, bool *logical_eof)
     return have_new_frame(mpctx, r <= 0) ? VD_NEW_FRAME : r;
 }
 
-static bool check_for_hwdec_fallback(struct MPContext *mpctx)
+static bool force_hwdec_fallback(struct MPContext *mpctx)
 {
     struct vo_chain *vo_c = mpctx->vo_chain;
 
-    if (!vo_c->filter->failed_output_conversion || !vo_c->track || !vo_c->track->dec)
+    if (!vo_c->track || !vo_c->track->dec)
         return false;
 
     if (mp_decoder_wrapper_control(vo_c->track->dec,
@@ -726,6 +726,12 @@ static bool check_for_hwdec_fallback(struct MPContext *mpctx)
 
     mp_output_chain_reset_harder(vo_c->filter);
     return true;
+}
+
+static bool check_for_hwdec_fallback(struct MPContext *mpctx)
+{
+    return mpctx->vo_chain->filter->failed_output_conversion &&
+           force_hwdec_fallback(mpctx);
 }
 
 static bool check_for_forced_eof(struct MPContext *mpctx)
@@ -1219,9 +1225,13 @@ void write_video(struct MPContext *mpctx)
     struct vo_chain *vo_c = mpctx->vo_chain;
     struct vo *vo = vo_c->vo;
 
-    if (is_android_dolby_vision_direct_output_active(mpctx) &&
-        vo_query_backend_error(vo))
+    if (vo_query_backend_error(vo)) {
+        if (is_android_dolby_vision_direct_output_active(mpctx))
+            goto error;
+        if (force_hwdec_fallback(mpctx))
+            return;
         goto error;
+    }
 
     if (vo_c->filter->reconfig_happened) {
         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);

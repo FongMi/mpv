@@ -139,6 +139,7 @@ struct ra_hwdec_mapper *ra_hwdec_mapper_create(struct ra_hwdec *hwdec,
         .priv = talloc_zero_size(mapper, hwdec->driver->mapper->priv_size),
         .src_params = *params,
         .dst_params = *params,
+        .dst_params_ready = true,
     };
     if (mapper->driver->init(mapper) < 0)
         ra_hwdec_mapper_free(&mapper);
@@ -169,10 +170,12 @@ int ra_hwdec_mapper_map(struct ra_hwdec_mapper *mapper, struct mp_image *img)
 {
     ra_hwdec_mapper_unmap(mapper);
     mp_image_setrefp(&mapper->src, img);
-    if (mapper->driver->map(mapper) < 0) {
+    int result = mapper->driver->map(mapper);
+    if (result < 0) {
         ra_hwdec_mapper_unmap(mapper);
-        return -1;
+        return result;
     }
+    mapper->dst_params_ready = true;
     return 0;
 }
 

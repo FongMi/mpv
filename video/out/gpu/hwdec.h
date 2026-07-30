@@ -8,6 +8,10 @@
 #include "ra.h"
 #include "video/hwdec.h"
 
+// The external producer has not made this frame available yet. Callers may
+// defer it without treating the mapper as permanently broken.
+#define RA_HWDEC_MAP_RETRY (-2)
+
 // Helper to organize/load hwdecs dynamically
 struct ra_hwdec_ctx {
     // Set these before calling `ra_hwdec_ctx_init`
@@ -57,9 +61,23 @@ struct ra_hwdec_mapper {
     struct ra_hwdec *owner;
     // Input frame parameters. (Set before init(), immutable.)
     struct mp_image_params src_params;
-    // Output frame parameters (represents the format the textures return). Must
-    // be set by init(), immutable afterwards,
+    // Output frame parameters (represents the format the textures return).
+    // Normally set by init() and immutable afterwards. A mapper may clear
+    // dst_params_ready in init() when the first source image must be inspected
+    // before the output format can be selected. The first successful map then
+    // finalizes dst_params.
     struct mp_image_params dst_params;
+    bool dst_params_ready;
+    // Preserve the mapper-provided color representation across generic
+    // imgfmt inference. Used when a carrier texture exposes non-RGB samples.
+    bool dst_params_preserve_repr;
+    // Map source crop coordinates into dst_params.crop instead of assuming
+    // the mapped texture has the same geometry as the decoded frame.
+    bool dst_params_map_coordinates;
+    // Optional semantic mapping for a single carrier texture. Zero components
+    // uses the normal mapping inferred from dst_params.imgfmt.
+    int dst_num_components;
+    int dst_component_mapping[4];
 
     // The currently mapped source image (or the image about to be mapped in
     // ->map()). NULL if unmapped. The mapper can also clear this reference if
@@ -77,6 +95,16 @@ struct ra_hwdec_mapper {
 struct ra_hwdec_mapper_driver {
     // Used to create ra_hwdec_mapper.priv.
     size_t priv_size;
+
+    // Map the first new frame while gpu-next processes a render queue reset,
+    // before it acquires a new output target. This lets mappers which wait for
+    // an external producer defer presentation without replacing the currently
+    // displayed frame with an error color.
+    bool map_on_reset;
+
+    // Whether this mapper needs the first source frame to determine dst_params
+    // for the current rendering API. Legacy vo=gpu cannot defer that decision.
+    bool (*needs_dst_params_probe)(struct ra *ra);
 
     // Init the mapper implementation. At this point, the field src_params,
     // fns, devs, priv are initialized.

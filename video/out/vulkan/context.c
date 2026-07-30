@@ -214,6 +214,10 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
      * of the ffmpeg Vulkan hwcontext and video decoding capability.
      */
     const char *opt_extensions[] = {
+#if HAVE_ANDROID_MEDIA_NDK
+        "VK_ANDROID_external_memory_android_hardware_buffer",
+        "VK_EXT_queue_family_foreign",
+#endif
 #if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 26, 0)
         VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
 #endif
@@ -506,6 +510,7 @@ static pl_swapchain ra_vk_ctx_create_swapchain(struct ra_ctx *ctx,
         .surface = surface,
         .present_mode = preferred_mode,
         .swapchain_depth = ctx->vo->opts->swapchain_depth,
+        .allow_suboptimal = p->params.allow_suboptimal,
         .alpha_bits = ctx->opts.want_alpha ? 8 : 0,
     };
 

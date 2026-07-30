@@ -83,6 +83,9 @@ static bool android_init(struct ra_ctx *ctx)
 
     struct ra_ctx_params params = {
         .check_visible = android_check_visible,
+        // Rotated SurfaceViews may stay suboptimal even after recreation.
+        // surfaceChanged drives explicit resizes through android_reconfig.
+        .allow_suboptimal = true,
     };
 
     vk->surface = android_create_surface(ctx, vo_android_native_window(ctx->vo),
