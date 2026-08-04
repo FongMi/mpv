@@ -511,6 +511,9 @@ static pl_swapchain ra_vk_ctx_create_swapchain(struct ra_ctx *ctx,
         .present_mode = preferred_mode,
         .swapchain_depth = ctx->vo->opts->swapchain_depth,
         .allow_suboptimal = p->params.allow_suboptimal,
+#if PL_API_VER >= 374
+        .disable_storage = p->params.disable_swapchain_storage,
+#endif
         .alpha_bits = ctx->opts.want_alpha ? 8 : 0,
     };
 

@@ -79,6 +79,9 @@ struct ra_ctx_params {
     // must explicitly resize the swapchain when its surface dimensions change.
     bool allow_suboptimal;
 
+    // See pl_vulkan_swapchain_params.disable_storage.
+    bool disable_swapchain_storage;
+
     // See ra_swapchain_fns.color_depth.
     int (*color_depth)(struct ra_ctx *ctx);
 
