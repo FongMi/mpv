@@ -5,6 +5,8 @@
 #include <android/hardware_buffer.h>
 #include <media/NdkImage.h>
 
+#include "options/options.h"
+
 struct mp_log;
 struct mp_image;
 struct ra_ctx;
@@ -19,9 +21,11 @@ struct aimagereader_vk_api {
 
 struct aimagereader_vk;
 
-bool aimagereader_vk_available(struct ra_ctx *ra_ctx, struct mp_log *log);
+bool aimagereader_vk_available(struct ra_ctx *ra_ctx, struct mp_log *log,
+                              enum android_vulkan_aimagereader_backend backend);
 struct aimagereader_vk *aimagereader_vk_create(
-    struct ra_hwdec_mapper *mapper, const struct aimagereader_vk_api *api);
+    struct ra_hwdec_mapper *mapper, const struct aimagereader_vk_api *api,
+    enum android_vulkan_aimagereader_backend backend);
 void aimagereader_vk_destroy(struct aimagereader_vk **state);
 void aimagereader_vk_buffer_removed(struct aimagereader_vk *state,
                                     AHardwareBuffer *buffer);

@@ -34,6 +34,7 @@
 #include <libavutil/hwcontext_mediacodec.h>
 
 #include "misc/jni.h"
+#include "options/options.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 #include "video/out/gpu/hwdec.h"
@@ -64,6 +65,7 @@ struct priv_owner {
 #if HAVE_VULKAN
     mp_mutex vk_lock;
     struct aimagereader_vk *vk;
+    enum android_vulkan_aimagereader_backend vk_backend;
 #endif
 
     media_status_t (*AImageReader_newWithUsage)(
@@ -402,7 +404,9 @@ static int init(struct ra_hwdec *hw)
 
 #if HAVE_VULKAN
     mp_mutex_init(&p->vk_lock);
-    use_vulkan = aimagereader_vk_available(hw->ra_ctx, hw->log);
+    p->vk_backend = hw->ra_ctx->vo->opts->android_vulkan_aimagereader_backend;
+    use_vulkan = aimagereader_vk_available(hw->ra_ctx, hw->log,
+                                           p->vk_backend);
 #endif
 
     if (!use_gl && !use_vulkan)
@@ -584,7 +588,7 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
             .AHardwareBuffer_describe = o->AHardwareBuffer_describe,
         };
         p->backend = MAPPER_BACKEND_VULKAN;
-        p->vk = aimagereader_vk_create(mapper, &api);
+        p->vk = aimagereader_vk_create(mapper, &api, o->vk_backend);
         if (!p->vk)
             return -1;
         mp_mutex_lock(&o->vk_lock);

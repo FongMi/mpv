@@ -28,7 +28,8 @@ int aimagereader_vk_direct_map(
 bool aimagereader_vk_convert_available(struct ra_ctx *ra_ctx,
                                        struct mp_log *log);
 struct aimagereader_vk_convert *aimagereader_vk_convert_create(
-    struct ra_hwdec_mapper *mapper, const struct aimagereader_vk_api *api);
+    struct ra_hwdec_mapper *mapper, const struct aimagereader_vk_api *api,
+    enum android_vulkan_aimagereader_backend backend);
 void aimagereader_vk_convert_destroy(struct aimagereader_vk_convert **state);
 void aimagereader_vk_convert_buffer_removed(
     struct aimagereader_vk_convert *state, AHardwareBuffer *buffer);

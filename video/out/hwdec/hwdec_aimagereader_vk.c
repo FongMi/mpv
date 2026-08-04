@@ -23,8 +23,23 @@ struct aimagereader_vk {
     mp_mutex lock;
     struct aimagereader_vk_direct *direct;
     struct aimagereader_vk_convert *convert;
+    enum android_vulkan_aimagereader_backend backend;
     bool direct_mapped;
 };
+
+static const char *backend_name(enum android_vulkan_aimagereader_backend backend)
+{
+    switch (backend) {
+    case ANDROID_VULKAN_AIMAGEREADER_BACKEND_DIRECT:
+        return "direct";
+    case ANDROID_VULKAN_AIMAGEREADER_BACKEND_COMPUTE:
+        return "compute";
+    case ANDROID_VULKAN_AIMAGEREADER_BACKEND_FRAGMENT:
+        return "fragment";
+    default:
+        return "auto";
+    }
+}
 
 static void reset_mapper_params(struct aimagereader_vk *p)
 {
@@ -44,7 +59,8 @@ static bool switch_to_conversion(struct aimagereader_vk *p)
     mp_assert(p->direct && !p->convert && !p->direct_mapped);
     aimagereader_vk_direct_destroy(&p->direct);
     reset_mapper_params(p);
-    p->convert = aimagereader_vk_convert_create(p->mapper, &p->api);
+    p->convert = aimagereader_vk_convert_create(p->mapper, &p->api,
+                                                p->backend);
     if (!p->convert) {
         mp_err(p->log, "No Vulkan conversion backend for this Android "
                        "hardware buffer\n");
@@ -53,29 +69,46 @@ static bool switch_to_conversion(struct aimagereader_vk *p)
     return true;
 }
 
-bool aimagereader_vk_available(struct ra_ctx *ra_ctx, struct mp_log *log)
+bool aimagereader_vk_available(struct ra_ctx *ra_ctx, struct mp_log *log,
+                              enum android_vulkan_aimagereader_backend backend)
 {
+    if (backend == ANDROID_VULKAN_AIMAGEREADER_BACKEND_DIRECT)
+        return aimagereader_vk_direct_available(ra_ctx, log);
+    if (backend == ANDROID_VULKAN_AIMAGEREADER_BACKEND_COMPUTE ||
+        backend == ANDROID_VULKAN_AIMAGEREADER_BACKEND_FRAGMENT)
+        return aimagereader_vk_convert_available(ra_ctx, log);
     return aimagereader_vk_direct_available(ra_ctx, log) ||
            aimagereader_vk_convert_available(ra_ctx, log);
 }
 
 struct aimagereader_vk *aimagereader_vk_create(
-    struct ra_hwdec_mapper *mapper, const struct aimagereader_vk_api *api)
+    struct ra_hwdec_mapper *mapper, const struct aimagereader_vk_api *api,
+    enum android_vulkan_aimagereader_backend backend)
 {
     struct aimagereader_vk *p = talloc_zero(NULL, struct aimagereader_vk);
     p->log = mapper->log;
     p->mapper = mapper;
     p->api = *api;
+    p->backend = backend;
     mp_mutex_init(&p->lock);
-    p->direct = aimagereader_vk_direct_create(mapper, api);
-    if (p->direct)
-        return p;
+    mp_info(p->log, "Vulkan AImageReader backend: %s\n",
+            backend_name(backend));
+
+    if (backend == ANDROID_VULKAN_AIMAGEREADER_BACKEND_AUTO ||
+        backend == ANDROID_VULKAN_AIMAGEREADER_BACKEND_DIRECT) {
+        p->direct = aimagereader_vk_direct_create(mapper, api);
+        if (p->direct)
+            return p;
+        if (backend == ANDROID_VULKAN_AIMAGEREADER_BACKEND_DIRECT)
+            goto error;
+    }
 
     reset_mapper_params(p);
-    p->convert = aimagereader_vk_convert_create(mapper, api);
+    p->convert = aimagereader_vk_convert_create(mapper, api, backend);
     if (p->convert)
         return p;
 
+error:
     mp_mutex_destroy(&p->lock);
     talloc_free(p);
     return NULL;
@@ -155,6 +188,12 @@ int aimagereader_vk_map(struct aimagereader_vk *p, AImage *image,
     }
     if (result != AIMAGEREADER_VK_MAP_UNSUPPORTED)
         goto done;
+    if (p->backend == ANDROID_VULKAN_AIMAGEREADER_BACKEND_DIRECT) {
+        mp_err(p->log, "Forced direct Vulkan AImageReader backend does not "
+                       "support this Android hardware buffer\n");
+        result = -1;
+        goto done;
+    }
     if (p->direct_mapped) {
         mp_err(p->log, "Android hardware-buffer format changed after the "
                        "direct Vulkan mapper was configured\n");

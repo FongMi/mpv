@@ -7202,6 +7202,25 @@ them.
 
     Android with ``--gpu-context=android`` only.
 
+``--android-vulkan-aimagereader-backend=<auto|direct|compute|fragment>``
+    Select how Android MediaCodec ``AHardwareBuffer`` frames are imported for
+    Vulkan rendering:
+
+    :auto: Prefer direct YCbCr sampling. If direct sampling is unavailable,
+           select compute or fragment conversion while preferring the
+           narrowest suitable output format. Compute wins when both backends
+           support the same format. This is the default.
+    :direct: Require direct YCbCr sampling without conversion fallback.
+    :compute: Require compute conversion without direct or fragment fallback.
+    :fragment: Require fragment conversion without direct or compute fallback.
+
+    The forced modes are intended for device compatibility, power, and
+    performance comparisons. If the selected backend is unsupported or fails,
+    mpv does not silently switch to another AImageReader backend. Normal
+    hardware-decoding fallback rules still apply.
+
+    Android Vulkan while using the MediaCodec hardware decoder only.
+
 ``--android-dolby-vision-output=<configured|direct>``
     Select how Dolby Vision video tracks are sent to an Android rendering
     surface:

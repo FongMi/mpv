@@ -129,6 +129,7 @@ struct aimagereader_vk_convert {
     VkCommandPool command_pool;
     VkFormat output_format;
     enum conversion_backend backend;
+    enum conversion_backend required_backend;
     struct source_config source;
     int output_index;
 
@@ -1468,7 +1469,7 @@ static bool ensure_conversion_resources(struct aimagereader_vk_convert *p,
     }
 
     p->conversion_geometry_valid = false;
-    if (select_conversion_backend(p, source, CONVERSION_BACKEND_NONE) &&
+    if (select_conversion_backend(p, source, p->required_backend) &&
         create_outputs(p) &&
         create_pipeline(p, &source->format_props)) {
         configure_dst_params(p, source);
@@ -1476,6 +1477,13 @@ static bool ensure_conversion_resources(struct aimagereader_vk_convert *p,
     }
 
     enum conversion_backend failed_backend = p->backend;
+    if (p->required_backend != CONVERSION_BACKEND_NONE) {
+        mp_err(p->log, "Forced Vulkan AHardwareBuffer %s conversion is "
+                       "unavailable\n",
+               conversion_backend_name(p->required_backend));
+        destroy_conversion_resources(p);
+        return false;
+    }
     enum conversion_backend fallback_backend = CONVERSION_BACKEND_NONE;
     if (failed_backend == CONVERSION_BACKEND_FRAGMENT)
         fallback_backend = CONVERSION_BACKEND_COMPUTE;
@@ -1994,7 +2002,8 @@ static bool submit_conversion(struct aimagereader_vk_convert *p,
 }
 
 struct aimagereader_vk_convert *aimagereader_vk_convert_create(
-    struct ra_hwdec_mapper *mapper, const struct aimagereader_vk_api *api)
+    struct ra_hwdec_mapper *mapper, const struct aimagereader_vk_api *api,
+    enum android_vulkan_aimagereader_backend backend)
 {
     struct aimagereader_vk_convert *p =
         talloc_zero(NULL, struct aimagereader_vk_convert);
@@ -2017,8 +2026,21 @@ struct aimagereader_vk_convert *aimagereader_vk_convert_create(
     p->device = p->vk->device;
     p->output_index = -1;
     mapper->dst_params_ready = false;
-    mp_info(p->log, "Vulkan AHardwareBuffer fallback conversion: "
-                    "compute with fragment fallback\n");
+    switch (backend) {
+    case ANDROID_VULKAN_AIMAGEREADER_BACKEND_COMPUTE:
+        p->required_backend = CONVERSION_BACKEND_COMPUTE;
+        break;
+    case ANDROID_VULKAN_AIMAGEREADER_BACKEND_FRAGMENT:
+        p->required_backend = CONVERSION_BACKEND_FRAGMENT;
+        break;
+    default:
+        p->required_backend = CONVERSION_BACKEND_NONE;
+        break;
+    }
+    mp_info(p->log, "Vulkan AHardwareBuffer conversion backend: %s\n",
+            p->required_backend == CONVERSION_BACKEND_NONE
+                ? "auto (narrowest format, compute tie-break)"
+                : conversion_backend_name(p->required_backend));
 
     p->GetImageFormatProperties2 = get_image_format_properties2(p->vk);
 
