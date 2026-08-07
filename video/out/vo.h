@@ -215,6 +215,8 @@ enum {
     VO_CAP_NORETAIN_REDRAW = 1 << 7,
     // VO is a native Dolby Vision sink rather than a GPU-rendered output.
     VO_CAP_NATIVE_DOVI  = 1 << 8,
+    // VO can apply Dolby Vision metadata to raw GPU-mapped decoder output.
+    VO_CAP_GPU_DOVI     = 1 << 9,
 };
 
 enum {

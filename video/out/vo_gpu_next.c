@@ -798,6 +798,9 @@ static pl_tex hwdec_get_tex(struct priv *p, struct ra_hwdec_mapper *mapper, int 
         struct pl_opengl_wrap_params par = {
             .width = ratex->params.w,
             .height = ratex->params.h,
+#if PL_API_VER >= 375
+            .external_yuv = mapper->dst_gl_external_yuv,
+#endif
         };
 
         ra_gl_get_format(ratex->params.format, &par.iformat,
@@ -3264,6 +3267,7 @@ const struct vo_driver video_out_gpu_next = {
     .caps = VO_CAP_ROTATE90 |
             VO_CAP_FILM_GRAIN |
             VO_CAP_VFLIP |
+            VO_CAP_GPU_DOVI |
             0x0,
     .preinit = preinit,
     .query_format = query_format,

@@ -56,6 +56,7 @@ struct priv_owner {
     jobject java_surface;
     jmethodID surface_release_id;
     void *lib_handle;
+    bool has_gl_yuv_target;
 
     // AImageReader callbacks are queued and can outlive individual mappers.
     mp_mutex image_lock;
@@ -434,7 +435,14 @@ static int init(struct ra_hwdec *hw)
             "GL_OES_EGL_image_external_essl3", 0
         };
         GL *gl = ra_gl_get(hw->ra_ctx->ra);
-        if (gl_check_extension(gl->extensions, es3_exts[0]))
+        bool external_essl3 =
+            gl_check_extension(gl->extensions, es3_exts[0]);
+#if PL_API_VER >= 375
+        p->has_gl_yuv_target = gl->es >= 300 &&
+            gl_check_extension(gl->extensions, es2_exts[0]) &&
+            gl_check_extension(gl->extensions, "GL_EXT_YUV_target");
+#endif
+        if (external_essl3)
             hw->glsl_extensions = es3_exts;
         else
             hw->glsl_extensions = es2_exts;
@@ -519,6 +527,7 @@ static int init(struct ra_hwdec *hw)
 
     p->hwctx = (struct mp_hwdec_ctx) {
         .driver_name = hw->driver->name,
+        .supports_gpu_dovi_mapping = use_vulkan || p->has_gl_yuv_target,
         .av_device_ref = create_mediacodec_device_ref(p->java_surface),
         .hw_imgfmt = IMGFMT_MEDIACODEC,
     };
@@ -572,6 +581,8 @@ static void uninit(struct ra_hwdec *hw)
 static int mapper_init(struct ra_hwdec_mapper *mapper)
 {
     struct priv *p = mapper->priv;
+    struct priv_owner *o = mapper->owner->priv;
+    bool raw_dovi = mapper->src_params.repr.dovi != NULL;
 
     p->log = mapper->log;
 
@@ -580,7 +591,6 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     mapper->dst_params.hw_subfmt = 0;
 
 #if HAVE_VULKAN
-    struct priv_owner *o = mapper->owner->priv;
     if (!ra_is_gl(mapper->ra)) {
         const struct aimagereader_vk_api api = {
             .AImage_delete = o->AImage_delete,
@@ -600,6 +610,9 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
 #endif
 
     p->backend = MAPPER_BACKEND_GL;
+    if (raw_dovi && !o->has_gl_yuv_target)
+        return -1;
+
     GL *gl = ra_gl_get(mapper->ra);
     p->CreateImageKHR = (void *)eglGetProcAddress("eglCreateImageKHR");
     p->DestroyImageKHR = (void *)eglGetProcAddress("eglDestroyImageKHR");
@@ -638,6 +651,27 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params, p->gl_texture);
     if (!mapper->tex[0])
         return -1;
+
+    if (raw_dovi) {
+        // Profile 5 exposes normalized 10-bit YUV samples through the external
+        // texture, without P010 storage padding.
+        mapper->dst_params.repr.bits = (struct pl_bit_encoding) {
+            .sample_depth = 10,
+            .color_depth = 10,
+        };
+        mapper->dst_params_preserve_repr = true;
+        mapper->dst_gl_external_yuv = true;
+        mapper->dst_num_components = 3;
+        const int mapping[4] = {
+            PL_CHANNEL_Y,
+            PL_CHANNEL_CB,
+            PL_CHANNEL_CR,
+            PL_CHANNEL_NONE,
+        };
+        memcpy(mapper->dst_component_mapping, mapping, sizeof(mapping));
+        MP_INFO(mapper, "Using OpenGL raw YUV AHardwareBuffer sampling for "
+                        "Dolby Vision\n");
+    }
 
     return 0;
 }

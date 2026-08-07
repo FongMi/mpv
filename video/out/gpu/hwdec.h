@@ -71,6 +71,8 @@ struct ra_hwdec_mapper {
     // Preserve the mapper-provided color representation across generic
     // imgfmt inference. Used when a carrier texture exposes non-RGB samples.
     bool dst_params_preserve_repr;
+    // Interpret a GL external texture as raw Y/U/V instead of converted RGB.
+    bool dst_gl_external_yuv;
     // Map source crop coordinates into dst_params.crop instead of assuming
     // the mapped texture has the same geometry as the decoded frame.
     bool dst_params_map_coordinates;
