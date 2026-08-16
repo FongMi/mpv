@@ -283,6 +283,8 @@ Interface changes
       result` properties
     - add `track-list/N/dolby-vision-profile` and `track-list/N/dolby-vision-
       level`
+    - add `track-list/N/source-dolby-vision-profile` and `track-list/N/source-
+      dolby-vision-level`
     - add `track-list/N/decoder`
     - add `sub-text/ass-full` sub-property
     - add `osc-show` script message

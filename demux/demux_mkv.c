@@ -1831,10 +1831,6 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track, int idx)
 done:
     demux_add_sh_stream(demuxer, sh);
 
-    // Profile 7 NALU-interleaved
-    if (sh_v->dv_el_present)
-        track->dovi_split = mp_dovi_split_create(demuxer, sh);
-
     return 0;
 }
 
@@ -2292,6 +2288,9 @@ static void pair_dovi_tracks(demuxer_t *demuxer)
 
         AVDOVIDecoderConfigurationRecord *dovi = track->dovi_config;
         if (dovi && dovi->dv_profile == 7 && dovi->el_present_flag) {
+            // hvcE marks an interleaved BL+EL track, not a separate EL.
+            if (track->hvce.len > 0)
+                continue;
             // bl_present_flag is not checked, because the files in the
             // wild set it to 1 for EL stream, while the expectation, based
             // on Dolby spec for MPEG-TS would be that it's set to 0.
@@ -2322,6 +2321,29 @@ static void pair_dovi_tracks(demuxer_t *demuxer)
     bl_sh->group = group;
     el_sh->group = group;
     el_sh->dependent_track = true;
+    if (demuxer->opts->dovi_profile7_mode != DEMUX_DOVI_PROFILE7_PRESERVE) {
+        bl_sh->codec->source_dv_profile = el_sh->codec->dv_profile;
+        bl_sh->codec->source_dv_level = el_sh->codec->dv_level;
+        if (demuxer->opts->dovi_profile7_mode == DEMUX_DOVI_PROFILE7_P81) {
+            MP_INFO(demuxer, "Dolby Vision Profile 7: separate enhancement "
+                             "track cannot be converted to P8.1; using its "
+                             "HDR10 base track.\n");
+            bl_sh->codec->dv_p7_hdr10_fallback = true;
+        }
+    }
+}
+
+static void detect_dovi_split_tracks(demuxer_t *demuxer)
+{
+    mkv_demuxer_t *mkv_d = demuxer->priv;
+
+    // Pair separate BL/EL tracks first. Only ungrouped tracks can carry the
+    // interleaved Profile 7 representation handled by the bitstream filter.
+    for (int i = 0; i < mkv_d->num_tracks; i++) {
+        mkv_track_t *track = mkv_d->tracks[i];
+        if (track->stream && !track->stream->group)
+            track->dovi_split = mp_dovi_split_create(demuxer, track->stream);
+    }
 }
 
 // Workaround for broken files that don't set attached_picture
@@ -2606,6 +2628,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
 
     display_create_tracks(demuxer);
     pair_dovi_tracks(demuxer);
+    detect_dovi_split_tracks(demuxer);
     add_coverart(demuxer);
     process_tags(demuxer);
 
@@ -2978,6 +3001,12 @@ static void mkv_parse_and_add_packet(demuxer_t *demuxer, mkv_track_t *track,
             el_sh = mp_dovi_split_el_stream(track->dovi_split);
             if (el_sh && demux_stream_is_selected(el_sh))
                 el_dp = mp_dovi_split_dispatch(track->dovi_split, dp);
+            if (!mp_dovi_split_filter_base(track->dovi_split, &dp)) {
+                talloc_free(dp);
+                return;
+            }
+            if (!dp)
+                return;
         }
         add_packet(demuxer, stream, dp);
         if (el_dp)

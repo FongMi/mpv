@@ -4046,6 +4046,25 @@ Demuxer
     Force demuxer type. Use a '+' before the name to force it; this will skip
     some checks. Give the demuxer name as printed by ``--demuxer=help``.
 
+``--demuxer-dovi-profile7=<preserve|hdr10|p81>``
+    Select how Dolby Vision Profile 7 is demuxed (default: ``preserve``).
+
+    ``preserve``
+        Preserve the enhancement layer and RPU metadata for Dolby Vision
+        output or GPU processing.
+
+    ``hdr10``
+        Decode only the independently decodable HDR10 base layer. Interleaved
+        enhancement-layer and RPU NAL units are removed before decoding, and
+        separate enhancement tracks are not selected.
+
+    ``p81``
+        Convert the RPU metadata to Dolby Vision Profile 8.1 and discard the
+        enhancement layer. This requires an independently decodable base
+        layer. If conversion cannot be initialized, fall back to that HDR10
+        base layer. Profile 7 sources that store the base and enhancement
+        layers in separate tracks also use the HDR10 base track.
+
 ``--demuxer-lavf-analyzeduration=<value>``
     Maximum length in seconds to analyze the stream properties.
 

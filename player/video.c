@@ -283,6 +283,7 @@ bool wants_android_dolby_vision_direct_output(struct MPContext *mpctx,
 {
 #if HAVE_ANDROID
     return is_android_dolby_vision_track(track) &&
+           !track_uses_dovi_p7_hdr10_fallback(track) &&
            mpctx->opts->vo->android_dolby_vision_output ==
                ANDROID_DOLBY_VISION_OUTPUT_DIRECT &&
            vd_lavc_hwdec_api_preferred(mpctx->opts, "mediacodec",

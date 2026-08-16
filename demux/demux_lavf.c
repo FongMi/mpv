@@ -1397,6 +1397,18 @@ static void handle_layered_video_group(demuxer_t *demuxer, AVStreamGroup *stg)
     bl_sh->group = group;
     el_sh->group = group;
     el_sh->dependent_track = true;
+    if (demuxer->opts->dovi_profile7_mode != DEMUX_DOVI_PROFILE7_PRESERVE &&
+        el_sh->codec && el_sh->codec->dv_profile == 7)
+    {
+        bl_sh->codec->source_dv_profile = el_sh->codec->dv_profile;
+        bl_sh->codec->source_dv_level = el_sh->codec->dv_level;
+        if (demuxer->opts->dovi_profile7_mode == DEMUX_DOVI_PROFILE7_P81) {
+            MP_INFO(demuxer, "Dolby Vision Profile 7: separate enhancement "
+                             "track cannot be converted to P8.1; using its "
+                             "HDR10 base track.\n");
+            bl_sh->codec->dv_p7_hdr10_fallback = true;
+        }
+    }
 }
 #endif
 
@@ -1454,8 +1466,7 @@ static void detect_dovi_split_streams(demuxer_t *demuxer)
     for (int n = 0; n < snapshot_count; n++) {
         struct stream_info *info = priv->streams[n];
         struct sh_stream *sh = info ? info->sh : NULL;
-        if (!sh || sh->type != STREAM_VIDEO || !sh->codec ||
-            !sh->codec->dv_el_present || sh->group)
+        if (!sh || sh->type != STREAM_VIDEO || !sh->codec || sh->group)
         {
             continue;
         }
@@ -1865,19 +1876,23 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
         }
     }
 
-    // Dispatch the EL view of this packet via the splitter.
-    if (info->dovi_split) {
-        struct sh_stream *el = mp_dovi_split_el_stream(info->dovi_split);
-        if (el && demux_stream_is_selected(el))
-            priv->pending_pkt = mp_dovi_split_dispatch(info->dovi_split, dp);
-    }
-
     if (st->event_flags & AVSTREAM_EVENT_FLAG_METADATA_UPDATED) {
         st->event_flags = 0;
         struct mp_tags *tags = talloc_zero(NULL, struct mp_tags);
         mp_tags_move_from_av_dictionary(tags, &st->metadata);
         double pts = MP_PTS_OR_DEF(dp->pts, dp->dts);
         demux_stream_tags_changed(demux, stream, tags, pts);
+    }
+
+    if (info->dovi_split) {
+        struct sh_stream *el = mp_dovi_split_el_stream(info->dovi_split);
+        if (el && demux_stream_is_selected(el))
+            priv->pending_pkt = mp_dovi_split_dispatch(info->dovi_split, dp);
+        if (!mp_dovi_split_filter_base(info->dovi_split, &dp)) {
+            talloc_free(dp);
+            *mp_pkt = NULL;
+            return true;
+        }
     }
 
     *mp_pkt = dp;

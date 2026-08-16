@@ -2249,6 +2249,10 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
                         .unavailable = !p.dovi},
         {"dolby-vision-level", SUB_PROP_INT(p.dv_level),
                         .unavailable = !p.dovi},
+        {"source-dolby-vision-profile", SUB_PROP_INT(p.source_dv_profile),
+                        .unavailable = !p.source_dv_profile},
+        {"source-dolby-vision-level", SUB_PROP_INT(p.source_dv_level),
+                        .unavailable = !p.source_dv_profile},
         {"metadata", SUB_PROP_KEYVALUE_LIST(tag_list),
                         .unavailable = !tags->num_keys},
         {0}

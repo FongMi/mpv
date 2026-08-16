@@ -3715,8 +3715,14 @@ Property list
         these properties unavailable instead in this case.
 
     ``track-list/N/dolby-vision-profile``, ``track-list/N/dolby-vision-level``
-        Dolby Vision profile and level. May not be available if the container
-        does not provide this information.
+        Dolby Vision profile and level of the stream sent to the decoder. May
+        not be available if the stream is converted to a non-Dolby Vision
+        format.
+
+    ``track-list/N/source-dolby-vision-profile``,
+    ``track-list/N/source-dolby-vision-level``
+        Dolby Vision profile and level before bitstream conversion. These are
+        only available when they differ from the decoder input.
 
     ``track-list/N/metadata``,
         Works like the ``metadata`` property, but it accesses metadata that is
@@ -3776,6 +3782,8 @@ Property list
                 "replaygain-album-gain" MPV_FORMAT_DOUBLE
                 "dolby-vision-profile" MPV_FORMAT_INT64
                 "dolby-vision-level" MPV_FORMAT_INT64
+                "source-dolby-vision-profile" MPV_FORMAT_INT64
+                "source-dolby-vision-level" MPV_FORMAT_INT64
                 "metadata"           MPV_FORMAT_NODE_MAP
                     (key and string value for each metadata entry)
 

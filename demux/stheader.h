@@ -176,7 +176,10 @@ struct mp_codec_params {
     bool dovi;
     uint8_t dv_profile;
     uint8_t dv_level;
-    bool dv_el_present;     // BL and EL interleaved in this stream (Profile 7)
+    uint8_t source_dv_profile;
+    uint8_t source_dv_level;
+    bool dv_el_present;        // BL and EL interleaved in this stream (Profile 7)
+    bool dv_p7_hdr10_fallback; // Profile 7 filtered to its HDR10 base layer
 
     // STREAM_VIDEO + STREAM_AUDIO
     int bits_per_coded_sample;
@@ -190,5 +193,13 @@ struct mp_codec_params {
     // STREAM_VIDEO + STREAM_AUDIO + STREAM_SUB
     double duration;
 };
+
+static inline uint8_t mp_codec_params_source_dv_profile(
+    const struct mp_codec_params *codec)
+{
+    return codec && codec->source_dv_profile
+        ? codec->source_dv_profile
+        : codec ? codec->dv_profile : 0;
+}
 
 #endif /* MPLAYER_STHEADER_H */

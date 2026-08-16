@@ -133,6 +133,10 @@ const struct m_sub_options demux_conf = {
         {"directory-filter-types", OPT_STRINGLIST(directory_filter)},
         {"autocreate-playlist", OPT_CHOICE(autocreate_playlist,
             {"no", 0}, {"filter", 1}, {"same", 2})},
+        {"demuxer-dovi-profile7", OPT_CHOICE(dovi_profile7_mode,
+            {"preserve", DEMUX_DOVI_PROFILE7_PRESERVE},
+            {"hdr10", DEMUX_DOVI_PROFILE7_HDR10},
+            {"p81", DEMUX_DOVI_PROFILE7_P81})},
         {0}
     },
     .size = sizeof(struct demux_opts),
@@ -158,6 +162,7 @@ const struct m_sub_options demux_conf = {
         .directory_filter = (char *[]){
             "video", "audio", "image", "archive", "playlist", NULL
         },
+        .dovi_profile7_mode = DEMUX_DOVI_PROFILE7_PRESERVE,
     },
     .get_sub_options = get_demux_sub_opts,
 };

@@ -1636,6 +1636,25 @@ done:
     return success ? 1 : -1;
 }
 
+bool track_uses_dovi_p7_hdr10_fallback(struct track *track)
+{
+    struct sh_stream *el =
+        track && track->stream
+            ? sh_stream_dependent_sibling(track->stream)
+            : NULL;
+    struct mp_codec_params *codec =
+        track && track->stream ? track->stream->codec : NULL;
+    bool is_p7 = mp_codec_params_source_dv_profile(codec) == 7 ||
+                 mp_codec_params_source_dv_profile(el ? el->codec : NULL) == 7;
+    bool per_stream_fallback =
+        (codec && codec->dv_p7_hdr10_fallback) ||
+        (el && el->codec && el->codec->dv_p7_hdr10_fallback);
+    return is_p7 && track->demuxer &&
+           (per_stream_fallback ||
+            track->demuxer->opts->dovi_profile7_mode ==
+                DEMUX_DOVI_PROFILE7_HDR10);
+}
+
 // Match enhancement-layer selection and pairing to the active video output.
 // Native Dolby Vision consumes the original bitstream directly; GPU output
 // needs the dependent EL stream selected and paired with decoded BL frames.
@@ -1647,7 +1666,8 @@ void update_vo_chain_el_state(struct MPContext *mpctx)
     struct track *track = mpctx->current_track[0][STREAM_VIDEO];
     struct sh_stream *el =
         track ? sh_stream_dependent_sibling(track->stream) : NULL;
-    bool use_el = el && !is_android_dolby_vision_direct_output_active(mpctx);
+    bool use_el = el && !track_uses_dovi_p7_hdr10_fallback(track) &&
+                  !is_android_dolby_vision_direct_output_active(mpctx);
     char *hwdec = NULL;
     // Android zero-copy MediaCodec decoders share the VO's single output
     // surface. Keep the dependent EL decoder off that surface.

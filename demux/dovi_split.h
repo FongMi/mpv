@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+
 struct demuxer;
 struct sh_stream;
 struct demux_packet;
@@ -24,11 +26,13 @@ struct demux_packet;
 // Dolby Vision Profile 7 enhancement-layer splitter for HEVC streams that
 // carry the EL bitstream interleaved as HEVC_NAL_UNSPEC63.
 //
-// Creates a virtual EL sh_stream and binds it to the BL via sh_stream_group
-// so downstream code can treat same as separate track BL+EL.
+// Preserve mode creates a virtual EL sh_stream and binds it to the BL via
+// sh_stream_group. HDR10 and P8.1 modes filter the input without exposing an
+// EL stream.
 struct mp_dovi_split;
 
-// Create a splitter on `bl`. Adds the virtual EL sh_stream to `demuxer`.
+// Create a splitter on `bl`. Preserve mode adds the virtual EL sh_stream to
+// `demuxer`; fallback modes keep a single base-layer packet stream.
 //
 // Returns NULL if the BSF is unavailable or initialization fails. The
 // returned context is talloc-attached to `demuxer`.
@@ -40,6 +44,14 @@ void mp_dovi_split_reset(struct mp_dovi_split *s);
 // Return the virtual EL sh_stream created by mp_dovi_split_create. The
 // returned pointer remains valid for the lifetime of the splitter.
 struct sh_stream *mp_dovi_split_el_stream(struct mp_dovi_split *s);
+
+// Replace `*bl_dp` with a clean HDR10 base-layer packet or a converted P8.1
+// packet. This is a no-op in preserve mode. Returns false on filtering errors;
+// the caller retains ownership of the original packet in that case. A
+// successful filter may set `*bl_dp` to NULL when an access unit contains no
+// selected NAL units.
+bool mp_dovi_split_filter_base(struct mp_dovi_split *s,
+                               struct demux_packet **bl_dp);
 
 // Apply the BSF to `bl_dp` and produce a companion EL demux_packet, if any.
 // Caller owns the returned packet. Returns NULL if the access unit contained

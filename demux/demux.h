@@ -89,6 +89,13 @@ struct demux_opts {
     bool force_retry_eof;
     char **directory_filter;
     int autocreate_playlist;
+    int dovi_profile7_mode;
+};
+
+enum demux_dovi_profile7_mode {
+    DEMUX_DOVI_PROFILE7_PRESERVE = 0,
+    DEMUX_DOVI_PROFILE7_HDR10,
+    DEMUX_DOVI_PROFILE7_P81,
 };
 
 #define SEEK_FACTOR   (1 << 1)      // argument is in range [0,1]

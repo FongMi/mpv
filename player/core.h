@@ -573,6 +573,7 @@ struct track *select_default_track(struct MPContext *mpctx, int order,
 void prefetch_next(struct MPContext *mpctx);
 void update_lavfi_complex(struct MPContext *mpctx);
 void update_vo_chain_el_state(struct MPContext *mpctx);
+bool track_uses_dovi_p7_hdr10_fallback(struct track *track);
 
 // main.c
 int mp_initialize(struct MPContext *mpctx, char **argv);
