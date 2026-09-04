@@ -155,11 +155,11 @@ static bool configure_lavrr(struct priv *p, bool verbose)
     struct mp_chmap map_in = p->in_channels;
     struct mp_chmap map_out = p->out_channels;
 
-    // Try not to do any remixing if at least one is "unknown". Some corner
-    // cases also benefit from disabling all channel handling logic if the
-    // src/dst layouts are the same (like fl-fr-na -> fl-fr-na).
+    // Try not to do any remixing if at least one is "unknown". Equal layouts
+    // that lavc cannot represent also benefit from disabling all channel
+    // handling logic (like fl-fr-na -> fl-fr-na).
     if (mp_chmap_is_unknown(&map_in) || mp_chmap_is_unknown(&map_out) ||
-        mp_chmap_equals(&map_in, &map_out))
+        (mp_chmap_equals(&map_in, &map_out) && !mp_chmap_is_lavc(&map_in)))
     {
         mp_chmap_set_unknown(&map_in, map_in.num);
         mp_chmap_set_unknown(&map_out, map_out.num);
