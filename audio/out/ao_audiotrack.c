@@ -600,8 +600,10 @@ static MP_THREAD_VOID ao_thread(void *arg)
             int64_t ts = mp_time_ns();
             ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
             ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
-            int samples = ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
-            int ret = AudioTrack_write(ao, samples * ao->sstride);
+            // Like other pull AOs, keep the device clock running through an
+            // underrun. A zero-length write would not block and would spin.
+            ao_read_data(ao, &p->chunk, read_samples, ts, NULL, true, true);
+            int ret = AudioTrack_write(ao, read_samples * ao->sstride);
             if (ret >= 0) {
                 p->written_frames += ret / ao->sstride;
             } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
