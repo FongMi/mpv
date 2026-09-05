@@ -471,11 +471,17 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
             ao_c->spdif_passthrough = false;
             ao_c->spdif_failed = true;
             mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, false);
+            // Discard queued passthrough frames before switching to PCM.
+            mp_filter_reset(ao_c->track->dec->f);
             if (!mp_decoder_wrapper_reinit(ao_c->track->dec))
                 goto init_error;
             reset_audio_state(mpctx);
             mp_output_chain_reset_harder(ao_c->filter);
-            mp_wakeup_core(mpctx); // reinit with new format next time
+            // The old format change left a pending request at the AO input.
+            // Reissue it so the reset filter chain negotiates the PCM format.
+            mp_filter_reset(ao_c->ao_filter);
+            mp_filter_wakeup(ao_c->ao_filter);
+            mp_wakeup_core(mpctx);
             return 0;
         }
 

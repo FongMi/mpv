@@ -565,6 +565,7 @@ bool mp_decoder_wrapper_reinit(struct mp_decoder_wrapper *d)
     }
     thread_lock(p);
     bool res = reinit_decoder(p);
+    mp_filter_wakeup(p->decf);
     thread_unlock(p);
     return res;
 }
