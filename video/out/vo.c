@@ -139,6 +139,7 @@ struct vo_internal {
     bool paused;
     bool visible;
     bool wakeup_on_done;
+    bool backend_error;
     int queued_events;              // event mask for the user
     int internal_events;            // event mask for us
 
@@ -326,6 +327,12 @@ static struct vo *vo_create(bool probing, struct mpv_global *global,
 error:
     dealloc_vo(vo);
     return NULL;
+}
+
+struct vo *init_video_out_by_name(struct mpv_global *global,
+                                  struct vo_extra *ex, const char *name)
+{
+    return vo_create(false, global, ex, (char *)name);
 }
 
 struct vo *init_best_video_out(struct mpv_global *global, struct vo_extra *ex)
@@ -826,6 +833,25 @@ void vo_request_wakeup_on_done(struct vo *vo)
     mp_mutex_unlock(&vo->in->lock);
 }
 
+void vo_report_backend_error(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    in->backend_error = true;
+    wakeup_core(vo);
+    mp_mutex_unlock(&in->lock);
+}
+
+bool vo_query_backend_error(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    bool error = in->backend_error;
+    in->backend_error = false;
+    mp_mutex_unlock(&in->lock);
+    return error;
+}
+
 // Whether vo_queue_frame() can be called. If the VO is not ready yet, the
 // function will return false, and the VO will call the wakeup callback once
 // it's ready.
@@ -1078,7 +1104,10 @@ static void do_redraw(struct vo *vo)
     mp_mutex_lock(&in->lock);
     in->request_redraw = false;
 
-    if (vo->driver->caps & (VO_CAP_NORETAIN | VO_CAP_UNTIMED)) {
+    if ((vo->driver->caps & VO_CAP_UNTIMED) ||
+        ((vo->driver->caps & VO_CAP_NORETAIN) &&
+         !(vo->driver->caps & VO_CAP_NORETAIN_REDRAW)))
+    {
         mp_mutex_unlock(&in->lock);
         return;
     }
