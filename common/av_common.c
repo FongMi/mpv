@@ -25,8 +25,10 @@
 #include <libavutil/opt.h>
 #include <libavutil/error.h>
 #include <libavutil/cpu.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libplacebo/utils/libav.h>
 
 #include "config.h"
 
@@ -48,6 +50,92 @@ enum AVMediaType mp_to_av_stream_type(int type)
     case STREAM_SUB:   return AVMEDIA_TYPE_SUBTITLE;
     default:           return AVMEDIA_TYPE_UNKNOWN;
     }
+}
+
+static unsigned int hdr_metadata_u32(float value)
+{
+    if (!isfinite(value) || value <= 0)
+        return 0;
+    return value >= (double)UINT_MAX ? UINT_MAX : value;
+}
+
+static int add_hdr_codec_side_data(AVCodecParameters *avp,
+                                   const struct pl_hdr_metadata *hdr)
+{
+    unsigned int max_cll = hdr_metadata_u32(hdr->max_cll);
+    unsigned int max_fall = hdr_metadata_u32(hdr->max_fall);
+    if (max_cll && max_fall) {
+        size_t clm_size;
+        AVContentLightMetadata *clm =
+            av_content_light_metadata_alloc(&clm_size);
+        if (!clm)
+            return -1;
+
+        clm->MaxCLL = max_cll;
+        clm->MaxFALL = max_fall;
+        if (!av_packet_side_data_add(&avp->coded_side_data,
+                                     &avp->nb_coded_side_data,
+                                     AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+                                     (uint8_t *)clm, clm_size, 0))
+        {
+            av_free(clm);
+            return -1;
+        }
+    }
+
+    bool has_primaries =
+        pl_primaries_valid(&hdr->prim) &&
+        isfinite(hdr->prim.red.x) && hdr->prim.red.x > 0 &&
+        isfinite(hdr->prim.red.y) && hdr->prim.red.y > 0 &&
+        isfinite(hdr->prim.green.x) && hdr->prim.green.x > 0 &&
+        isfinite(hdr->prim.green.y) && hdr->prim.green.y > 0 &&
+        isfinite(hdr->prim.blue.x) && hdr->prim.blue.x > 0 &&
+        isfinite(hdr->prim.blue.y) && hdr->prim.blue.y > 0 &&
+        isfinite(hdr->prim.white.x) && hdr->prim.white.x > 0 &&
+        isfinite(hdr->prim.white.y) && hdr->prim.white.y > 0;
+    bool has_luminance =
+        isfinite(hdr->min_luma) && hdr->min_luma >= 0 &&
+        isfinite(hdr->max_luma) && hdr->max_luma > hdr->min_luma;
+    if (has_primaries || has_luminance) {
+        size_t mdm_size = sizeof(AVMasteringDisplayMetadata);
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 15, 100)
+        AVMasteringDisplayMetadata *mdm =
+            av_mastering_display_metadata_alloc_size(&mdm_size);
+#else
+        AVMasteringDisplayMetadata *mdm =
+            av_mastering_display_metadata_alloc();
+#endif
+        if (!mdm)
+            return -1;
+
+        if (has_primaries) {
+            mdm->display_primaries[0][0] = av_d2q(hdr->prim.red.x, INT_MAX);
+            mdm->display_primaries[0][1] = av_d2q(hdr->prim.red.y, INT_MAX);
+            mdm->display_primaries[1][0] = av_d2q(hdr->prim.green.x, INT_MAX);
+            mdm->display_primaries[1][1] = av_d2q(hdr->prim.green.y, INT_MAX);
+            mdm->display_primaries[2][0] = av_d2q(hdr->prim.blue.x, INT_MAX);
+            mdm->display_primaries[2][1] = av_d2q(hdr->prim.blue.y, INT_MAX);
+            mdm->white_point[0] = av_d2q(hdr->prim.white.x, INT_MAX);
+            mdm->white_point[1] = av_d2q(hdr->prim.white.y, INT_MAX);
+            mdm->has_primaries = 1;
+        }
+        if (has_luminance) {
+            mdm->min_luminance = av_d2q(hdr->min_luma, INT_MAX);
+            mdm->max_luminance = av_d2q(hdr->max_luma, INT_MAX);
+            mdm->has_luminance = 1;
+        }
+
+        if (!av_packet_side_data_add(&avp->coded_side_data,
+                                     &avp->nb_coded_side_data,
+                                     AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+                                     (uint8_t *)mdm, mdm_size, 0))
+        {
+            av_free(mdm);
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 AVCodecParameters *mp_codec_params_to_av(const struct mp_codec_params *c)
@@ -90,6 +178,14 @@ AVCodecParameters *mp_codec_params_to_av(const struct mp_codec_params *c)
     // Video only
     avp->width = c->disp_w;
     avp->height = c->disp_h;
+    avp->color_range = pl_levels_to_av(c->repr.levels);
+    avp->color_primaries = pl_primaries_to_av(c->color.primaries);
+    avp->color_trc = pl_transfer_to_av(c->color.transfer);
+    avp->color_space = pl_system_to_av(c->repr.sys);
+    avp->chroma_location = pl_chroma_to_av(c->chroma_location);
+    if (pl_color_transfer_is_hdr(c->color.transfer) &&
+        add_hdr_codec_side_data(avp, &c->color.hdr) < 0)
+        goto error;
 
     // Audio only
     avp->sample_rate = c->samplerate;
