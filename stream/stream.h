@@ -229,6 +229,8 @@ typedef struct stream {
     int (*write_buffer)(struct stream *s, void *buffer, int len);
     // Seek
     int (*seek)(struct stream *s, int64_t pos);
+    // Restart a linear stream at byte 0 without implying general seek support.
+    int (*rewind)(struct stream *s);
     // Total stream size in bytes (negative if unavailable)
     int64_t (*get_size)(struct stream *s);
     // Control
