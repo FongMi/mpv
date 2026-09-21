@@ -2025,6 +2025,15 @@ static int mp_property_audio_params(void *ctx, struct m_property *prop,
         mpctx->ao_chain->filter->input_aformat : NULL, action, arg);
 }
 
+static int mp_property_audio_passthrough_failed(void *ctx, struct m_property *prop,
+                                               int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (!mpctx->ao_chain)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_bool_ro(action, arg, mpctx->ao_chain->spdif_failed);
+}
+
 static int mp_property_audio_out_params(void *ctx, struct m_property *prop,
                                         int action, void *arg)
 {
@@ -4834,6 +4843,7 @@ static const struct m_property mp_properties_base[] = {
     M_PROPERTY_ALIAS("audio-codec", "current-tracks/audio/codec-desc"),
     {"audio-params", mp_property_audio_params},
     {"audio-out-params", mp_property_audio_out_params},
+    {"audio-passthrough-failed", mp_property_audio_passthrough_failed},
     {"aid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_AUDIO}},
     {"audio-device", mp_property_audio_device},
     {"audio-device-list", mp_property_audio_devices},
@@ -5006,7 +5016,8 @@ static const char *const *const mp_event_property_change[] = {
     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
       "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",
-      "audio-out-params", "volume-max", "volume-gain-min", "volume-gain-max", "mixer-active"),
+      "audio-out-params", "audio-passthrough-failed", "volume-max", "volume-gain-min",
+      "volume-gain-max", "mixer-active"),
     E(MPV_EVENT_SEEK, "seeking", "core-idle", "eof-reached"),
     E(MPV_EVENT_PLAYBACK_RESTART, "seeking", "core-idle", "eof-reached"),
     E(MP_EVENT_METADATA_UPDATE, "metadata", "filtered-metadata", "media-title"),

@@ -2843,6 +2843,12 @@ Property list
             "channel-count"     MPV_FORMAT_INT64
             "hr-channels"       MPV_FORMAT_STRING
 
+``audio-passthrough-failed``
+    Whether passthrough output initialization failed for the current audio chain,
+    causing mpv to retry with PCM decoding. Reset when the audio chain is replaced
+    or passthrough is retried after an output reload. Unavailable without an audio
+    chain. This does not indicate whether an external receiver is producing sound.
+
 ``audio-out-params``
     Same as ``audio-params``, but the format of the data written to the audio
     API.
