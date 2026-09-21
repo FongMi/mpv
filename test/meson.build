@@ -103,6 +103,16 @@ if features['lua']
     endif
 endif
 
+target_hint_functions = custom_target('target-hint-functions',
+    input: files('../video/out/gpu/video.c', '../video/out/gpu/video.h',
+                 '../video/out/vo_gpu_next.c'),
+    output: 'target_hint_functions.h',
+    command: [python, files('target_hint.py'), '--generate', '@OUTPUT@'])
+target_hint = executable('target-hint', ['target_hint.c', target_hint_functions],
+                         dependencies: libm)
+
+test('target-hint', target_hint)
+
 chmap_files = [
     'audio/chmap_avchannel.c',
     'audio/chmap_sel.c',
