@@ -7508,6 +7508,17 @@ static void cmd_load_script(void *p)
     }
 }
 
+static void cmd_unload_script(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    int64_t id = cmd->args[0].v.i64;
+
+    if (!mp_unload_script(cmd->mpctx, id)) {
+        MP_VERBOSE(cmd->mpctx, "Can't find script client @%"PRIi64".\n", id);
+        cmd->success = false;
+    }
+}
+
 static void cache_dump_poll(struct MPContext *mpctx)
 {
     struct command_ctx *ctx = mpctx->command_ctx;
@@ -8271,6 +8282,7 @@ const struct mp_cmd_def mp_cmds[] = {
     { "load-input-conf", cmd_load_input_conf, {{"filename", OPT_STRING(v.s)}} },
 
     { "load-script", cmd_load_script, {{"filename", OPT_STRING(v.s)}} },
+    { "unload-script", cmd_unload_script, {{"client-id", OPT_INT64(v.i64)}} },
 
     { "dump-cache", cmd_dump_cache, { {"start", OPT_TIME(v.d),
                                         .flags = M_OPT_ALLOW_NO},

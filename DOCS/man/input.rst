@@ -1473,7 +1473,12 @@ Scripting Commands
     ::
 
         MPV_FORMAT_NODE_MAP
-            "client_id"    MPV_FORMAT_STRING
+            "client_id"    MPV_FORMAT_INT64
+
+``unload-script <client-id>``
+    Request shutdown of a script loaded with ``load-script``. ``client-id`` is
+    the value returned by ``load-script``. The command succeeds after the
+    shutdown event is queued; script cleanup remains asynchronous.
 
 Screenshot Commands
 ~~~~~~~~~~~~~~~~~~~
