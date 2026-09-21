@@ -194,6 +194,48 @@ gl_video = executable('gl-video', 'gl_video.c', objects: gl_video_objects,
                       link_with: [img_utils, test_utils])
 test('gl-video', gl_video)
 
+gpu_dumb_headers = custom_target('gpu-dumb-headers',
+    input: files('../video/out/gpu/video.c', '../video/out/gpu/utils.c',
+                 '../video/out/gpu/utils.h'),
+    depend_files: files('vo_android_frame.py'),
+    output: ['vo_gpu_dumb_functions.h', 'vo_gpu_dumb_types.h'],
+    command: [python, files('vo_gpu_dumb.py'), '--generate', '@OUTPUT0@'])
+gpu_dumb = executable('gpu-dumb', ['vo_gpu_dumb.c', gpu_dumb_headers],
+                      dependencies: libm)
+test('gpu-dumb', gpu_dumb)
+
+gpu_next_headers = custom_target('gpu-next-mapping-headers',
+    input: files('../video/mp_image.h', '../video/out/gpu/hwdec.h',
+                 '../video/mp_image.c', '../video/out/vo_gpu_next.c'),
+    output: ['vo_gpu_next_contracts.h', 'vo_gpu_next_functions.h'],
+    command: [python, files('vo_gpu_next.py'), '--mpv', source_root,
+              '--generate', '@OUTPUT0@', '@OUTPUT1@'])
+gpu_next_mapping = executable('gpu-next-mapping',
+                              ['vo_gpu_next.c', gpu_next_headers])
+test('gpu-next-mapping', gpu_next_mapping)
+
+aimage_mapper_header = custom_target('aimage-mapper-functions',
+    input: files('../video/out/hwdec/hwdec_aimagereader.c'),
+    output: 'aimage_mapper_functions.h',
+    command: [python, files('aimage_mapper.py'), '--generate', '@OUTPUT@'])
+aimage_mapper = executable('aimage-mapper', ['aimage_mapper.c', aimage_mapper_header])
+test('aimage-mapper', aimage_mapper)
+
+aimage_timestamp_header = custom_target('aimage-timestamp-functions',
+    input: files('../video/out/hwdec/hwdec_aimagereader.c'),
+    output: 'aimage_timestamp_functions.h',
+    command: [python, files('aimage_mapper.py'), '--acquire', '--generate', '@OUTPUT@'])
+aimage_timestamp = executable('aimage-timestamp',
+    ['aimage_timestamp.c', aimage_timestamp_header])
+test('aimage-timestamp', aimage_timestamp)
+
+aimage_gl_header = custom_target('aimage-gl-functions',
+    input: files('../video/out/hwdec/hwdec_aimagereader.c'),
+    output: 'aimage_gl_functions.h',
+    command: [python, files('aimage_gl.py'), '--generate', '@OUTPUT@'])
+aimage_gl = executable('aimage-gl', ['aimage_gl.c', aimage_gl_header])
+test('aimage-gl', aimage_gl)
+
 android_osd_source = custom_target('android-osd-contracts-source',
     input: files('../video/out/android_osd_overlay.c', '../video/out/aspect.c',
                  '../player/command.c', '../sub/osd.c', '../sub/sd_ass.c',
