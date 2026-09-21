@@ -130,7 +130,9 @@ Interface changes
     - add `dropped-file` property
     - add `--dvd-region` option
     - add `--disc-menu` option
+    - add `disc-navigation-active` property
     - add `disc-menu-active` property
+    - add `disc-menu-supported` property
     - add `discnav` command with the `up`, `down`, `left`, `right`, `select`,
       `menu`, `title-menu`, `popup`, `audio-menu`, `sub-menu`, `angle-menu`,
       `up-menu`, `prev`, `red`, `green`, `yellow`, `blue`, `mouse-move` and
