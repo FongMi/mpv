@@ -116,6 +116,7 @@ static const stream_info_t *const stream_list[] = {
 struct stream_opts {
     int64_t buffer_size;
     bool load_unsafe_playlists;
+    char *proxy_url;
 };
 
 #define OPT_BASE_STRUCT struct stream_opts
@@ -125,6 +126,7 @@ const struct m_sub_options stream_conf = {
         {"stream-buffer-size", OPT_BYTE_SIZE(buffer_size),
             M_RANGE(STREAM_MIN_BUFFER_SIZE, STREAM_MAX_BUFFER_SIZE)},
         {"load-unsafe-playlists", OPT_BOOL(load_unsafe_playlists)},
+        {"proxy-url", OPT_STRING(proxy_url)},
         {0}
     },
     .size = sizeof(struct stream_opts),
@@ -211,6 +213,28 @@ char *mp_url_escape(void *talloc_ctx, const char *url, const char *ok)
 
     *out = 0;
     return rv;
+}
+
+static bool split_proxy_url(const char *url, bstr *path)
+{
+    bstr proto = mp_split_proto(bstr0(url), path);
+    return bstrcasecmp0(proto, "proxy") == 0;
+}
+
+char *mp_rewrite_proxy_url(void *talloc_ctx, struct mpv_global *global,
+                           const char *url)
+{
+    bstr path;
+    if (!global || !url || !split_proxy_url(url, &path))
+        return NULL;
+
+    struct stream_opts *opts = mp_get_config_group(NULL, global, &stream_conf);
+    char *proxy_url = opts->proxy_url;
+    char *rewritten = NULL;
+    if (proxy_url && proxy_url[0])
+        rewritten = talloc_asprintf(talloc_ctx, "%s%.*s", proxy_url, BSTR_P(path));
+    talloc_free(opts);
+    return rewritten;
 }
 
 static const char *match_proto(const char *url, const char *proto)

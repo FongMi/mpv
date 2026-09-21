@@ -356,6 +356,8 @@ stream_t *open_output_stream(const char *filename, struct mpv_global *global);
 void mp_url_unescape_inplace(char *buf);
 char *mp_url_unescape(void *talloc_ctx, const char *url);
 char *mp_url_escape(void *talloc_ctx, const char *s, const char *ok);
+char *mp_rewrite_proxy_url(void *talloc_ctx, struct mpv_global *global,
+                           const char *url);
 
 // stream_memory.c
 struct stream *stream_memory_open(struct mpv_global *global, void *data, int len);

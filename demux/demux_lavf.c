@@ -961,6 +961,11 @@ static int nested_io_open(struct AVFormatContext *s, AVIOContext **pb,
     struct demuxer *demuxer = s->opaque;
     mp_require(demuxer);
     lavf_priv_t *priv = demuxer->priv;
+    char *rewritten = mp_rewrite_proxy_url(NULL, demuxer->global, url);
+    if (rewritten) {
+        MP_VERBOSE(demuxer, "Rewriting nested proxy URL to %s\n", rewritten);
+        url = rewritten;
+    }
 
     if (options && priv->opts->propagate_opts) {
         // Copy av_opts to options, but only entries that are not present in
@@ -1000,6 +1005,7 @@ static int nested_io_open(struct AVFormatContext *s, AVIOContext **pb,
         };
         MP_TARRAY_APPEND(priv, priv->nested, priv->num_nested, nest);
     }
+    talloc_free(rewritten);
     return r;
 }
 

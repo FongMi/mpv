@@ -1192,6 +1192,8 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     const char *effective_url = NULL;
     curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &effective_url);
     p->effective_url = effective_url ? effective_url : p->url;
+    talloc_free(s->url);
+    s->url = talloc_strdup(s, p->effective_url);
 
     s->seekable = p->seekable;
     s->is_network = true;
