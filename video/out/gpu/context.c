@@ -28,10 +28,15 @@
 #include "common/msg.h"
 #include "options/options.h"
 #include "options/m_option.h"
+#include "video/mp_image.h"
 #include "video/out/vo.h"
 
 #include "context.h"
 #include "spirv.h"
+
+#if HAVE_VULKAN
+#include "video/out/vulkan/context.h"
+#endif
 
 /* OpenGL */
 extern const struct ra_ctx_fns ra_ctx_glx;
@@ -344,4 +349,98 @@ void ra_ctx_destroy(struct ra_ctx **ctx_ptr)
     talloc_free(ctx);
 
     *ctx_ptr = NULL;
+}
+
+bool ra_ctx_get_pl_swapchain(struct ra_ctx *ctx, pl_swapchain *swapchain)
+{
+    *swapchain = NULL;
+#if HAVE_VULKAN
+    struct mpvk_ctx *vk = ra_vk_ctx_get(ctx);
+    if (vk) {
+        *swapchain = vk->swapchain;
+        return true;
+    }
+#endif
+
+    return false;
+}
+
+static struct pl_color_space color_hint_platform_state(
+    const struct pl_color_space *color)
+{
+    // Surface negotiation can signal only static HDR10 metadata. Keep
+    // per-frame HDR10+ and Dolby Vision metadata out of the cache key.
+    return (struct pl_color_space) {
+        .primaries = color->primaries,
+        .transfer = color->transfer,
+        .hdr = {
+            .prim = color->hdr.prim,
+            .min_luma = color->hdr.min_luma,
+            .max_luma = color->hdr.max_luma,
+            .max_cll = color->hdr.max_cll,
+            .max_fall = color->hdr.max_fall,
+        },
+    };
+}
+
+enum ra_color_hint_result ra_swapchain_set_color(
+    struct ra_swapchain *sw, pl_swapchain pl_sw,
+    struct mp_image_params *params)
+{
+    bool has_params = params != NULL;
+    bool cache_enabled = sw->color_hint_cache_enabled;
+    struct pl_color_space request_color;
+    if (cache_enabled) {
+        request_color = params ? color_hint_platform_state(&params->color)
+                               : (struct pl_color_space){0};
+    }
+    if (cache_enabled && sw->color_hint_valid &&
+        sw->color_hint_has_params == has_params &&
+        sw->color_hint_swapchain == pl_sw &&
+        (!has_params ||
+         pl_color_space_equal(&sw->color_hint_request_color, &request_color)))
+    {
+        if (params) {
+            // Preserve per-frame HDR metadata while restoring any platform
+            // colorspace normalization from the original request.
+            params->color.primaries = sw->color_hint_output_primaries;
+            params->color.transfer = sw->color_hint_output_transfer;
+        }
+        return sw->color_hint_result;
+    }
+
+    enum ra_color_hint_result result = RA_COLOR_HINT_NONE;
+    if (!params) {
+        if (sw->fns->set_color)
+            sw->fns->set_color(sw, NULL);
+        if (pl_sw)
+            pl_swapchain_colorspace_hint(pl_sw, NULL);
+    } else if (sw->fns->set_color && sw->fns->set_color(sw, params)) {
+        result = RA_COLOR_HINT_EXTERNAL;
+    } else if (pl_sw) {
+        pl_swapchain_colorspace_hint(pl_sw, &params->color);
+        result = RA_COLOR_HINT_SWAPCHAIN;
+    } else if (sw->fns->set_color) {
+        sw->fns->set_color(sw, NULL);
+    }
+
+    // Cache rejected hints too; Android surface changes invalidate the result.
+    if (cache_enabled) {
+        sw->color_hint_valid = true;
+        sw->color_hint_has_params = has_params;
+        sw->color_hint_swapchain = pl_sw;
+        sw->color_hint_request_color = request_color;
+        sw->color_hint_output_primaries =
+            params ? params->color.primaries : PL_COLOR_PRIM_UNKNOWN;
+        sw->color_hint_output_transfer =
+            params ? params->color.transfer : PL_COLOR_TRC_UNKNOWN;
+        sw->color_hint_result = result;
+    }
+    return result;
+}
+
+void ra_swapchain_invalidate_color(struct ra_swapchain *sw)
+{
+    if (sw)
+        sw->color_hint_valid = false;
 }
