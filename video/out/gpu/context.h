@@ -75,6 +75,13 @@ struct ra_ctx_params {
     // before drawing a frame.
     bool (*check_visible)(struct ra_ctx *ctx);
 
+    // Keep presenting a Vulkan swapchain reported as suboptimal. The platform
+    // must explicitly resize the swapchain when its surface dimensions change.
+    bool allow_suboptimal;
+
+    // See pl_vulkan_swapchain_params.disable_storage.
+    bool disable_swapchain_storage;
+
     // See ra_swapchain_fns.color_depth.
     int (*color_depth)(struct ra_ctx *ctx);
 

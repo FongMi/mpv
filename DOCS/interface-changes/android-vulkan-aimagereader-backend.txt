@@ -1,0 +1,1 @@
+add `--android-vulkan-aimagereader-backend` to select the Android Vulkan AImageReader import or conversion backend

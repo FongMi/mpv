@@ -1002,7 +1002,15 @@ static void pass_get_images(struct gl_video *p, struct video_image *vimg,
         for (int i = 0; i < 4; i++)
             img[n].components += !!p->ra_format.components[n][i];
 
-        get_transform(t->w, t->h, p->image_params.rotate, t->flipped,
+        // The direct pass samples the visible plane, not allocation padding.
+        if (p->dumb_mode) {
+            int cw = type == PLANE_CHROMA ? p->ra_format.chroma_w : 1;
+            int ch = type == PLANE_CHROMA ? p->ra_format.chroma_h : 1;
+            img[n].w = chroma_upsize(w, cw) / cw;
+            img[n].h = chroma_upsize(h, ch) / ch;
+        }
+
+        get_transform(img[n].w, img[n].h, p->image_params.rotate, t->flipped,
                       &img[n].transform);
         if (p->image_params.rotate % 180 == 90)
             MPSWAP(int, img[n].w, img[n].h);
@@ -4370,8 +4378,14 @@ bool gl_video_check_format(struct gl_video *p, int mp_format)
     if (ra_get_imgfmt_desc(p->ra, mp_format, &desc) &&
         is_imgfmt_desc_supported(p, &desc))
         return true;
-    if (ra_hwdec_get(&p->hwdec_ctx, mp_format))
+    struct ra_hwdec *hwdec = ra_hwdec_get(&p->hwdec_ctx, mp_format);
+    if (hwdec) {
+        const struct ra_hwdec_mapper_driver *mapper = hwdec->driver->mapper;
+        if (mapper && mapper->needs_dst_params_probe &&
+            mapper->needs_dst_params_probe(p->ra))
+            return false;
         return true;
+    }
     return false;
 }
 
