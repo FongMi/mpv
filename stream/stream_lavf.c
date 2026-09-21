@@ -263,6 +263,8 @@ static char **get_safe_protocols(void)
         }
     }
 
+    MP_TARRAY_APPEND(NULL, protocols, num, talloc_strdup(protocols, "proxy"));
+
     // rtsp is a demuxer not protocol in ffmpeg so it is handled separately
     for (int i = 0; ffmpeg_demuxers[i]; i++) {
         if (strcmp("rtsp", ffmpeg_demuxers[i]) == 0) {
@@ -328,6 +330,33 @@ static char *normalize_url(void *ta_parent, const char *filename)
     return (char *)filename;
 }
 
+static void set_stream_url(stream_t *stream, const char *url)
+{
+    talloc_free(stream->url);
+    stream->url = talloc_strdup(stream, url);
+}
+
+static void read_avio_info(stream_t *stream, AVIOContext *avio)
+{
+    if (!avio->av_class)
+        return;
+
+    uint8_t *location = NULL;
+    if (av_opt_get(avio, "location", AV_OPT_SEARCH_CHILDREN, &location) >= 0 &&
+        location[0])
+    {
+        // Demuxers resolve relative references against the final URL.
+        set_stream_url(stream, location);
+    }
+    av_free(location);
+
+    uint8_t *mt = NULL;
+    if (av_opt_get(avio, "mime_type", AV_OPT_SEARCH_CHILDREN, &mt) >= 0) {
+        stream->mime_type = talloc_strdup(stream, mt);
+        av_free(mt);
+    }
+}
+
 static int open_f(stream_t *stream)
 {
     AVIOContext *avio = NULL;
@@ -348,6 +377,14 @@ static int open_f(stream_t *stream)
     for (int i = 0; i < MP_ARRAY_SIZE(prefix); i++)
         if (!strncmp(filename, prefix[i], strlen(prefix[i])))
             filename += strlen(prefix[i]);
+
+    char *rewritten = mp_rewrite_proxy_url(temp, stream->global, filename);
+    if (rewritten) {
+        MP_VERBOSE(stream, "Rewriting proxy URL to %s\n", rewritten);
+        filename = rewritten;
+        set_stream_url(stream, filename);
+    }
+
     if (!strncmp(filename, "rtsp:", 5) || !strncmp(filename, "rtsps:", 6)) {
         /* This is handled as a special demuxer, without a separate
          * stream layer. demux_lavf will do all the real work. Note
@@ -405,13 +442,7 @@ static int open_f(stream_t *stream)
 
     mp_avdict_print_unset(stream->log, MSGL_V, dict);
 
-    if (avio->av_class) {
-        uint8_t *mt = NULL;
-        if (av_opt_get(avio, "mime_type", AV_OPT_SEARCH_CHILDREN, &mt) >= 0) {
-            stream->mime_type = talloc_strdup(stream, mt);
-            av_free(mt);
-        }
-    }
+    read_avio_info(stream, avio);
 
     stream->priv = avio;
     stream->seekable = avio->seekable & AVIO_SEEKABLE_NORMAL;

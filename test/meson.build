@@ -131,6 +131,16 @@ paths = executable('paths', 'paths.c', include_directories: incdir,
                    objects: paths_objects, link_with: test_utils)
 test('paths', paths)
 
+stream_lavf = executable('stream-lavf', 'stream_lavf.c',
+    include_directories: incdir,
+    dependencies: [libavformat, libavutil],
+    link_with: test_utils,
+    c_args: cc.get_supported_arguments('-ffunction-sections', '-fdata-sections'),
+    link_args: cc.get_supported_link_arguments('-Wl,--gc-sections',
+                                              '-Wl,--no-export-dynamic',
+                                              '-Wl,-dead_strip'))
+test('stream-lavf', stream_lavf)
+
 if features['libcurl']
     avio_crypto_objects = libmpv.extract_objects('demux/avio_crypto.c')
     avio_crypto = executable('avio-crypto', files('avio_crypto.c'),
