@@ -176,6 +176,7 @@ struct vo_chain {
     bool is_coverart;
     // - video consists of sparse still images
     bool is_sparse;
+    bool demuxer_still_image; // last observed stream-header value
     bool sparse_eof_signalled;
 
     bool underrun;
