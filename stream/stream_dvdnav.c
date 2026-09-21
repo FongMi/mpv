@@ -36,6 +36,7 @@
 #endif
 
 #include <dvdnav/dvdnav.h>
+#include <dvdnav/title_layout.h>
 #include <libavutil/common.h>
 #include <libavutil/intreadwrite.h>
 
@@ -44,6 +45,7 @@
 #include "options/options.h"
 #include "common/msg.h"
 #include "input/input.h"
+#include "misc/thread_tools.h"
 #include "options/m_config.h"
 #include "options/path.h"
 #include "osdep/threads.h"
@@ -65,12 +67,14 @@
 
 struct priv {
     dvdnav_t *dvdnav;                   // handle to libdvdnav stuff
+    stream_t *iso_stream;               // backing stream for ISO images
     struct mp_log *log;                 // borrowed from the stream
     struct mp_log *lib_log;             // used by libdvdnav's log callback
     bool probing;                       // open is an .iso auto-detection probe
     char *filename;                     // path
     int64_t duration;                   // in 90 kHz PTS ticks
-    int title;
+    uint32_t last_nav_end_pts;          // last VOBU end PTS in 90 kHz ticks
+    bool nav_pts_valid;
     bool had_initial_vts;
 
     int dvd_speed;
@@ -78,9 +82,23 @@ struct priv {
     int track;
     char *device;
 
-    mp_mutex lock;                      // guards the nav/menu state below
+    mp_mutex vm_lock;                   // serializes libdvdnav reads and controls
+    mp_mutex lock;                      // protects only the published state below
+    struct stream_nav_state nav_state;
+    struct stream_dvd_streams dvd_streams;
+    bool dvd_catalog_dirty, dvd_selection_dirty;
+    int num_titles;                     // immutable after opening; -1 on error
+    int current_title;                  // libdvdnav title number; -1 on error
+    int64_t current_time;               // in 90 kHz PTS ticks; -1 on error
 
+    // The remaining navigation state is owned by vm_lock.
     bool still_active;                  // fill_buffer() is holding a still
+    bool terminal_stop;                 // EOF until an explicit navigation command
+    bool failed;                        // fatal VM error; cancellation is not failure
+    bool menu_support_known;            // reachability cached for the current VTS
+    bool menu_supported;
+    int still_duration;                 // finite length in seconds; 0 if infinite
+    uint32_t still_id;                  // incremented for each new held still
     uint32_t spu_clut[16];
     bool spu_clut_valid;
     bool in_menu;
@@ -90,6 +108,10 @@ struct priv {
     uint32_t discontinuity_id;          // bumped on actions that may jump
     bool drain_enabled;                 // a demuxer is attached and acks drains
     bool pending_drain;                 // hold EOF until the demuxer acks
+    bool wait_pending;                  // DVDNAV_WAIT awaits that drain
+    bool drain_immediate;               // user command should flush queued data now
+    bool drain_user_activation;         // pending jump came from a button
+    bool activation_pending_jump;       // activation may jump on the next read
     bool at_boundary;                   // no payload delivered since last jump
     int src_w, src_h;                   // video resolution in pixels
     int auto_actioned_button;           // last auto-activated button; 0 if none
@@ -98,6 +120,7 @@ struct priv {
 
     // Disc-driven audio/sub/angle state.
     int audio_physical;                 // 0..7 from DVDNAV_AUDIO_STREAM_CHANGE
+    int audio_logical;                  // VTS/domain attribute index
     int sub_physical;                   // 0..31 from DVDNAV_SPU_STREAM_CHANGE
     bool sub_visible;                   // SPU "on" flag from same event
 
@@ -320,13 +343,12 @@ static const char *dvd_domain_name(dvdnav_t *dvdnav)
     return "?";
 }
 
-// Map a libdvdnav physical audio stream number (0..7) to the corresponding
-// MPEG-PS substream byte that demux_lavf assigns to AVStream->id.
-static int dvd_physical_audio_to_substream(struct priv *priv, int physical)
+// Map the logical stream codec and physical ordinal to demux_lavf AVStream->id.
+static int dvd_audio_to_substream(struct priv *priv, int logical, int physical)
 {
-    if (physical < 0 || physical > 7)
+    if (logical < 0 || logical > 7 || physical < 0 || physical > 7)
         return -1;
-    uint16_t fmt = dvdnav_audio_stream_format(priv->dvdnav, physical);
+    uint16_t fmt = dvdnav_audio_stream_format(priv->dvdnav, logical);
     switch (fmt) {
     case DVD_AUDIO_FORMAT_AC3:
         return 0x80 + physical;
@@ -340,6 +362,26 @@ static int dvd_physical_audio_to_substream(struct priv *priv, int physical)
     default:
         return -1;
     }
+}
+
+// Resolve AST_REG using the same active-stream rules as libdvdnav. vm_lock held.
+static int dvd_audio_logical(struct priv *priv, int logical, int physical)
+{
+    if (physical < 0 || physical > 7)
+        return -1;
+    dvdnav_t *dvdnav = priv->dvdnav;
+    if (dvdnav_is_domain_vts(dvdnav) != 1)
+        logical = 0;
+    int mapped = logical >= 0 && logical < 8
+        ? dvdnav_get_audio_logical_stream(dvdnav, logical) : -1;
+    if (mapped < 0) {
+        for (logical = 0; logical < 8; logical++) {
+            mapped = dvdnav_get_audio_logical_stream(dvdnav, logical);
+            if (mapped >= 0)
+                break;
+        }
+    }
+    return mapped == physical ? logical : -1;
 }
 
 static void refresh_video_resolution(struct priv *priv)
@@ -356,9 +398,17 @@ static void refresh_video_resolution(struct priv *priv)
     }
 }
 
+static bool note_activation(struct priv *priv, dvdnav_status_t result)
+{
+    if (result != DVDNAV_STATUS_OK)
+        return false;
+    priv->activation_pending_jump = true;
+    return true;
+}
+
 // Pull the current selection back from libdvdnav and refresh our overlay
 // state. Called on NAV_PACKET/HIGHLIGHT events and after every nav command.
-// Runs with priv->lock held.
+// Runs with priv->vm_lock held.
 static void update_highlight(struct priv *priv)
 {
     int prev_btn = priv->current_button;
@@ -413,7 +463,7 @@ static void update_highlight(struct priv *priv)
         memcpy(&b, &pci->hli.btnit[priv->current_button - 1], sizeof(b));
         if (b.auto_action_mode == 1) {
             priv->auto_actioned_button = priv->current_button;
-            dvdnav_button_activate(priv->dvdnav, pci);
+            note_activation(priv, dvdnav_button_activate(priv->dvdnav, pci));
         }
     }
 }
@@ -422,106 +472,170 @@ static void update_highlight(struct priv *priv)
 // resolve the neighbour ourselves and use dvdnav_button_select() (rather than
 // dvdnav_{upper,lower,left,right}_button_select()) so that auto-action buttons
 // are activated only through update_highlight(), where we can observe it.
-static void select_neighbour_button(struct priv *priv, pci_t *pci,
+static bool select_neighbour_button(struct priv *priv, pci_t *pci,
                                     enum stream_nav_action action)
 {
     int32_t cur = 0;
-    dvdnav_get_current_highlight(priv->dvdnav, &cur);
-    if (cur <= 0 || cur > pci_num_buttons(pci))
-        return;
+    if (dvdnav_get_current_highlight(priv->dvdnav, &cur) != DVDNAV_STATUS_OK ||
+        cur <= 0 || cur > pci_num_buttons(pci))
+        return false;
     btni_t b;
     memcpy(&b, &pci->hli.btnit[cur - 1], sizeof(b));
     int target = action == STREAM_NAV_UP    ? b.up    :
                  action == STREAM_NAV_DOWN  ? b.down  :
                  action == STREAM_NAV_LEFT  ? b.left  :
                  action == STREAM_NAV_RIGHT ? b.right : 0;
-    if (target > 0)
-        dvdnav_button_select(priv->dvdnav, pci, target);
+    return target <= 0 ||
+           dvdnav_button_select(priv->dvdnav, pci, target) == DVDNAV_STATUS_OK;
 }
 
-static void do_nav_cmd(stream_t *stream, struct stream_nav_cmd *cmd)
+static bool do_nav_cmd(stream_t *stream, struct stream_nav_cmd *cmd,
+                       bool *menu_jump)
 {
     struct priv *priv = stream->priv;
+    *menu_jump = false;
 
     switch (cmd->action) {
-    case STREAM_NAV_MENU_ROOT:
-        dvdnav_menu_call(priv->dvdnav, DVD_MENU_Root);
+    case STREAM_NAV_MENU_ROOT: {
+        bool jumped = dvdnav_menu_call(priv->dvdnav, DVD_MENU_Root) ==
+                      DVDNAV_STATUS_OK ||
+                      dvdnav_menu_call(priv->dvdnav, DVD_MENU_Title) ==
+                      DVDNAV_STATUS_OK;
         update_highlight(priv);
-        return;
-    case STREAM_NAV_MENU_TITLE:
-        dvdnav_menu_call(priv->dvdnav, DVD_MENU_Title);
+        *menu_jump = jumped;
+        return jumped;
+    }
+    case STREAM_NAV_MENU_TITLE: {
+        bool jumped = dvdnav_menu_call(priv->dvdnav, DVD_MENU_Title) ==
+                      DVDNAV_STATUS_OK;
         update_highlight(priv);
-        return;
-    case STREAM_NAV_MENU_POPUP:
-        dvdnav_menu_call(priv->dvdnav, DVD_MENU_Part);
+        *menu_jump = jumped;
+        return jumped;
+    }
+    case STREAM_NAV_MENU_POPUP: {
+        bool jumped = dvdnav_menu_call(priv->dvdnav, DVD_MENU_Part) ==
+                      DVDNAV_STATUS_OK;
         update_highlight(priv);
-        return;
-    case STREAM_NAV_PREV_MENU:
-        dvdnav_menu_call(priv->dvdnav, DVD_MENU_Escape);
+        *menu_jump = jumped;
+        return jumped;
+    }
+    case STREAM_NAV_PREV_MENU: {
+        bool jumped = dvdnav_go_up(priv->dvdnav) == DVDNAV_STATUS_OK;
+        if (!jumped) {
+            jumped = dvdnav_menu_call(priv->dvdnav, DVD_MENU_Escape) ==
+                     DVDNAV_STATUS_OK;
+        }
         update_highlight(priv);
-        return;
+        *menu_jump = jumped;
+        return jumped;
+    }
     default:
         break;
     }
 
     if (!in_menu_domain(priv->dvdnav) || !priv->pci_valid)
-        return;
+        return false;
 
     pci_t *pci = &priv->pci;
     if (pci->hli.hl_gi.hli_ss == 0 || pci->hli.hl_gi.btn_ns == 0)
-        return;
+        return false;
 
+    bool accepted = true;
     switch (cmd->action) {
     case STREAM_NAV_UP:
     case STREAM_NAV_DOWN:
     case STREAM_NAV_LEFT:
     case STREAM_NAV_RIGHT:
-        select_neighbour_button(priv, pci, cmd->action);
+        accepted = select_neighbour_button(priv, pci, cmd->action);
         break;
     case STREAM_NAV_MOUSE_MOVE:
-        dvdnav_mouse_select(priv->dvdnav, pci, cmd->x, cmd->y);
+        accepted = dvdnav_mouse_select(priv->dvdnav, pci, cmd->x, cmd->y) ==
+                   DVDNAV_STATUS_OK;
         break;
     case STREAM_NAV_MOUSE_CLICK:
-        dvdnav_mouse_activate(priv->dvdnav, pci, cmd->x, cmd->y);
+        accepted = note_activation(priv,
+                                   dvdnav_mouse_activate(priv->dvdnav, pci,
+                                                         cmd->x, cmd->y));
         break;
     case STREAM_NAV_SELECT:
-        dvdnav_button_activate(priv->dvdnav, pci);
+        accepted = note_activation(priv,
+                                   dvdnav_button_activate(priv->dvdnav, pci));
         break;
     default:
+        accepted = false;
         break;
     }
 
     update_highlight(priv);
+    return accepted;
 }
 
-// Mark a source-position jump. Runs with priv->lock held.
-static void bump_discontinuity(struct priv *priv)
+// Forget a held still. Runs with priv->vm_lock held.
+static void clear_still(struct priv *priv)
 {
+    priv->still_active = false;
+    priv->still_duration = 0;
+}
+
+// A failed VM continuation cannot be resumed as a still or drain. vm_lock held.
+static void mark_failed(stream_t *s)
+{
+    struct priv *priv = s->priv;
+    priv->failed |= !mp_cancel_test(s->cancel);
+    clear_still(priv);
+    priv->pending_drain = false;
+    priv->wait_pending = false;
+    priv->drain_immediate = false;
+    priv->drain_user_activation = false;
+    priv->activation_pending_jump = false;
+}
+
+// Mark a source-position jump. Runs with priv->vm_lock held.
+static void bump_discontinuity(struct priv *priv, bool immediate)
+{
+    clear_still(priv);
+    priv->nav_pts_valid = false;
     // Back-to-back jump events with no payload between them are one jump.
-    if (priv->at_boundary)
+    if (priv->at_boundary) {
+        if (immediate && priv->pending_drain)
+            priv->drain_immediate = true;
         return;
+    }
     priv->at_boundary = true;
     priv->discontinuity_id++;
     // Hold an EOF at the boundary until the demuxer flushed and acked.
     // Off while no demuxer is attached (open/probing would starve).
-    if (priv->drain_enabled)
+    if (priv->drain_enabled) {
         priv->pending_drain = true;
+        priv->drain_immediate = immediate;
+        priv->drain_user_activation = false;
+    }
     MP_DBG(priv, "discontinuity -> %"PRIu32" (drain=%d)\n",
            priv->discontinuity_id, priv->pending_drain);
 }
 
-static void handle_nav_cmd(stream_t *stream, struct stream_nav_cmd *cmd)
+static bool handle_nav_cmd(stream_t *stream, struct stream_nav_cmd *cmd)
 {
     struct priv *priv = stream->priv;
 
-    mp_mutex_lock(&priv->lock);
-    int prev_auto = priv->auto_actioned_button;
-    do_nav_cmd(stream, cmd);
-    bool activated = stream_nav_action_activates(cmd->action) ||
-                     priv->auto_actioned_button != prev_auto;
-    if (priv->still_active && activated)
-        bump_discontinuity(priv);
-    mp_mutex_unlock(&priv->lock);
+    uint32_t pos, len;
+    bool positioned = dvdnav_get_position(priv->dvdnav, &pos, &len) ==
+                      DVDNAV_STATUS_OK;
+    bool menu_jump = false;
+    bool accepted = do_nav_cmd(stream, cmd, &menu_jump);
+    // A VM jump invalidates the position until the next block; register-only
+    // button commands leave it valid and must not discard the menu subpicture.
+    bool position_lost = positioned &&
+        dvdnav_get_position(priv->dvdnav, &pos, &len) != DVDNAV_STATUS_OK;
+    if (position_lost && !priv->pending_drain)
+        priv->at_boundary = false;
+    if (menu_jump || position_lost) {
+        priv->terminal_stop = false;
+        priv->wait_pending = false;
+        bump_discontinuity(priv, true);
+        priv->activation_pending_jump = false;
+    }
+    return accepted;
 }
 
 /**
@@ -532,19 +646,23 @@ static void handle_nav_cmd(stream_t *stream, struct stream_nav_cmd *cmd)
  */
 static int mp_dvdnav_lang_from_aid(stream_t *stream, int aid)
 {
-    uint8_t lg;
-    uint16_t lang;
     struct priv *priv = stream->priv;
-
     if (aid < 0)
         return 0;
-    lg = dvdnav_get_audio_logical_stream(priv->dvdnav, aid & 0x7);
-    if (lg == 0xff)
+    int match = -1;
+    int count = dvdnav_is_domain_vts(priv->dvdnav) == 1 ? 8 : 1;
+    for (int logical = 0; logical < count; logical++) {
+        int physical = dvdnav_get_audio_logical_stream(priv->dvdnav, logical);
+        if (dvd_audio_to_substream(priv, logical, physical) == aid) {
+            if (match >= 0)
+                return 0;
+            match = logical;
+        }
+    }
+    if (match < 0)
         return 0;
-    lang = dvdnav_audio_stream_to_lang(priv->dvdnav, lg);
-    if (lang == 0xffff)
-        return 0;
-    return lang;
+    uint16_t lang = dvdnav_audio_stream_to_lang(priv->dvdnav, match);
+    return lang == 0xffff ? 0 : lang;
 }
 
 /**
@@ -593,24 +711,53 @@ static int mp_dvdnav_number_of_subs(stream_t *stream)
 
 // Handle one event from dvdnav_get_next_block(). Returns the value that
 // fill_buffer() should return, or -1 to continue reading..
+static struct stream_dvd_streams read_dvd_streams(struct priv *priv);
+static bool same_dvd_streams(const struct stream_dvd_streams *a,
+                             const struct stream_dvd_streams *b);
+
 static int process_event(stream_t *s, int event, void *buf, int len)
 {
     struct priv *priv = s->priv;
     dvdnav_t *dvdnav = priv->dvdnav;
 
+    // BLOCK_OK is the hot path. Catalog metadata changes at navigation
+    // events, while an AST/SPST-only command can select an alias without a
+    // physical stream-change event.
+    if (event != DVDNAV_BLOCK_OK)
+        priv->dvd_selection_dirty = true;
+    if (event == DVDNAV_CELL_CHANGE || event == DVDNAV_VTS_CHANGE ||
+        event == DVDNAV_AUDIO_STREAM_CHANGE || event == DVDNAV_SPU_STREAM_CHANGE)
+        priv->dvd_catalog_dirty = true;
+
     switch (event) {
     case DVDNAV_BLOCK_OK:
         // Real data is flowing again: we are no longer holding a still, and
         // the last jump boundary (if any) has been crossed.
-        priv->still_active = false;
+        priv->activation_pending_jump = false;
+        clear_still(priv);
         priv->at_boundary = false;
         return len;
     case DVDNAV_STOP:
-        // End of disc: a real EOF, not a held still.
-        priv->still_active = false;
+        // End of disc: the next libdvdnav read would restart from first play.
+        priv->activation_pending_jump = false;
+        clear_still(priv);
+        priv->terminal_stop = true;
         return 0;
     case DVDNAV_NAV_PACKET: {
         pci_t *pnavpci = dvdnav_get_current_nav_pci(dvdnav);
+        if (!pnavpci)
+            break;
+        uint32_t start_pts = pnavpci->pci_gi.vobu_s_ptm;
+        uint32_t backward = priv->last_nav_end_pts - start_pts;
+        if (!priv->at_boundary && priv->nav_pts_valid &&
+            priv->last_nav_end_pts > start_pts &&
+            backward > DVD_TIMEBASE && backward < (1U << 31))
+        {
+            // This VOBU starts a new MPEG timeline without a HOP or WAIT.
+            bump_discontinuity(priv, false);
+        }
+        priv->last_nav_end_pts = pnavpci->pci_gi.vobu_e_ptm;
+        priv->nav_pts_valid = true;
         priv->pci = *pnavpci;
         priv->pci_valid = true;
         MP_TRACE(s, "start pts = %"PRIu32"\n", pnavpci->pci_gi.vobu_s_ptm);
@@ -636,30 +783,61 @@ static int process_event(stream_t *s, int event, void *buf, int len)
     }
     case DVDNAV_STILL_FRAME: {
         dvdnav_still_event_t *still = buf;
-        // We only honor indefinite (0xff) stills. Finite stills (studio
-        // logos / warnings shown for a few seconds before the menu) are
-        // not hold on screen. This avoids complexities with correctly
-        // timing the still frames, and there is little use-case for holding
-        // 10+ seconds on single still frame.
-        if (still->length != 0xFF) {
-            MP_VERBOSE(s, "skipping finite still (%d s)\n",
-                       still->length);
-            dvdnav_still_skip(dvdnav);
+        priv->activation_pending_jump = false;
+        // A zero-length still has no presentation interval to hold.
+        if (still->length == 0) {
+            MP_VERBOSE(s, "zero-length still, skipping\n");
+            if (dvdnav_still_skip(dvdnav) != DVDNAV_STATUS_OK) {
+                MP_ERR(s, "failed to skip zero-length still\n");
+                mark_failed(s);
+                return 0;
+            }
             break;
         }
-        // Indefinite still: report EOF to the demuxer so the video decoder
-        // is drained and the last frame is actually pushed to screen.
-        if (!priv->still_active)
-            MP_VERBOSE(s, "indefinite still -> EOF, hold last frame\n");
-        priv->still_active = true;
+        // An indefinite still outside a menu has no authored button action to
+        // resume the VM. End the title after draining its last frame.
+        if (still->length == 0xFF && !in_menu_domain(dvdnav)) {
+            MP_VERBOSE(s, "title still -> EOF\n");
+            clear_still(priv);
+            return 0;
+        }
+        // Report EOF so the decoder drains and the last frame is presented.
+        // The player starts finite timing only after playback reaches EOF;
+        // indefinite menu stills remain held until user interaction moves the VM.
+        if (!priv->still_active) {
+            priv->still_active = true;
+            priv->still_duration = still->length == 0xFF ? 0 : still->length;
+            priv->still_id++;
+            if (priv->still_duration) {
+                MP_VERBOSE(s, "finite still -> EOF, hold last frame for %d s\n",
+                           priv->still_duration);
+            } else {
+                MP_VERBOSE(s, "indefinite still -> EOF, hold last frame\n");
+            }
+        }
         return 0;
     }
     case DVDNAV_WAIT:
-        dvdnav_wait_skip(dvdnav);
-        break;
+        // libdvdnav can be ahead of the decoder here. Keep its VM at this
+        // boundary until the player has presented the queued packets.
+        if (!priv->drain_enabled || (priv->at_boundary && !priv->pending_drain)) {
+            if (dvdnav_wait_skip(dvdnav) != DVDNAV_STATUS_OK) {
+                MP_ERR(s, "failed to resume DVD wait\n");
+                mark_failed(s);
+                return 0;
+            }
+            break;
+        }
+        MP_VERBOSE(s, "DVDNAV_WAIT: draining queued packets\n");
+        priv->wait_pending = true;
+        bump_discontinuity(priv, false);
+        return 0;
     case DVDNAV_HOP_CHANNEL:
         MP_VERBOSE(s, "hop channel (domain=%s)\n", dvd_domain_name(dvdnav));
-        bump_discontinuity(priv);
+        bump_discontinuity(priv, false);
+        if (priv->pending_drain && priv->activation_pending_jump)
+            priv->drain_user_activation = true;
+        priv->activation_pending_jump = false;
         break;
     case DVDNAV_HIGHLIGHT:
         update_highlight(priv);
@@ -671,6 +849,10 @@ static int process_event(stream_t *s, int event, void *buf, int len)
         MP_VERBOSE(s, "switched to VTS: %d (old=%d) domain=%s\n",
                    vts_event->new_vtsN, vts_event->old_vtsN,
                    dvd_domain_name(dvdnav));
+        priv->menu_support_known = false;
+        // Opening in menu mode can precede VM startup. Refresh even the
+        // initial VTS, replacing any provisional resolution from open.
+        refresh_video_resolution(priv);
         if (!priv->had_initial_vts) {
             // dvdnav sends an initial VTS change before any data; don't
             // cause a blocking wait for the player, because the player in
@@ -681,26 +863,31 @@ static int process_event(stream_t *s, int event, void *buf, int len)
         if (dvdnav_current_title_info(dvdnav, &tit, &part) == DVDNAV_STATUS_OK)
         {
             MP_VERBOSE(s, "new title %d\n", tit);
-            if (priv->title > 0 && tit != priv->title)
-                MP_WARN(s, "Requested title not found\n");
         }
-        // Resolution can change across VTS (PAL vs. NTSC titles); refresh
-        // so mouse coordinate translation stays correct.
-        refresh_video_resolution(priv);
         // VTS change is a title-set boundary, flush.
-        bump_discontinuity(priv);
+        bump_discontinuity(priv, false);
+        if (priv->pending_drain && priv->activation_pending_jump)
+            priv->drain_user_activation = true;
+        priv->activation_pending_jump = false;
         break;
     }
     case DVDNAV_CELL_CHANGE: {
         dvdnav_cell_change_event_t *ev =  (dvdnav_cell_change_event_t *)buf;
 
+        // A new PGC can remap logical slots without a HOP or timestamp reset.
+        // Stop before its first payload so old queued PES keeps the old catalog.
+        struct stream_dvd_streams streams = read_dvd_streams(priv);
+        if (priv->dvd_streams.generation && !priv->at_boundary &&
+            !same_dvd_streams(&streams, &priv->dvd_streams))
+            bump_discontinuity(priv, false);
+
         if (ev->pgc_length)
             priv->duration = ev->pgc_length;
-
+        int64_t current_time = dvdnav_get_current_time(dvdnav);
         MP_VERBOSE(s, "cell change: cell=%d pg=%d pgc_len=%.3f "
                    "cur_time=%.3f domain=%s\n",
                    ev->cellN, ev->pgN, DVD_TIME_TO_S(ev->pgc_length),
-                   DVD_TIME_TO_S(dvdnav_get_current_time(dvdnav)),
+                   DVD_TIME_TO_S(current_time),
                    dvd_domain_name(dvdnav));
         break;
     }
@@ -712,11 +899,13 @@ static int process_event(stream_t *s, int event, void *buf, int len)
     }
     case DVDNAV_AUDIO_STREAM_CHANGE: {
         dvdnav_audio_stream_change_event_t *ev = buf;
-        // physical: 0..7 = active audio stream, -1 = SPU/audio off.
+        // The event's logical value is AST_REG, not necessarily the active slot.
+        int logical = dvd_audio_logical(priv, ev->logical, ev->physical);
         MP_VERBOSE(s, "audio change phys=%d log=%d domain=%s\n",
                    ev->physical, ev->logical, dvd_domain_name(dvdnav));
-        if (priv->audio_physical != ev->physical) {
+        if (priv->audio_physical != ev->physical || priv->audio_logical != logical) {
             priv->audio_physical = ev->physical;
+            priv->audio_logical = logical;
             priv->nav_change_id++;
         }
         break;
@@ -740,6 +929,192 @@ static int process_event(stream_t *s, int event, void *buf, int len)
     return -1;
 }
 
+// Publish one coherent view after a VM read/event or control, with vm_lock
+// held (or during open). libdvdnav getters may take its internal VM lock or do
+// I/O, so none may run while holding the lock used by player-thread queries.
+static void dvd_stream_language(struct stream_dvd_stream *stream, uint16_t lang)
+{
+    if (lang && lang != 0xffff) {
+        stream->lang[0] = (char)(lang >> 8);
+        stream->lang[1] = (char)lang;
+    }
+}
+
+static void read_dvd_selection(struct priv *priv, struct stream_dvd_streams *streams)
+{
+    dvdnav_t *dvd = priv->dvdnav;
+    streams->active_audio = dvdnav_get_active_logical_stream(dvd, DVD_AUDIO_STREAM);
+    streams->active_sub = dvdnav_get_active_logical_stream(dvd, DVD_SUBTITLE_STREAM);
+    int sub = dvdnav_get_active_spu_stream(dvd);
+    streams->sub_visible = sub != -1 && !(sub & 0x80);
+}
+
+static struct stream_dvd_streams read_dvd_streams(struct priv *priv)
+{
+    dvdnav_t *dvd = priv->dvdnav;
+    struct stream_dvd_streams streams = {
+        .discontinuity_id = priv->discontinuity_id,
+        .domain = dvdnav_is_domain_vts(dvd) ? 4 :
+                  dvdnav_is_domain_vtsm(dvd) ? 3 :
+                  dvdnav_is_domain_vmgm(dvd) ? 2 : 1,
+    };
+    int audio_count = dvdnav_get_number_of_stream_attributes(dvd, DVD_AUDIO_STREAM);
+    int sub_count = dvdnav_get_number_of_stream_attributes(dvd, DVD_SUBTITLE_STREAM);
+    for (int i = 0; i < 8; i++) {
+        streams.audio[i].id = -1;
+        if (audio_count > i) {
+            int physical = dvdnav_get_audio_logical_stream(dvd, i);
+            streams.audio[i].id = dvd_audio_to_substream(priv, i, physical);
+            dvd_stream_language(&streams.audio[i], dvdnav_audio_stream_to_lang(dvd, i));
+        }
+    }
+    for (int i = 0; i < 32; i++) {
+        streams.sub[i].id = -1;
+        if (sub_count > i) {
+            int physical = dvdnav_get_spu_logical_stream(dvd, i);
+            if (physical >= 0 && physical < 32)
+                streams.sub[i].id = 0x20 + physical;
+            dvd_stream_language(&streams.sub[i], dvdnav_spu_stream_to_lang(dvd, i));
+        }
+    }
+    read_dvd_selection(priv, &streams);
+    return streams;
+}
+
+static bool same_dvd_streams(const struct stream_dvd_streams *a,
+                             const struct stream_dvd_streams *b)
+{
+    if (a->discontinuity_id != b->discontinuity_id || a->domain != b->domain)
+        return false;
+    for (int i = 0; i < 8; i++) {
+        if (a->audio[i].id != b->audio[i].id || strcmp(a->audio[i].lang, b->audio[i].lang))
+            return false;
+    }
+    for (int i = 0; i < 32; i++) {
+        if (a->sub[i].id != b->sub[i].id || strcmp(a->sub[i].lang, b->sub[i].lang))
+            return false;
+    }
+    return true;
+}
+
+// Called under vm_lock, before touching AST/SPST. A future VM must never
+// receive a selection made against tracks from the held presentation epoch.
+static int select_dvd_stream(struct priv *priv, struct stream_dvd_select *select)
+{
+    struct stream_dvd_streams streams = read_dvd_streams(priv);
+    if (priv->failed || priv->terminal_stop ||
+        (priv->pending_drain && !priv->wait_pending) ||
+        !select->generation || select->generation != priv->dvd_streams.generation ||
+        !same_dvd_streams(&streams, &priv->dvd_streams))
+        return STREAM_ERROR;
+    if (select->type == STREAM_SUB && select->logical == -1)
+        return dvdnav_toggle_spu_stream(priv->dvdnav, 0) == DVDNAV_STATUS_OK
+                   ? STREAM_OK : STREAM_ERROR;
+    int limit = select->type == STREAM_AUDIO ? 8 : select->type == STREAM_SUB ? 32 : 0;
+    if (select->logical < 0 || select->logical >= limit)
+        return STREAM_ERROR;
+    struct stream_dvd_stream *entry = select->type == STREAM_AUDIO
+        ? &streams.audio[select->logical] : &streams.sub[select->logical];
+    if (entry->id < 0)
+        return STREAM_ERROR;
+    int type = select->type == STREAM_AUDIO ? DVD_AUDIO_STREAM : DVD_SUBTITLE_STREAM;
+    if (dvdnav_set_active_stream(priv->dvdnav, select->logical, type) != DVDNAV_STATUS_OK)
+        return STREAM_ERROR;
+    // The VM owner cannot stop between these calls. The validated setter
+    // requires the same started VM as toggle_spu_stream.
+    if (select->type == STREAM_SUB)
+        dvdnav_toggle_spu_stream(priv->dvdnav, 1);
+    return STREAM_OK;
+}
+
+// Runs under vm_lock only. Never acquire a native VM lock while holding the
+// publication lock: GET_NAV_STATE must remain responsive during DVD reads.
+static struct stream_dvd_streams update_dvd_streams(struct priv *priv,
+                                                    struct stream_nav_state *state)
+{
+    struct stream_dvd_streams streams = priv->dvd_streams;
+    // WAIT precedes title commands: only the drain id changed. The catalog
+    // and selection still belong to the VM whose packets are being presented.
+    if (priv->wait_pending && streams.generation) {
+        streams.discontinuity_id = priv->discontinuity_id;
+        if (priv->dvd_selection_dirty)
+            read_dvd_selection(priv, &streams);
+        priv->dvd_selection_dirty = false;
+    // A boundary after a VM jump still belongs to the old presentation epoch.
+    } else if ((!priv->pending_drain && !priv->terminal_stop) || !streams.generation) {
+        if (priv->dvd_catalog_dirty || !streams.generation) {
+            streams = read_dvd_streams(priv);
+            streams.generation = priv->dvd_streams.generation;
+            if (!streams.generation || !same_dvd_streams(&streams, &priv->dvd_streams))
+                streams.generation++;
+            priv->dvd_catalog_dirty = false;
+        } else if (priv->dvd_selection_dirty) {
+            read_dvd_selection(priv, &streams);
+        }
+        priv->dvd_selection_dirty = false;
+    }
+    state->no_audio = true;
+    for (int i = 0; i < 8; i++)
+        state->no_audio &= streams.audio[i].id < 0;
+    state->dvd_generation = streams.generation;
+    state->active_audio_logical = streams.active_audio;
+    state->active_sub_logical = streams.active_sub;
+    state->sub_visible = streams.sub_visible;
+    return streams;
+}
+
+static void publish_state(struct priv *priv)
+{
+    dvdnav_t *dvdnav = priv->dvdnav;
+    int32_t title = -1, part = 0;
+    if (dvdnav_current_title_info(dvdnav, &title, &part) != DVDNAV_STATUS_OK)
+        title = -1;
+    int64_t time = dvdnav_get_current_time(dvdnav);
+    int32_t cur_angle = 0, num_angles = 0;
+    dvdnav_get_angle_info(dvdnav, &cur_angle, &num_angles);
+    // Menu routes may default to physical 0 even when their IFO has no audio.
+    bool no_audio = dvdnav_get_number_of_streams(dvdnav, DVD_AUDIO_STREAM) == 0;
+    if (!priv->menu_support_known) {
+        priv->menu_supported =
+            dvdnav_menu_available(dvdnav, DVD_MENU_Root) == DVDNAV_STATUS_OK ||
+            dvdnav_menu_available(dvdnav, DVD_MENU_Title) == DVDNAV_STATUS_OK;
+        priv->menu_support_known = true;
+    }
+    if (priv->src_w <= 0 || priv->src_h <= 0)
+        refresh_video_resolution(priv);
+    struct stream_nav_state state = {
+        .nav_active = true,
+        .failed = priv->failed,
+        .menu_supported = priv->menu_supported,
+        .no_audio = no_audio,
+        .menu_active = in_menu_domain(dvdnav),
+        .still_active = priv->still_active,
+        .still_duration = priv->still_duration,
+        .still_id = priv->still_id,
+        .src_w = priv->src_w,
+        .src_h = priv->src_h,
+        .hl = priv->hl,
+        .change_id = priv->nav_change_id,
+        .discontinuity_id = priv->discontinuity_id,
+        .drain_pending = priv->pending_drain,
+        .drain_immediate = priv->drain_immediate,
+        .drain_user_activation = priv->drain_user_activation,
+        .active_audio_id = no_audio ? -1 :
+            dvd_audio_to_substream(priv, priv->audio_logical, priv->audio_physical),
+        .active_sub_id = priv->sub_physical >= 0 ? 0x20 + priv->sub_physical : -1,
+        .sub_visible = priv->sub_visible,
+        .angle = cur_angle,
+        .num_angles = num_angles,
+    };
+    struct stream_dvd_streams streams = update_dvd_streams(priv, &state);
+    mp_mutex_lock(&priv->lock);
+    priv->dvd_streams = streams;
+    priv->nav_state = state;
+    priv->current_title = title;
+    priv->current_time = time;
+    mp_mutex_unlock(&priv->lock);
+}
+
 static int fill_buffer(stream_t *s, void *buf, int max_len)
 {
     struct priv *priv = s->priv;
@@ -752,20 +1127,31 @@ static int fill_buffer(stream_t *s, void *buf, int max_len)
     }
 
     while (1) {
-        mp_mutex_lock(&priv->lock);
+        // Keep the fetched event and its state update in one VM operation.
+        mp_mutex_lock(&priv->vm_lock);
         bool drain = priv->pending_drain;
-        mp_mutex_unlock(&priv->lock);
+        if (priv->terminal_stop || priv->failed) {
+            mp_mutex_unlock(&priv->vm_lock);
+            return 0;
+        }
         if (drain) {
             MP_DBG(s, "holding drain EOF (jump boundary)\n");
+            mp_mutex_unlock(&priv->vm_lock);
             return 0;
         }
 
         int len = -1;
         int event = DVDNAV_NOP;
-        if (dvdnav_get_next_block(dvdnav, buf, &event, &len) != DVDNAV_STATUS_OK)
+        dvdnav_status_t status = priv->drain_enabled
+            ? dvdnav_get_next_block_with_wait(dvdnav, buf, &event, &len)
+            : dvdnav_get_next_block(dvdnav, buf, &event, &len);
+        if (status != DVDNAV_STATUS_OK)
         {
             MP_ERR(s, "Error getting next block from DVD %d (%s)\n",
                    event, dvdnav_err_to_string(dvdnav));
+            mark_failed(s);
+            publish_state(priv);
+            mp_mutex_unlock(&priv->vm_lock);
             return 0;
         }
         if (event != DVDNAV_BLOCK_OK) {
@@ -773,18 +1159,18 @@ static int fill_buffer(stream_t *s, void *buf, int max_len)
             MP_TRACE(s, "event %s (%d)\n", name, event);
         }
 
-        mp_mutex_lock(&priv->lock);
         int r = process_event(s, event, buf, len);
-        mp_mutex_unlock(&priv->lock);
+        publish_state(priv);
+        mp_mutex_unlock(&priv->vm_lock);
         if (r >= 0)
             return r;
     }
     return 0;
 }
 
-static int64_t seek_landing_ticks(struct priv *priv, double d, double margin)
+static int64_t seek_time_ticks(struct priv *priv, double d)
 {
-    int64_t tm = DVD_TIME_FROM_S(d - margin);
+    int64_t tm = DVD_TIME_FROM_S(d);
     if (tm < 0)
         tm = 0;
     if (priv->duration > 0 && tm >= priv->duration)
@@ -792,13 +1178,17 @@ static int64_t seek_landing_ticks(struct priv *priv, double d, double margin)
     return tm;
 }
 
-static int control(stream_t *stream, int cmd, void *arg)
+// Called with vm_lock held so controls cannot split a read from its event.
+static int control_locked(stream_t *stream, int cmd, void *arg)
 {
     struct priv *priv = stream->priv;
     dvdnav_t *dvdnav = priv->dvdnav;
     int tit, part;
 
     switch (cmd) {
+    case STREAM_CTRL_SET_DVD_STREAM:
+        return select_dvd_stream(priv, arg);
+
     case STREAM_CTRL_GET_NUM_CHAPTERS: {
         if (dvdnav_current_title_info(dvdnav, &tit, &part) != DVDNAV_STATUS_OK)
             break;
@@ -838,21 +1228,6 @@ static int control(stream_t *stream, int cmd, void *arg)
         *(double *)arg = !ar ? 4.0 / 3.0 : 16.0 / 9.0;
         return STREAM_OK;
     }
-    case STREAM_CTRL_GET_CURRENT_TIME: {
-        int64_t tm = dvdnav_get_current_time(dvdnav);
-        if (tm != -1) {
-            *(double *)arg = DVD_TIME_TO_S(tm);
-            return STREAM_OK;
-        }
-        break;
-    }
-    case STREAM_CTRL_GET_NUM_TITLES: {
-        int32_t num_titles = 0;
-        if (dvdnav_get_number_of_titles(dvdnav, &num_titles) != DVDNAV_STATUS_OK)
-            break;
-        *((unsigned int*)arg)= num_titles;
-        return STREAM_OK;
-    }
     case STREAM_CTRL_GET_TITLE_LENGTH: {
         int t = *(double *)arg;
         int32_t num_titles = 0;
@@ -869,12 +1244,6 @@ static int control(stream_t *stream, int cmd, void *arg)
         *(double *)arg = DVD_TIME_TO_S(duration);
         return STREAM_OK;
     }
-    case STREAM_CTRL_GET_CURRENT_TITLE: {
-        if (dvdnav_current_title_info(dvdnav, &tit, &part) != DVDNAV_STATUS_OK)
-            break;
-        *((unsigned int *) arg) = tit - 1;
-        return STREAM_OK;
-    }
     case STREAM_CTRL_SET_CURRENT_TITLE: {
         int title = *((unsigned int *) arg);
         int32_t num_titles = 0;
@@ -884,6 +1253,8 @@ static int control(stream_t *stream, int cmd, void *arg)
         dvdnav_status_t status;
         if (title == num_titles) {
             status = dvdnav_menu_call(priv->dvdnav, DVD_MENU_Root);
+            if (status != DVDNAV_STATUS_OK)
+                status = dvdnav_menu_call(priv->dvdnav, DVD_MENU_Title);
         } else {
             status = dvdnav_title_play(priv->dvdnav, title + 1);
         }
@@ -891,9 +1262,11 @@ static int control(stream_t *stream, int cmd, void *arg)
             break;
         // This may run on the player thread; buffered data is dropped on the
         // demuxer thread when the discontinuity is processed.
-        mp_mutex_lock(&priv->lock);
-        bump_discontinuity(priv);
-        mp_mutex_unlock(&priv->lock);
+        priv->terminal_stop = false;
+        priv->menu_support_known = false;
+        priv->pci_valid = false;
+        update_highlight(priv);
+        bump_discontinuity(priv, true);
         return STREAM_OK;
     }
     case STREAM_CTRL_SEEK_TO_TIME: {
@@ -917,32 +1290,31 @@ static int control(stream_t *stream, int cmd, void *arg)
             uint32_t pos, len;
             if (dvdnav_get_position(dvdnav, &pos, &len) != DVDNAV_STATUS_OK)
                 break;
-            // hr-seeks decode from the landing up to the exact target, so
-            // the landing must not overshoot it. Time-map landings are
-            // accurate to one map entry, the time_search fallback
-            // interpolates from cell durations and can be off by several
-            // seconds on VBR content.
-            int64_t tm = seek_landing_ticks(priv, d, flags & SEEK_HR ? 2 : 0);
+            int64_t tm = seek_time_ticks(priv, d);
             MP_VERBOSE(stream, "seek to PTS %f (%"PRId64")\n", d, tm);
-            // The disc's time maps give accurate landings. Fall back to
-            // dvdnav's cell-duration interpolation for titles that lack
-            // them.
-            bool jumped = false;
+            if (flags & SEEK_HR) {
+                // Decode forward from the verified selected-angle NAV. A
+                // refused floor seek must not fall back to interpolation.
+                if (dvdnav_time_search_floor(dvdnav, tm) != DVDNAV_STATUS_OK)
+                    break;
+            } else {
+                bool jumped = false;
 #if DVDNAV_VERSION >= DVDNAV_VERSION_CODE(7, 0, 0)
-            jumped = dvdnav_jump_to_sector_by_time(dvdnav, tm, 0) == DVDNAV_STATUS_OK;
+                jumped = dvdnav_jump_to_sector_by_time(dvdnav, tm, 0) == DVDNAV_STATUS_OK;
 #endif
-            if (!jumped) {
-                tm = seek_landing_ticks(priv, d, flags & SEEK_HR ? 10 : 0);
-                if (dvdnav_time_search(dvdnav, tm) != DVDNAV_STATUS_OK)
+                if (!jumped && dvdnav_time_search(dvdnav, tm) != DVDNAV_STATUS_OK)
                     break;
             }
         }
         // The seek reinitializes everything itself. Clear any held boundary
         // and coalesce the HOP_CHANNEL libdvdnav emits for the seek.
-        mp_mutex_lock(&priv->lock);
+        priv->terminal_stop = false;
+        clear_still(priv);
         priv->pending_drain = false;
+        priv->wait_pending = false;
+        priv->drain_immediate = false;
+        priv->drain_user_activation = false;
         priv->at_boundary = true;
-        mp_mutex_unlock(&priv->lock);
         stream_drop_buffers(stream);
         d = DVD_TIME_TO_S(dvdnav_get_current_time(dvdnav));
         MP_VERBOSE(stream, "landed at: %f\n", d);
@@ -997,9 +1369,7 @@ static int control(stream_t *stream, int cmd, void *arg)
         memset(req, 0, sizeof(*req));
         req->num_subs = mp_dvdnav_number_of_subs(stream);
         static_assert(sizeof(uint32_t) == sizeof(unsigned int), "");
-        mp_mutex_lock(&priv->lock);
         memcpy(req->palette, priv->spu_clut, sizeof(req->palette));
-        mp_mutex_unlock(&priv->lock);
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_DISC_NAME: {
@@ -1012,61 +1382,110 @@ static int control(stream_t *stream, int cmd, void *arg)
         return STREAM_OK;
     }
     case STREAM_CTRL_NAV_CMD: {
-        handle_nav_cmd(stream, arg);
-        return STREAM_OK;
+        return handle_nav_cmd(stream, arg) ? STREAM_OK : STREAM_UNSUPPORTED;
     }
     case STREAM_CTRL_NAV_DRAIN_ENABLE: {
-        mp_mutex_lock(&priv->lock);
         priv->drain_enabled = true;
         priv->pending_drain = false;
+        priv->drain_immediate = false;
+        priv->drain_user_activation = false;
         priv->at_boundary = false;
-        mp_mutex_unlock(&priv->lock);
         MP_DBG(stream, "jump boundary drain enabled\n");
         return STREAM_OK;
     }
     case STREAM_CTRL_NAV_DRAIN_ACK: {
-        mp_mutex_lock(&priv->lock);
         MP_DBG(stream, "jump boundary drain acked (was %d)\n",
                priv->pending_drain);
+        if (priv->wait_pending) {
+            MP_VERBOSE(stream, "DVDNAV_WAIT: queued packets drained\n");
+            if (dvdnav_wait_skip(dvdnav) != DVDNAV_STATUS_OK) {
+                MP_ERR(stream, "failed to resume DVD wait\n");
+                mark_failed(stream);
+                return STREAM_ERROR;
+            }
+            priv->wait_pending = false;
+        }
         priv->pending_drain = false;
-        mp_mutex_unlock(&priv->lock);
+        priv->drain_immediate = false;
+        priv->drain_user_activation = false;
         return STREAM_OK;
     }
-    case STREAM_CTRL_GET_NAV_STATE: {
-        struct stream_nav_state *st = arg;
-        uint32_t cur_angle = 0, num_angles = 0;
-        dvdnav_get_angle_info(dvdnav, &cur_angle, &num_angles);
-        // The current PGC provably has no audio when no physical stream maps
-        // to a logical one (e.g. silent menus).
-        bool no_audio = true;
-        for (int n = 0; n < 8 && no_audio; n++)
-            no_audio = dvdnav_get_audio_logical_stream(dvdnav, n) == -1;
-        mp_mutex_lock(&priv->lock);
-        if (priv->src_w <= 0 || priv->src_h <= 0)
-            refresh_video_resolution(priv);
-        *st = (struct stream_nav_state){
-            .nav_active = true,
-            .no_audio = no_audio,
-            .menu_active = priv->in_menu,
-            .still_active = priv->still_active,
-            .src_w = priv->src_w,
-            .src_h = priv->src_h,
-            .hl = priv->hl,
-            .change_id = priv->nav_change_id,
-            .discontinuity_id = priv->discontinuity_id,
-            .drain_pending = priv->pending_drain,
-            .active_audio_id = dvd_physical_audio_to_substream(priv, priv->audio_physical),
-            .active_sub_id = priv->sub_physical >= 0 ? 0x20 + priv->sub_physical : -1,
-            .sub_visible = priv->sub_visible,
-            .angle = cur_angle,
-            .num_angles = num_angles,
-        };
-        mp_mutex_unlock(&priv->lock);
-        return STREAM_OK;
+    case STREAM_CTRL_NAV_STILL_SKIP: {
+        struct stream_nav_still_skip *req = arg;
+        int result = STREAM_ERROR;
+        if (priv->still_active && priv->still_duration > 0 &&
+            priv->still_id == req->id)
+        {
+            if (dvdnav_still_skip(dvdnav) == DVDNAV_STATUS_OK) {
+                MP_VERBOSE(stream, "finite still %u elapsed\n", req->id);
+                // The slave demuxer has latched EOF. Treat the resumed VM as
+                // a jump so the regular drain/resync path clears that EOF.
+                priv->at_boundary = false;
+                bump_discontinuity(priv, true);
+                result = STREAM_OK;
+            } else {
+                MP_ERR(stream, "failed to skip finite still %u\n", req->id);
+                mark_failed(stream);
+            }
+        }
+        return result;
     }
     }
 
     return STREAM_UNSUPPORTED;
+}
+
+// The player polls these controls while the demuxer can be blocked in a DVD
+// read. Return the last published state without waiting for the VM or its I/O.
+static int control(stream_t *stream, int cmd, void *arg)
+{
+    struct priv *priv = stream->priv;
+    int result = STREAM_UNSUPPORTED;
+    mp_mutex_lock(&priv->lock);
+    switch (cmd) {
+    case STREAM_CTRL_GET_DVD_STREAMS:
+        *(struct stream_dvd_streams *)arg = priv->dvd_streams;
+        result = priv->dvd_streams.generation ? STREAM_OK : STREAM_UNSUPPORTED;
+        break;
+    case STREAM_CTRL_GET_NAV_STATE:
+        *(struct stream_nav_state *)arg = priv->nav_state;
+        result = STREAM_OK;
+        break;
+    case STREAM_CTRL_GET_NUM_TITLES:
+        if (priv->num_titles >= 0) {
+            *(unsigned int *)arg = priv->num_titles;
+            result = STREAM_OK;
+        }
+        break;
+    case STREAM_CTRL_GET_CURRENT_TITLE:
+        if (priv->current_title >= 0) {
+            *(unsigned int *)arg = priv->current_title - 1;
+            result = STREAM_OK;
+        }
+        break;
+    case STREAM_CTRL_GET_CURRENT_TIME:
+        if (priv->current_time != -1) {
+            *(double *)arg = DVD_TIME_TO_S(priv->current_time);
+            result = STREAM_OK;
+        }
+        break;
+    default:
+        mp_mutex_unlock(&priv->lock);
+        mp_mutex_lock(&priv->vm_lock);
+        result = control_locked(stream, cmd, arg);
+        if (result == STREAM_OK) {
+            priv->dvd_selection_dirty = true;
+            if (cmd == STREAM_CTRL_NAV_CMD || cmd == STREAM_CTRL_NAV_DRAIN_ACK ||
+                cmd == STREAM_CTRL_NAV_STILL_SKIP || cmd == STREAM_CTRL_SET_CURRENT_TITLE ||
+                cmd == STREAM_CTRL_SEEK_TO_TIME || cmd == STREAM_CTRL_SET_ANGLE)
+                priv->dvd_catalog_dirty = true;
+        }
+        publish_state(priv);
+        mp_mutex_unlock(&priv->vm_lock);
+        return result;
+    }
+    mp_mutex_unlock(&priv->lock);
+    return result;
 }
 
 static void stream_dvdnav_close(stream_t *s)
@@ -1075,8 +1494,12 @@ static void stream_dvdnav_close(stream_t *s)
     if (priv->dvdnav)
         dvdnav_close(priv->dvdnav);
     priv->dvdnav = NULL;
+    if (priv->iso_stream)
+        free_stream(priv->iso_stream);
+    priv->iso_stream = NULL;
     if (priv->dvd_speed)
         dvd_set_speed(s, priv->filename, -1);
+    mp_mutex_destroy(&priv->vm_lock);
     mp_mutex_destroy(&priv->lock);
 }
 
@@ -1137,6 +1560,71 @@ static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
     return priv;
 }
 
+static int dvdnav_stream_seek(void *handle, uint64_t pos)
+{
+    stream_t *source = handle;
+    if (!source || pos > INT64_MAX)
+        return -1;
+    return stream_seek(source, (int64_t)pos) ? 0 : -1;
+}
+
+static int dvdnav_stream_read(void *handle, void *buffer, int size)
+{
+    stream_t *source = handle;
+    if (!source || size < 0)
+        return -1;
+    return stream_read(source, buffer, size);
+}
+
+static dvdnav_stream_cb dvdnav_stream_callbacks = {
+    .pf_seek = dvdnav_stream_seek,
+    .pf_read = dvdnav_stream_read,
+    .pf_readv = NULL,
+};
+
+extern const stream_info_t stream_info_ffmpeg;
+extern const stream_info_t stream_info_cb;
+
+static int open_dvdnav_iso_stream(stream_t *stream, const char *url)
+{
+    struct priv *priv = stream->priv;
+    bool media3_source = strncmp(url, "media3iso://", 12) == 0;
+    struct stream_open_args args = {
+        .global = stream->global,
+        .cancel = stream->cancel,
+        .url = url,
+        .flags = STREAM_READ | (stream->stream_origin & STREAM_ORIGIN_MASK),
+        .sinfo = media3_source ? &stream_info_cb : &stream_info_ffmpeg,
+    };
+    if (stream_create_with_args(&args, &priv->iso_stream) != STREAM_OK ||
+        !priv->iso_stream)
+        return STREAM_ERROR;
+    if (media3_source) {
+        priv->iso_stream->is_network = true;
+        priv->iso_stream->streaming = true;
+    }
+
+    if (!priv->iso_stream->seekable) {
+        MP_ERR(stream, "DVD ISO stream must be seekable.\n");
+        return STREAM_UNSUPPORTED;
+    }
+
+    if (dvdnav_open_stream(&priv->dvdnav, priv->iso_stream,
+                           &dvdnav_stream_callbacks) != DVDNAV_STATUS_OK)
+        return STREAM_UNSUPPORTED;
+
+    if (!priv->dvdnav)
+        return STREAM_UNSUPPORTED;
+
+    stream->is_network = priv->iso_stream->is_network;
+    stream->streaming = priv->iso_stream->streaming;
+    dvdnav_set_readahead_flag(priv->dvdnav, 1);
+    if (dvdnav_set_PGC_positioning_flag(priv->dvdnav, 1) != DVDNAV_STATUS_OK)
+        MP_ERR(stream, "stream_dvdnav, failed to set PGC positioning\n");
+
+    return STREAM_OK;
+}
+
 static int open_s_internal(stream_t *stream)
 {
     struct priv *priv, *p;
@@ -1144,31 +1632,37 @@ static int open_s_internal(stream_t *stream)
     char *filename;
     int ret = 0;
 
+    mp_mutex_init(&priv->vm_lock);
     mp_mutex_init(&priv->lock);
 
     priv->log = stream->log;
     priv->audio_physical = -1;
+    priv->audio_logical = -1;
     priv->sub_physical = -1;
     priv->sub_visible = false;
 
     p->opts = mp_get_config_group(stream, stream->global, &dvd_conf);
 
-    if (p->device && p->device[0])
-        filename = p->device;
-    else if (p->opts->device && p->opts->device[0])
-        filename = p->opts->device;
-    else
-        filename = DEFAULT_OPTICAL_DEVICE;
-    if (!new_dvdnav_stream(stream, filename)) {
-        if (!priv->probing)
-            MP_ERR(stream, "Couldn't open DVD device: %s\n", filename);
-        ret = priv->probing ? STREAM_UNSUPPORTED : STREAM_ERROR;
-        goto err;
+    if (!priv->dvdnav) {
+        if (p->device && p->device[0])
+            filename = p->device;
+        else if (p->opts->device && p->opts->device[0])
+            filename = p->opts->device;
+        else
+            filename = DEFAULT_OPTICAL_DEVICE;
+        if (!new_dvdnav_stream(stream, filename)) {
+            if (!priv->probing)
+                MP_ERR(stream, "Couldn't open DVD device: %s\n", filename);
+            ret = priv->probing ? STREAM_UNSUPPORTED : STREAM_ERROR;
+            goto err;
+        }
     }
     priv->probing = false;
 
     int32_t num_titles = 0;
-    dvdnav_get_number_of_titles(priv->dvdnav, &num_titles);
+    priv->num_titles = -1;
+    if (dvdnav_get_number_of_titles(priv->dvdnav, &num_titles) == DVDNAV_STATUS_OK)
+        priv->num_titles = num_titles;
 
     if (p->track == TITLE_LONGEST) { // longest
         dvdnav_t *dvdnav = priv->dvdnav;
@@ -1201,7 +1695,6 @@ static int open_s_internal(stream_t *stream)
         p->track = TITLE_MENU;
 
     if (p->track >= 0) {
-        priv->title = p->track;
         if (dvdnav_title_play(priv->dvdnav, p->track + 1) != DVDNAV_STATUS_OK) {
             MP_FATAL(stream, "couldn't select title %d, error '%s'\n",
                    p->track, dvdnav_err_to_string(priv->dvdnav));
@@ -1209,11 +1702,13 @@ static int open_s_internal(stream_t *stream)
             goto err;
         }
     } else {
-        priv->title = 0;
-        dvdnav_menu_call(priv->dvdnav, DVD_MENU_Root);
+        if (dvdnav_menu_call(priv->dvdnav, DVD_MENU_Root) != DVDNAV_STATUS_OK)
+            dvdnav_menu_call(priv->dvdnav, DVD_MENU_Title);
     }
     if (p->opts->angle > 1)
         dvdnav_angle_change(priv->dvdnav, p->opts->angle);
+
+    publish_state(priv);
 
     stream->fill_buffer = fill_buffer;
     stream->control = control;
@@ -1269,6 +1764,42 @@ const stream_info_t stream_info_dvdnav = {
     .protocols = (const char*const[]){ "dvd", "dvdnav", NULL },
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
+
+int stream_open_dvd_iso(stream_t *stream, const char *url, bool local_path)
+{
+    struct priv *priv = talloc_zero(stream, struct priv);
+    stream->priv = priv;
+    priv->probing = true;
+
+    struct MPOpts *opts = mp_get_config_group(stream, stream->global, &mp_opt_root);
+    priv->track = opts->edition_id >= 0 ? opts->edition_id :
+                  (opts->disc_menu ? TITLE_MENU : TITLE_LONGEST);
+    talloc_free(opts);
+
+    if (local_path) {
+        priv->device = talloc_strdup(priv, url);
+    } else {
+        int r = open_dvdnav_iso_stream(stream, url);
+        if (r != STREAM_OK) {
+            if (priv->dvdnav)
+                dvdnav_close(priv->dvdnav);
+            if (priv->iso_stream)
+                free_stream(priv->iso_stream);
+            talloc_free(priv);
+            stream->priv = NULL;
+            return r;
+        }
+    }
+
+    int r = open_s_internal(stream);
+    if (r != STREAM_OK) {
+        talloc_free(priv);
+        stream->priv = NULL;
+    } else {
+        stream->info = &stream_info_dvdnav;
+    }
+    return r;
+}
 
 static bool check_ifo(const char *path)
 {

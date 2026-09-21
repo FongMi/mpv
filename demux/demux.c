@@ -955,6 +955,9 @@ void demux_set_stream_absent(demuxer_t *demuxer, struct sh_stream *sh,
                    absent ? "absent" : "present");
         sh->absent = absent;
         update_stream_eager_state(in);
+        in->events |= DEMUX_EVENT_STREAMS;
+        if (in->wakeup_cb)
+            in->wakeup_cb(in->wakeup_cb_ctx);
     }
     mp_mutex_unlock(&in->lock);
 }
@@ -1104,6 +1107,22 @@ void demux_add_sh_stream(struct demuxer *demuxer, struct sh_stream *sh)
     mp_assert(demuxer == in->d_thread);
     mp_mutex_lock(&in->lock);
     demux_add_sh_stream_locked(in, sh);
+    mp_mutex_unlock(&in->lock);
+}
+
+// Report an unrecoverable failure from the demuxer thread. The player maps
+// this to a playback error, rather than treating the following EOF as an end.
+void demux_set_failed(struct demuxer *demuxer)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_assert(demuxer == in->d_thread);
+    mp_mutex_lock(&in->lock);
+    if (!demuxer->failed) {
+        demuxer->failed = true;
+        in->events |= DEMUX_EVENT_FAILED;
+        if (in->wakeup_cb)
+            in->wakeup_cb(in->wakeup_cb_ctx);
+    }
     mp_mutex_unlock(&in->lock);
 }
 
@@ -1305,9 +1324,11 @@ void demux_drive_nav(struct demuxer *demuxer)
     mp_assert(demuxer == in->d_user);
 
     mp_mutex_lock(&in->lock);
-    in->nav_pump = true;
-    in->reading = true;
-    mp_cond_signal(&in->wakeup);
+    if (!in->d_thread->failed) {
+        in->nav_pump = true;
+        in->reading = true;
+        mp_cond_signal(&in->wakeup);
+    }
     mp_mutex_unlock(&in->lock);
 }
 
@@ -2448,7 +2469,8 @@ static bool read_packet(struct demux_internal *in)
     struct demux_packet *pkt = NULL;
 
     bool eof = true;
-    if (demux->desc->read_packet && !demux_read_interrupted(demux))
+    if (demux->desc->read_packet && !demux->failed &&
+        !demux_read_interrupted(demux))
         eof = !demux->desc->read_packet(demux, &pkt);
 
     mp_mutex_lock(&in->lock);
@@ -3438,6 +3460,8 @@ void demux_update(demuxer_t *demuxer, double pts)
         demux_update_replaygain(demuxer);
     if (demuxer->events & DEMUX_EVENT_DURATION)
         demuxer->duration = in->duration;
+    if (demuxer->events & DEMUX_EVENT_FAILED)
+        demuxer->failed = in->d_thread->failed;
 
     mp_mutex_unlock(&in->lock);
 }
@@ -4092,6 +4116,8 @@ int demux_seek(demuxer_t *demuxer, double seek_pts, int flags)
 static bool queue_seek(struct demux_internal *in, double seek_pts, int flags,
                        bool clear_back_state)
 {
+    if (in->d_thread->failed)
+        return false;
     if (seek_pts == MP_NOPTS_VALUE)
         return false;
 

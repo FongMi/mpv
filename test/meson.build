@@ -229,3 +229,17 @@ if refdir != ''
         test('scale-zimg', scale_zimg, args: [refdir, outdir], suite: 'ffmpeg')
     endif
 endif
+
+if features['dvdnav']
+    dvdnav_test = executable('dvdnav', 'dvdnav.c',
+        gnu_symbol_visibility: 'hidden',
+        include_directories: incdir,
+        dependencies: [libavutil, libplacebo,
+                      dvdnav.partial_dependency(compile_args: true, includes: true)],
+        link_with: [img_utils, test_utils],
+        c_args: cc.get_supported_arguments('-ffunction-sections', '-fdata-sections'),
+        link_args: cc.get_supported_link_arguments('-Wl,--gc-sections',
+                                                   '-Wl,--no-export-dynamic',
+                                                   '-Wl,-dead_strip'))
+    test('dvdnav', dvdnav_test)
+endif

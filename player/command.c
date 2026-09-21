@@ -1138,6 +1138,19 @@ static int mp_property_current_edition(void *ctx, struct m_property *prop,
     return m_property_int_ro(action, arg, demuxer->edition);
 }
 
+static int mp_property_disc_navigation_active(void *ctx, struct m_property *prop,
+                                              int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct stream *s = disc_nav_get_stream(mpctx);
+    if (!s)
+        return M_PROPERTY_UNAVAILABLE;
+    struct stream_nav_state st = {0};
+    if (stream_control(s, STREAM_CTRL_GET_NAV_STATE, &st) < 1)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_bool_ro(action, arg, st.nav_active);
+}
+
 static int mp_property_disc_menu_active(void *ctx, struct m_property *prop,
                                         int action, void *arg)
 {
@@ -1149,6 +1162,19 @@ static int mp_property_disc_menu_active(void *ctx, struct m_property *prop,
     if (stream_control(s, STREAM_CTRL_GET_NAV_STATE, &st) < 1)
         return M_PROPERTY_UNAVAILABLE;
     return m_property_bool_ro(action, arg, st.menu_active);
+}
+
+static int mp_property_disc_menu_supported(void *ctx, struct m_property *prop,
+                                           int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct stream *s = disc_nav_get_stream(mpctx);
+    if (!s)
+        return M_PROPERTY_UNAVAILABLE;
+    struct stream_nav_state st = {0};
+    if (stream_control(s, STREAM_CTRL_GET_NAV_STATE, &st) < 1)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_bool_ro(action, arg, st.menu_supported);
 }
 
 static int mp_property_edition(void *ctx, struct m_property *prop,
@@ -2069,13 +2095,28 @@ static int mp_property_switch_track(void *ctx, struct m_property *prop,
         }
         return M_PROPERTY_OK;
 
+    case M_PROPERTY_SET:
+        if (mpctx->playback_initialized && *(int *)arg != -1) {
+            int tid = *(int *)arg;
+            struct track *selected = mp_track_by_tid(mpctx, type, tid);
+            if (tid < -2 || (tid >= 0 && !selected))
+                return M_PROPERTY_ERROR;
+            return mp_switch_track_n(mpctx, order, type, selected, FLAG_MARK_SELECTION)
+                ? M_PROPERTY_OK : M_PROPERTY_ERROR;
+        }
+        break;
+
     case M_PROPERTY_SWITCH: {
         if (mpctx->playback_initialized) {
             struct m_property_switch_arg *sarg = arg;
+            int attempts = mpctx->num_tracks + 1;
             do {
                 track = track_next(mpctx, type, sarg->inc >= 0 ? +1 : -1, track);
-                mp_switch_track_n(mpctx, order, type, track, FLAG_MARK_SELECTION);
-            } while (mpctx->current_track[order][type] != track);
+                if (mp_switch_track_n(mpctx, order, type, track, FLAG_MARK_SELECTION))
+                    break;
+                if (!--attempts)
+                    return M_PROPERTY_ERROR;
+            } while (true);
             print_track_list(mpctx, "Track switched:");
         } else {
             // Simply cycle between "no" and "auto". It's possible that this does
@@ -4684,7 +4725,9 @@ static const struct m_property mp_properties_base[] = {
     {"chapter", mp_property_chapter},
     {"edition", mp_property_edition},
     {"current-edition", mp_property_current_edition},
+    {"disc-navigation-active", mp_property_disc_navigation_active},
     {"disc-menu-active", mp_property_disc_menu_active},
+    {"disc-menu-supported", mp_property_disc_menu_supported},
     {"chapters", mp_property_chapters},
     {"editions", mp_property_editions},
     {"metadata", mp_property_metadata},
@@ -7510,7 +7553,10 @@ static void cmd_discnav(void *p)
 
     if (stream_control(s, STREAM_CTRL_NAV_CMD, &nc) < 1) {
         cmd->success = false;
-    } else if (mpctx->demuxer && stream_nav_action_activates(action)) {
+    } else if (mpctx->demuxer &&
+               (stream_nav_action_activates(action) ||
+                (mpctx->opts->pause && pre.menu_active))) {
+        // A paused direction or hover can auto-activate a DVD button.
         demux_drive_nav(mpctx->demuxer);
     }
 
@@ -8301,6 +8347,7 @@ static void update_track_switch(struct MPContext *mpctx, int order, int type)
         return;
 
     int tid = mpctx->opts->stream_id[order][type];
+    int previous = mpctx->accepted_track_selection[order][type];
     struct track *track;
     if (tid == -1) {
         // If "auto" reset to default track selection
@@ -8309,7 +8356,10 @@ static void update_track_switch(struct MPContext *mpctx, int order, int type)
     } else {
         track = mp_track_by_tid(mpctx, type, tid);
     }
-    mp_switch_track_n(mpctx, order, type, track, (tid == -1) ? 0 : FLAG_MARK_SELECTION);
+    if (!mp_switch_track_n(mpctx, order, type, track, (tid == -1) ? 0 : FLAG_MARK_SELECTION))
+        mark_track_selection(mpctx, order, type, previous);
+    else
+        mpctx->accepted_track_selection[order][type] = tid;
     print_track_list(mpctx, "Track switched:");
     mp_wakeup_core(mpctx);
 }

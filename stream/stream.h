@@ -79,6 +79,8 @@ enum stream_ctrl {
     // Optical discs (internal interface between streams and demux_disc)
     STREAM_CTRL_GET_TIME_LENGTH,
     STREAM_CTRL_GET_DVD_INFO,
+    STREAM_CTRL_GET_DVD_STREAMS,
+    STREAM_CTRL_SET_DVD_STREAM,
     STREAM_CTRL_GET_DISC_NAME,
     STREAM_CTRL_GET_NUM_CHAPTERS,
     STREAM_CTRL_GET_CURRENT_TIME,
@@ -101,6 +103,7 @@ enum stream_ctrl {
     STREAM_CTRL_SET_STILL_PAGE,      // int*, force the shown still page
     STREAM_CTRL_NAV_DRAIN_ENABLE,    // start holding EOF at jump boundaries
     STREAM_CTRL_NAV_DRAIN_ACK,       // flush done, release the held EOF
+    STREAM_CTRL_NAV_STILL_SKIP,      // struct stream_nav_still_skip*
 };
 
 // Fetch the still image that a disc (DVD-Audio ASVS) associates with the given
@@ -143,6 +146,12 @@ struct stream_nav_cmd {
     int x, y; // for MOUSE_*
 };
 
+// Release the finite DVD/BD still identified by `id`. The id makes a delayed
+// timeout harmless if user interaction has already moved the VM elsewhere.
+struct stream_nav_still_skip {
+    uint32_t id;
+};
+
 // Whether the action can activate a button / run a disc VM command.
 static inline bool stream_nav_action_activates(enum stream_nav_action a)
 {
@@ -168,16 +177,27 @@ struct mp_dvdnav_highlight {
 // Snapshot of the stream's menu state.
 struct stream_nav_state {
     bool nav_active;         // interactive disc navigation is enabled
+    bool menu_supported;     // interactive navigation can be entered on demand
     bool menu_active;        // a selectable menu/highlight is currently visible
-    bool still_active;       // holding an indefinite still frame
+    bool overlay_visible;    // Blu-ray graphics need display, including PG-only
+    bool still_active;       // holding the last frame at a DVD/BD still
+    int still_duration;      // finite DVD/BD still length in seconds; 0 otherwise
+    uint32_t still_id;       // identifies the current DVD/BD still
     int  src_w, src_h;       // dimensions of the coordinate space mouse uses
     struct mp_dvdnav_highlight hl; // focused button highlight (DVD only)
     uint32_t change_id; // Bumped whenever any of the above changes
     uint32_t discontinuity_id; // Bumped when the stream's source position jumps
+    bool transition_pending; // VM events are advancing beyond the previous EOF
+    bool failed; // fatal navigation/read failure, distinct from a held EOF
     bool drain_pending; // holding an EOF at a jump boundary, awaiting ACK
+    bool drain_immediate; // user command requires dropping queued old-domain data
+    bool drain_user_activation; // button jump; skip drain only while user-paused
 
     // Disc-driven track selection.
     bool no_audio;      // the current playlist/domain has no audio
+    // DVD exact logical selection; physical IDs remain available below.
+    uint64_t dvd_generation;
+    int active_audio_logical, active_sub_logical;
     int active_audio_id;
     int active_sub_id;
     bool sub_visible;   // disc says subs should be displayed
@@ -189,6 +209,26 @@ struct stream_lang_req {
     int type;     // STREAM_AUDIO, STREAM_SUB
     int id;
     char name[50];
+};
+
+// A catalog belongs to one DVD navigation epoch. PES IDs include the codec
+// namespace (AC3 0x80, DTS 0x88, LPCM 0xa0, MPEG 0x1c0, SPU 0x20).
+struct stream_dvd_stream {
+    int id;                     // -1 when this logical slot is inactive
+    char lang[3];
+};
+struct stream_dvd_streams {
+    uint64_t generation;
+    uint32_t discontinuity_id;
+    int domain;
+    struct stream_dvd_stream audio[8], sub[32];
+    int active_audio, active_sub;
+    bool sub_visible;
+};
+struct stream_dvd_select {
+    uint64_t generation;
+    int type;                   // STREAM_AUDIO or STREAM_SUB
+    int logical;                // -1: hide subtitles, preserving SPST logical
 };
 
 struct stream_dvd_info_req {
@@ -355,6 +395,8 @@ int stream_create_with_args(struct stream_open_args *args, struct stream **ret);
 struct stream *stream_create(const char *url, int flags,
                              struct mp_cancel *c, struct mpv_global *global);
 stream_t *open_output_stream(const char *filename, struct mpv_global *global);
+int stream_open_bluray_iso(stream_t *stream, const char *url, bool local_path);
+int stream_open_dvd_iso(stream_t *stream, const char *url, bool local_path);
 
 void mp_url_unescape_inplace(char *buf);
 char *mp_url_unescape(void *talloc_ctx, const char *url);
