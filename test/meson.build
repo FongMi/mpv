@@ -271,6 +271,44 @@ if refdir != ''
     endif
 endif
 
+if features['audiotrack']
+    ad_passthrough = executable('ad-passthrough', 'ad_passthrough.c',
+        include_directories: incdir,
+        dependencies: [libavutil, libavcodec, libavformat,
+                      libplacebo.partial_dependency(compile_args: true, includes: true)],
+        objects: aframe_objects,
+        link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections'])
+    test('ad-passthrough', ad_passthrough,
+         args: join_paths(source_root, 'test/ref/passthrough'))
+
+    decoder_passthrough = executable('decoder-passthrough', 'decoder_passthrough.c',
+        include_directories: incdir,
+        dependencies: [libavutil,
+                      libplacebo.partial_dependency(compile_args: true, includes: true)],
+        objects: aframe_objects, link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections'])
+    test('decoder-passthrough', decoder_passthrough)
+
+    ao_buffer = executable('ao-buffer', 'ao_buffer.c',
+        include_directories: incdir, dependencies: [libavutil],
+        objects: aframe_objects, link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections', '-Wl,--no-export-dynamic'])
+    test('ao-buffer', ao_buffer)
+
+    output_chain = executable('output-chain', 'output_chain.c',
+        include_directories: incdir,
+        dependencies: [libavutil,
+                      libplacebo.partial_dependency(compile_args: true, includes: true)],
+        objects: aframe_objects, link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections'])
+    test('output-chain', output_chain)
+endif
+
 if features['dvdnav']
     dvdnav_test = executable('dvdnav', 'dvdnav.c',
         gnu_symbol_visibility: 'hidden',
@@ -300,3 +338,11 @@ dvd_segment_header = custom_target('dvd-segment-functions',
     command: [python, files('dvd_segments.py'), '--generate', '@OUTPUT@'])
 dvd_segments = executable('dvd-segments', ['dvd_segments.c', dvd_segment_header])
 test('dvd-segments', dvd_segments)
+
+filter_options_header = custom_target('filter-options-functions',
+    input: files('../player/command.c'),
+    output: 'filter_options_functions.h',
+    depend_files: files('vo_android_frame.py'),
+    command: [python, files('filter_options.py'), '--generate', '@OUTPUT@'])
+filter_options = executable('filter-options', ['filter_options.c', filter_options_header])
+test('filter-options', filter_options)
