@@ -314,6 +314,9 @@ static bool track_in_current_edition(struct MPContext *mpctx, struct track *trac
 
 bool track_is_visible(struct MPContext *mpctx, struct track *track)
 {
+    if (track->stream && track->stream->dvd_nav_stream &&
+        !atomic_load(&track->stream->dvd_nav_generation))
+        return false;
     if (!track_in_current_edition(mpctx, track))
         return false;
     if (track->dependent_track && !mpctx->opts->show_dependent_tracks)
@@ -339,12 +342,23 @@ void print_track_list(struct MPContext *mpctx, const char *msg)
     }
 }
 
+static void handle_demuxer_failure(struct MPContext *mpctx)
+{
+    if (mpctx->demuxer && mpctx->demuxer->failed &&
+        (!mpctx->stop_play || mpctx->stop_play == AT_END_OF_FILE))
+    {
+        mpctx->error_playing = MPV_ERROR_UNKNOWN_FORMAT;
+        mpctx->stop_play = PT_ERROR;
+    }
+}
+
 void update_demuxer_properties(struct MPContext *mpctx)
 {
     struct demuxer *demuxer = mpctx->demuxer;
     if (!demuxer)
         return;
     demux_update(demuxer, get_current_time(mpctx));
+    handle_demuxer_failure(mpctx);
     int events = demuxer->events;
     if ((events & DEMUX_EVENT_INIT) && demuxer->num_editions > 1) {
         for (int n = 0; n < demuxer->num_editions; n++) {
@@ -364,7 +378,12 @@ void update_demuxer_properties(struct MPContext *mpctx)
     }
     struct demuxer *tracks = mpctx->demuxer;
     if (tracks->events & DEMUX_EVENT_STREAMS) {
+        int old_num_tracks = mpctx->num_tracks;
         add_demuxer_tracks(mpctx, tracks);
+        // Existing streams may have become absent/present without adding a
+        // header. Their visible track list still needs a property notification.
+        if (mpctx->num_tracks == old_num_tracks)
+            mp_notify(mpctx, MP_EVENT_TRACKS_CHANGED, NULL);
         print_track_list(mpctx, NULL);
         tracks->events &= ~DEMUX_EVENT_STREAMS;
 
@@ -779,29 +798,27 @@ void mark_track_selection(struct MPContext *mpctx, int order,
 {
     mp_assert(order >= 0 && order < num_ptracks[type]);
     mpctx->opts->stream_id[order][type] = value;
+    mpctx->accepted_track_selection[order][type] = value;
     m_config_notify_change_opt_ptr(mpctx->mconfig,
                                    &mpctx->opts->stream_id[order][type]);
 }
 
-void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type,
+bool mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type,
                        struct track *track, int flags)
 {
     mp_assert(!track || track->type == type);
     mp_assert(type >= 0 && type < STREAM_TYPE_COUNT);
     mp_assert(order >= 0 && order < num_ptracks[type]);
 
-    // Mark the current track selection as explicitly user-requested. (This is
-    // different from auto-selection or disabling a track due to errors.)
-    if (flags & FLAG_MARK_SELECTION)
-        mark_track_selection(mpctx, order, type, track ? track->user_tid : -2);
-
-    // No decoder should be initialized yet.
-    if (!mpctx->demuxer)
-        return;
-
     struct track *current = mpctx->current_track[order][type];
+    // Preserve option setup before playback; no DVD VM is attached yet.
+    if (!mpctx->demuxer) {
+        if (flags & FLAG_MARK_SELECTION)
+            mark_track_selection(mpctx, order, type, track ? track->user_tid : -2);
+        return true;
+    }
     if (track == current)
-        return;
+        goto select;
 
     if (current && current->sink) {
         MP_ERR(mpctx, "Can't disable input to complex filter.\n");
@@ -819,6 +836,17 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
         MP_ERR(mpctx, "Track %d is already selected.\n", track->user_tid);
         goto error;
     }
+
+select:
+    // Reject before mutating options, decoders or demux selection. This also
+    // applies when the user explicitly selects the already-decoded alias.
+    if ((flags & FLAG_MARK_SELECTION) &&
+        !disc_nav_select_track(mpctx, order, type, track))
+        return false;
+    if (flags & FLAG_MARK_SELECTION)
+        mark_track_selection(mpctx, order, type, track ? track->user_tid : -2);
+    if (track == current)
+        return true;
 
     if (order == 0) {
         if (type == STREAM_VIDEO) {
@@ -875,9 +903,9 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
     talloc_free(mpctx->track_layout_hash);
     mpctx->track_layout_hash = talloc_steal(mpctx, track_layout_hash(mpctx));
 
-    return;
+    return true;
 error:
-    mark_track_selection(mpctx, order, type, -1);
+    return false;
 }
 
 void mp_switch_track(struct MPContext *mpctx, enum stream_type type,
@@ -1949,6 +1977,12 @@ static void play_current_file(struct MPContext *mpctx)
                          (t == STREAM_AUDIO && mpctx->ao_chain);
             if (!taken && opts->stream_auto_sel)
                 sel = select_default_track(mpctx, i, t);
+            // Startup/config restoration does not pass through a track
+            // property command. Apply its explicit DVD choice before decoding.
+            if (!taken && (opts->stream_id[i][t] >= 0 ||
+                           (t == STREAM_SUB && opts->stream_id[i][t] == -2)) &&
+                !disc_nav_select_track(mpctx, i, t, sel))
+                sel = NULL;
             mpctx->current_track[i][t] = sel;
         }
     }
@@ -2033,6 +2067,8 @@ static void play_current_file(struct MPContext *mpctx)
 
     MP_VERBOSE(mpctx, "Starting playback...\n");
 
+    memcpy(mpctx->accepted_track_selection, opts->stream_id,
+           sizeof(mpctx->accepted_track_selection));
     mpctx->playback_initialized = true;
     mpctx->playing->playlist_prev_attempt = false;
     mpctx->playlist->playlist_completed = false;
@@ -2092,6 +2128,13 @@ static void play_current_file(struct MPContext *mpctx)
     MP_VERBOSE(mpctx, "EOF code: %d  \n", mpctx->stop_play);
 
 terminate_playback:
+
+    // A demux failure may have arrived after the playloop's property update
+    // and caused the decoders to reach EOF during the same iteration.
+    if (mpctx->demuxer && mpctx->stop_play == AT_END_OF_FILE) {
+        demux_update(mpctx->demuxer, get_current_time(mpctx));
+        handle_demuxer_failure(mpctx);
+    }
 
     if (!mpctx->stop_play)
         mpctx->stop_play = PT_ERROR;
