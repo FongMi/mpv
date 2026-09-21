@@ -1782,8 +1782,9 @@ Miscellaneous Commands
     select
         Activate the currently highlighted button.
     menu
-        Jump to the root menu of the current title set (DVD: VTSM root menu,
-        BD: HDMV top menu).
+        Jump to the disc menu (DVD: VTSM root menu, or VMGM title menu if the
+        root menu is unavailable; BD: start First Play when entering disc
+        navigation, or request Top Menu when navigation is already active).
     title-menu
         Jump to the disc's title menu (DVD: VMGM title menu, treated like
         ``menu`` on BD).
@@ -2485,10 +2486,23 @@ Property list
     between having no editions and a single edition, which will be reflected by
     the property, although in practice it does not matter.)
 
+``disc-navigation-active``
+    ``yes`` when interactive navigation is enabled for the current optical-disc
+    stream (DVD or Blu-ray), including during title playback and still frames.
+    This is independent of whether a menu is visible or playback has ended.
+    ``no`` when navigation is disabled. Unavailable when the current source is
+    not an optical disc or its navigation state is unavailable.
+
 ``disc-menu-active``
     ``yes`` when the current optical-disc stream (DVD or Blu-ray) is showing
     an interactive menu (a DVD menu domain, or a visible Blu-ray menu
     overlay), and ``no`` otherwise. Unavailable when the currently playing
+    source is not an optical disc.
+
+``disc-menu-supported``
+    ``yes`` when the current disc can enter a DVD root or title menu, or when
+    the Blu-ray navigation backend supports its authored menu. This can change
+    when a DVD switches title sets. Unavailable when the currently playing
     source is not an optical disc.
 
 ``chapters``

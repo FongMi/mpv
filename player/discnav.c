@@ -20,9 +20,11 @@
 
 #include "mpv_talloc.h"
 
+#include "audio/out/ao.h"
 #include "common/common.h"
 #include "common/msg.h"
 #include "input/input.h"
+#include "osdep/timer.h"
 #include "player/command.h"
 
 #include "stream/stream.h"
@@ -36,10 +38,11 @@
 #include "core.h"
 
 struct disc_nav_state {
-    // True while the disc-menu input section is enabled (a menu is on screen).
+    // Track Blu-ray OSD graphics separately from the menu input section.
     bool overlay_visible;
+    bool menu_input_enabled;
 
-    // Blu-ray HDMV menu staging. libbluray hands us a pre-composited BGRA IG
+    // Blu-ray graphics staging. The stream supplies composited BGRA PG/IG
     // plane via STREAM_CTRL_GET_NAV_OVERLAY; we copy it into bd_image and
     // forward through osd_set_bitmaps (OSDTYPE_DISC_MENU).
     struct mp_image *bd_image;
@@ -50,7 +53,8 @@ struct disc_nav_state {
     uint32_t last_overlay_change_id;
     bool overlay_change_seen;
 
-    bool drain_was_pending; // last poll saw a boundary awaiting resync
+    bool drain_was_pending; // a boundary has already been queued for resync
+    uint32_t last_drain_disc_id;
 
     // DVD-only: dvd_subtitle track we force-selected for the menu, and the
     // selection it displaced (restored on menu close).
@@ -69,14 +73,27 @@ struct disc_nav_state {
     // Last audio id we logged as "not in tracks yet" (avoids log spam).
     int last_missing_audio_id;
 
-    // Last menu_active pushed through property-change notification.
+    // Last navigation state pushed through property-change notification.
+    bool last_navigation_active;
+    bool navigation_active_seen;
     bool last_menu_active;
     bool menu_active_seen;
+    bool last_menu_supported;
+    bool menu_supported_seen;
+
+    // DVD/BD finite-still timer. It starts only after decoders have drained so
+    // the authored duration applies to the actually displayed last frame.
+    bool timed_still_seen;
+    uint32_t timed_still_id;
+    double timed_still_remaining;
+    double timed_still_last_tick;
 };
 
 static bool is_dvd_sub_track(struct track *t)
 {
-    return t && t->type == STREAM_SUB && t->stream && t->stream->codec &&
+    return t && t->type == STREAM_SUB && t->stream &&
+           (!t->stream->dvd_nav_stream || atomic_load(&t->stream->dvd_nav_generation)) &&
+           t->stream->codec &&
            t->stream->codec->codec &&
            strcmp(t->stream->codec->codec, "dvd_subtitle") == 0;
 }
@@ -95,10 +112,10 @@ void disc_nav_reset(struct MPContext *mpctx)
     struct disc_nav_state *st = mpctx->disc_nav;
     if (!st)
         return;
-    if (st->overlay_visible) {
+    if (st->overlay_visible)
         osd_set_bitmaps(mpctx->osd, OSDTYPE_DISC_MENU, NULL);
+    if (st->menu_input_enabled)
         mp_input_disable_section(mpctx->input, "discnav");
-    }
     mp_image_unrefp(&st->bd_image);
     *st = (struct disc_nav_state){0};
 }
@@ -125,6 +142,14 @@ struct stream *disc_nav_get_stream(struct MPContext *mpctx)
         return s;
     }
     return NULL;
+}
+
+bool disc_nav_prevents_eof(struct MPContext *mpctx)
+{
+    struct stream *s = disc_nav_get_stream(mpctx);
+    struct stream_nav_state nav = {0};
+    return s && stream_control(s, STREAM_CTRL_GET_NAV_STATE, &nav) >= 1 &&
+           (nav.still_active || nav.transition_pending || nav.drain_pending || nav.failed);
 }
 
 bool disc_nav_mouse_pos_to_src(struct MPContext *mpctx, int src_w, int src_h,
@@ -170,6 +195,7 @@ static void push_bd_overlay(struct MPContext *mpctx, struct stream *s,
     if (!visible) {
         if (st->overlay_visible)
             osd_set_bitmaps(mpctx->osd, OSDTYPE_DISC_MENU, NULL);
+        st->overlay_visible = false;
         st->bd_last_change_id = 0;
         st->bd_last_vo_res = (struct mp_osd_res){0};
         return;
@@ -229,6 +255,7 @@ static void push_bd_overlay(struct MPContext *mpctx, struct stream *s,
     };
     osd_rescale_bitmaps(&imgs, nav->src_w, nav->src_h, vo_res, 0);
     osd_set_bitmaps(mpctx->osd, OSDTYPE_DISC_MENU, &imgs);
+    st->overlay_visible = true;
     st->bd_last_change_id = nav->change_id;
     st->bd_last_vo_res = vo_res;
 }
@@ -242,17 +269,23 @@ static void sync_current_edition(struct MPContext *mpctx, struct stream *s,
         strcmp(demuxer->desc->name, "disc") != 0)
         return;
 
+    unsigned num_titles;
+    if (stream_control(s, STREAM_CTRL_GET_NUM_TITLES, &num_titles) < 1)
+        return;
+    bool has_menu_edition = demuxer->num_editions == num_titles + 1;
     int desired = demuxer->edition;
-    if (nav->menu_active) {
-        desired = demuxer->num_editions - 1;
+    if (nav->menu_active && has_menu_edition) {
+        desired = num_titles;
     } else {
         unsigned title;
         if (stream_control(s, STREAM_CTRL_GET_CURRENT_TITLE, &title) >= 1 &&
-            (int)title < demuxer->num_editions - 1)
+            title < num_titles && title < (unsigned)demuxer->num_editions)
         {
-            desired = (int)title;
+            desired = title;
         }
     }
+    if (desired >= demuxer->num_editions)
+        desired = 0;
     if (desired != demuxer->edition) {
         MP_VERBOSE(s, "current-edition %d->%d "
                    "(menu_active=%d)\n",
@@ -264,17 +297,39 @@ static void sync_current_edition(struct MPContext *mpctx, struct stream *s,
 
 // Catch playlist/title jumps driven by the disc itself (menu buttons, HDMV
 // bytecode, end of title, dvdnav HOP_CHANNEL, etc.).
-static void check_async_discontinuity(struct MPContext *mpctx, struct stream *s,
-                                      struct stream_nav_state *nav)
+static bool check_async_discontinuity(struct MPContext *mpctx, struct stream *s,
+                                      struct stream_nav_state *nav, bool is_dvd)
 {
     struct disc_nav_state *st = get_state(mpctx);
     if (!mpctx->demuxer)
-        return;
+        return false;
 
-    bool new_drain = nav->drain_pending && !st->drain_was_pending;
-    st->drain_was_pending = nav->drain_pending;
-    if (!new_drain)
-        return;
+    if (!nav->drain_pending) {
+        st->drain_was_pending = false;
+        return false;
+    }
+    if (st->drain_was_pending &&
+        st->last_drain_disc_id == nav->discontinuity_id)
+        return false;
+
+    // An explicit seek owns the next VM position, including a track refresh.
+    if (mpctx->seek.type)
+        return true;
+
+    bool playback_drained = mpctx->video_status == STATUS_EOF &&
+                            mpctx->audio_status == STATUS_EOF &&
+                            (!mpctx->ao || !ao_is_playing(mpctx->ao));
+    bool immediate = nav->drain_immediate ||
+                     (nav->drain_user_activation && mpctx->opts->pause);
+    if (is_dvd && !immediate && !playback_drained) {
+        // The demux thread can reach an authored end-of-title jump while the
+        // player still has packets queued. Keep presenting the old domain
+        // until those packets drain instead of flushing the title early.
+        mp_set_timeout(mpctx, 0.05);
+        return true;
+    }
+    st->drain_was_pending = true;
+    st->last_drain_disc_id = nav->discontinuity_id;
 
     // The disc jumped on its own, resync through the regular seek path.
     // demux_disc releases the held boundary instead of repositioning the VM.
@@ -283,7 +338,81 @@ static void check_async_discontinuity(struct MPContext *mpctx, struct stream *s,
         t = 0;
     MP_VERBOSE(s, "disc jumped (id %u), resync seek to %f\n",
                nav->discontinuity_id, t);
-    queue_seek(mpctx, MPSEEK_ABSOLUTE, t, MPSEEK_KEYFRAME, 0);
+    queue_seek(mpctx, MPSEEK_ABSOLUTE, t, MPSEEK_KEYFRAME, MPSEEK_FLAG_NAV);
+    return false;
+}
+
+// Only explicit primary track requests write the DVD VM. Internal navigation
+// synchronization calls mp_switch_track_n without FLAG_MARK_SELECTION.
+bool disc_nav_select_track(struct MPContext *mpctx, int order,
+                            enum stream_type type, struct track *track)
+{
+    if (order || (type != STREAM_AUDIO && type != STREAM_SUB))
+        return true;
+    struct sh_stream *sh = track ? track->stream : NULL;
+    struct stream *s = disc_nav_get_stream(mpctx);
+    if (!s)
+        return !sh || !sh->dvd_nav_stream;
+    struct stream_nav_state nav = {0};
+    if (stream_control(s, STREAM_CTRL_GET_NAV_STATE, &nav) < 1 || !nav.dvd_generation)
+        return !sh || !sh->dvd_nav_stream;
+    if (track && (!sh || !sh->dvd_nav_stream))
+        return true;
+    if (!track && type == STREAM_AUDIO)
+        return true;
+    struct stream_dvd_select select = {
+        .generation = sh ? atomic_load(&sh->dvd_nav_generation) : nav.dvd_generation,
+        .type = type,
+        .logical = sh ? sh->dvd_nav_logical : -1,
+    };
+    if (stream_control(s, STREAM_CTRL_SET_DVD_STREAM, &select) != STREAM_OK) {
+        MP_WARN(mpctx, "DVD rejected track selection from an inactive navigation epoch.\n");
+        return false;
+    }
+    // Disc demuxers cannot use the generic packet-cache refresh. Refill the
+    // selected track at the playback position through the normal seek owner.
+    if (mpctx->playback_initialized && track && !nav.menu_active &&
+        track != mpctx->current_track[0][type] && !mpctx->seek.type)
+        queue_seek(mpctx, MPSEEK_ABSOLUTE, get_current_time(mpctx), MPSEEK_EXACT, 0);
+    return true;
+}
+
+static struct track *find_dvd_track(struct MPContext *mpctx, enum stream_type type,
+                                    int logical, uint64_t generation)
+{
+    for (int n = 0; n < mpctx->num_tracks; n++) {
+        struct track *track = mpctx->tracks[n];
+        struct sh_stream *sh = track->stream;
+        if (track->type == type && sh && sh->dvd_nav_stream &&
+            sh->dvd_nav_logical == logical &&
+            atomic_load(&sh->dvd_nav_generation) == generation)
+            return track;
+    }
+    return NULL;
+}
+
+static void sync_dvd_track_selection(struct MPContext *mpctx,
+                                     struct stream_nav_state *nav)
+{
+    struct disc_nav_state *st = get_state(mpctx);
+    // The VM is authoritative after a user request has been accepted too:
+    // authored commands may select another logical alias on the same PES.
+    for (int type = 0; type < STREAM_TYPE_COUNT; type++) {
+        if (type != STREAM_AUDIO && type != STREAM_SUB)
+            continue;
+        if (mpctx->opts->stream_id[0][type] == -2 ||
+            (type == STREAM_SUB && (nav->menu_active || st->menu_selected_track)))
+            continue;
+        struct track *current = mpctx->current_track[0][type];
+        // Explicit external tracks stay outside DVD navigation ownership.
+        if (current && (!current->stream || !current->stream->dvd_nav_stream))
+            continue;
+        int logical = type == STREAM_AUDIO ? nav->active_audio_logical : nav->active_sub_logical;
+        bool off = type == STREAM_AUDIO ? nav->no_audio : !nav->sub_visible;
+        struct track *track = off ? NULL : find_dvd_track(mpctx, type, logical, nav->dvd_generation);
+        if ((off || track) && current != track)
+            mp_switch_track_n(mpctx, 0, type, track, 0);
+    }
 }
 
 static struct track *find_track_by_demuxer_id(struct MPContext *mpctx,
@@ -303,6 +432,14 @@ static void sync_disc_track_selection(struct MPContext *mpctx, struct stream *s,
                                       struct stream_nav_state *nav)
 {
     struct disc_nav_state *st = get_state(mpctx);
+    if (nav->dvd_generation) {
+        sync_dvd_track_selection(mpctx, nav);
+        if (st->last_angle != nav->angle) {
+            st->last_angle = nav->angle;
+            mp_notify_property(mpctx, "angle");
+        }
+        return;
+    }
     bool first = !st->track_sync_seen;
     bool hopped = nav->discontinuity_id != st->last_track_disc_id;
     st->last_track_disc_id = nav->discontinuity_id;
@@ -419,7 +556,7 @@ static void ensure_menu_sub_selection(struct MPContext *mpctx, bool menu_on)
     if (menu_on) {
         // Re-checked every frame; other selectors (stream auto-select, slave
         // reopens) can change the sub under us.
-        if (st->menu_selected_track && cur == st->menu_selected_track)
+        if (st->menu_selected_track && cur == st->menu_selected_track && is_dvd_sub_track(cur))
             return;
         // A dvd_subtitle track is already active; nothing to force.
         if (is_dvd_sub_track(cur))
@@ -444,11 +581,29 @@ static void ensure_menu_sub_selection(struct MPContext *mpctx, bool menu_on)
         if (!st->menu_selected_track)
             return;
         // Only revert if our override is still the active selection.
-        if (cur == st->menu_selected_track)
-            mp_switch_track_n(mpctx, 0, STREAM_SUB, st->menu_saved_track, 0);
+        if (cur == st->menu_selected_track) {
+            struct track *saved = st->menu_saved_track;
+            if (saved && saved->stream && saved->stream->dvd_nav_stream &&
+                !atomic_load(&saved->stream->dvd_nav_generation))
+                saved = NULL;
+            mp_switch_track_n(mpctx, 0, STREAM_SUB, saved, 0);
+        }
         st->menu_selected_track = NULL;
         st->menu_saved_track = NULL;
     }
+}
+
+static bool handle_nav_failure(struct MPContext *mpctx,
+                               const struct stream_nav_state *nav)
+{
+    if (!nav->failed)
+        return false;
+    // A player-thread VM continuation can fail after the demuxer latched EOF.
+    // Wake its owner to publish that failure through the demuxer error path.
+    if (mpctx->demuxer)
+        demux_drive_nav(mpctx->demuxer);
+    mpctx->disc_nav_still_frame = false;
+    return true;
 }
 
 void disc_nav_update(struct MPContext *mpctx)
@@ -459,6 +614,59 @@ void disc_nav_update(struct MPContext *mpctx)
     struct disc_nav_state *st = get_state(mpctx);
     struct stream_nav_state nav = {0};
     bool have = s && stream_control(s, STREAM_CTRL_GET_NAV_STATE, &nav) >= 1;
+    bool is_dvd = have && (strcmp(s->info->name, "dvdnav") == 0 ||
+                           strcmp(s->info->name, "ifo_dvdnav") == 0);
+
+    if (have && handle_nav_failure(mpctx, &nav))
+        return;
+
+    if (have && check_async_discontinuity(mpctx, s, &nav, is_dvd))
+        return;
+
+    if (!have || !nav.still_active || nav.still_duration <= 0) {
+        st->timed_still_seen = false;
+        st->timed_still_last_tick = 0;
+    } else {
+        if (!st->timed_still_seen || st->timed_still_id != nav.still_id) {
+            st->timed_still_seen = true;
+            st->timed_still_id = nav.still_id;
+            st->timed_still_remaining = nav.still_duration;
+            st->timed_still_last_tick = 0;
+        }
+
+        bool drained = mpctx->video_status == STATUS_EOF &&
+                       mpctx->audio_status == STATUS_EOF &&
+                       (!mpctx->ao || !ao_is_playing(mpctx->ao));
+        double now = mp_time_sec();
+        if (!drained) {
+            st->timed_still_last_tick = 0;
+            mp_set_timeout(mpctx, 0.05);
+        } else if (mpctx->paused) {
+            if (st->timed_still_last_tick > 0)
+                st->timed_still_remaining -= now - st->timed_still_last_tick;
+            st->timed_still_last_tick = 0;
+        } else {
+            if (st->timed_still_last_tick > 0)
+                st->timed_still_remaining -= now - st->timed_still_last_tick;
+            st->timed_still_last_tick = now;
+
+            if (st->timed_still_remaining <= 0) {
+                if (!mpctx->seek.type) {
+                    struct stream_nav_still_skip req = {.id = nav.still_id};
+                    if (stream_control(s, STREAM_CTRL_NAV_STILL_SKIP, &req) >= 1) {
+                        st->timed_still_seen = false;
+                        st->timed_still_last_tick = 0;
+                    }
+                    have = stream_control(s, STREAM_CTRL_GET_NAV_STATE, &nav) >= 1;
+                    if (have && handle_nav_failure(mpctx, &nav))
+                        return;
+                }
+            } else {
+                mp_set_timeout(mpctx, st->timed_still_remaining);
+            }
+        }
+    }
+
     bool still = have && nav.still_active;
     if (s && still != mpctx->disc_nav_still_frame)
         MP_VERBOSE(s, "still_frame %d->%d\n",
@@ -484,28 +692,50 @@ void disc_nav_update(struct MPContext *mpctx)
     if (!have) {
         if (st->overlay_visible) {
             osd_set_bitmaps(mpctx->osd, OSDTYPE_DISC_MENU, NULL);
-            mp_input_disable_section(mpctx->input, "discnav");
             st->overlay_visible = false;
+        }
+        if (st->menu_input_enabled) {
+            mp_input_disable_section(mpctx->input, "discnav");
+            st->menu_input_enabled = false;
         }
         st->bd_last_change_id = 0;
         st->bd_last_vo_res = (struct mp_osd_res){0};
         st->menu_selected_track = NULL;
         st->menu_saved_track = NULL;
         st->overlay_change_seen = false;
+        if (st->navigation_active_seen) {
+            st->navigation_active_seen = false;
+            st->last_navigation_active = false;
+            mp_notify_property(mpctx, "disc-navigation-active");
+        }
         if (st->menu_active_seen && st->last_menu_active) {
             st->last_menu_active = false;
             mp_notify_property(mpctx, "disc-menu-active");
         }
+        if (st->menu_supported_seen) {
+            st->menu_supported_seen = false;
+            st->last_menu_supported = false;
+            mp_notify_property(mpctx, "disc-menu-supported");
+        }
         return;
     }
 
+    if (!st->navigation_active_seen || nav.nav_active != st->last_navigation_active) {
+        st->navigation_active_seen = true;
+        st->last_navigation_active = nav.nav_active;
+        mp_notify_property(mpctx, "disc-navigation-active");
+    }
     if (!st->menu_active_seen || nav.menu_active != st->last_menu_active) {
         st->menu_active_seen = true;
         st->last_menu_active = nav.menu_active;
         mp_notify_property(mpctx, "disc-menu-active");
     }
+    if (!st->menu_supported_seen || nav.menu_supported != st->last_menu_supported) {
+        st->menu_supported_seen = true;
+        st->last_menu_supported = nav.menu_supported;
+        mp_notify_property(mpctx, "disc-menu-supported");
+    }
 
-    check_async_discontinuity(mpctx, s, &nav);
     sync_current_edition(mpctx, s, &nav);
     sync_disc_track_selection(mpctx, s, &nav);
 
@@ -514,7 +744,7 @@ void disc_nav_update(struct MPContext *mpctx)
                    (is_bd || (mp_rect_w(nav.hl.rect) > 0 && mp_rect_h(nav.hl.rect) > 0));
 
     if (is_bd) {
-        push_bd_overlay(mpctx, s, &nav, visible);
+        push_bd_overlay(mpctx, s, &nav, nav.overlay_visible);
     } else {
         push_dvd_overlay(mpctx, &nav);
         ensure_menu_sub_selection(mpctx, nav.menu_active);
@@ -526,14 +756,14 @@ void disc_nav_update(struct MPContext *mpctx)
         osd_changed(mpctx->osd);
     }
 
-    if (visible != st->overlay_visible) {
-        MP_VERBOSE(s, "overlay %s\n", visible ? "on" : "off");
+    if (visible != st->menu_input_enabled) {
+        MP_VERBOSE(s, "menu input %s\n", visible ? "on" : "off");
         if (visible) {
             mp_input_enable_section(mpctx->input, "discnav",
                 MP_INPUT_ON_TOP | MP_INPUT_ALLOW_VO_DRAGGING | MP_INPUT_ALLOW_HIDE_CURSOR);
         } else {
             mp_input_disable_section(mpctx->input, "discnav");
         }
-        st->overlay_visible = visible;
+        st->menu_input_enabled = visible;
     }
 }
