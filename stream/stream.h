@@ -258,6 +258,7 @@ typedef struct stream {
     bool allow_partial_read : 1; // allows partial read with stream_read_file()
     bool autoprobed : 1; // opened by the autoprobe loop, not explicitly
                          // requested, failures should stay quiet
+    bool lavf_force_rtsp_tcp : 1; // force RTSP over TCP for rtspt://
     struct mp_log *log;
     struct mpv_global *global;
 
