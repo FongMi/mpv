@@ -25,6 +25,7 @@
 struct sh_stream;
 struct mp_codec_params;
 struct mp_image_params;
+struct mp_aframe;
 struct mp_decoder_list;
 struct demux_packet;
 
@@ -55,6 +56,16 @@ double mp_decoder_wrapper_get_container_fps(struct mp_decoder_wrapper *d);
 
 // Whether to prefer spdif wrapper over real decoders on next reinit.
 void mp_decoder_wrapper_set_spdif_flag(struct mp_decoder_wrapper *d, bool spdif);
+
+// Acknowledge the passthrough format after the AO accepts it. Rejected formats
+// can be reinitialized without losing the input packets that produced them.
+void mp_decoder_wrapper_accept_passthrough(struct mp_decoder_wrapper *d,
+                                           struct mp_aframe *format);
+// failed_format is the format rejected by the AO, or AF_FORMAT_UNKNOWN when
+// passthrough is disabled by a filter rather than an output initialization.
+bool mp_decoder_wrapper_fallback_passthrough(struct mp_decoder_wrapper *d,
+                                            int failed_format, bool *passthrough,
+                                            bool force_pcm);
 
 // Whether to decode only 1 frame and then stop, and cache the frame across resets.
 void mp_decoder_wrapper_set_coverart_flag(struct mp_decoder_wrapper *d, bool c);
@@ -98,6 +109,11 @@ struct mp_decoder {
     // Bidirectional filter; takes MP_FRAME_PACKET for input.
     struct mp_filter *f;
 
+    // Passthrough input packets consumed by the next nonempty audio output,
+    // and startup packets discarded without output. Read/reset by the wrapper.
+    int passthrough_consumed;
+    int passthrough_discarded;
+
     // Can be set by decoder impl. on init for "special" functionality.
     int (*control)(struct mp_filter *f, enum dec_ctrl cmd, void *arg);
 };
@@ -112,6 +128,7 @@ struct mp_decoder_fns {
 extern const struct mp_decoder_fns vd_lavc;
 extern const struct mp_decoder_fns ad_lavc;
 extern const struct mp_decoder_fns ad_spdif;
+extern const struct mp_decoder_fns ad_passthrough;
 extern const struct mp_decoder_fns ad_dsd;
 
 // Convenience wrapper for lavc based decoders. Treat lavc_state as private;
@@ -126,6 +143,10 @@ void lavc_process(struct mp_filter *f, struct lavc_state *state,
 
 // ad_spdif.c
 struct mp_decoder_list *select_spdif_codec(const char *codec, const char *pref);
+
+// ad_passthrough.c
+struct mp_decoder_list *select_passthrough_codec(const char *codec,
+                                                const char *pref);
 
 // ad_dsd.c
 struct mp_decoder_list *select_dsd_codec(const char *codec, const char *pref);

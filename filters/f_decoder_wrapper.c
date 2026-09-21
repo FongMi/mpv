@@ -22,6 +22,8 @@
 #include <math.h>
 #include <assert.h>
 
+#include "config.h"
+
 #include <libavutil/buffer.h>
 #include <libavutil/common.h>
 #include <libavutil/rational.h>
@@ -42,6 +44,7 @@
 #include "misc/dispatch.h"
 
 #include "audio/aframe.h"
+#include "audio/format.h"
 #include "video/out/vo.h"
 #include "video/csputils.h"
 
@@ -149,6 +152,11 @@ const struct m_sub_options dec_wrapper_conf = {
     },
 };
 
+struct passthrough_output {
+    struct mp_aframe *format;
+    int packets;
+};
+
 struct priv {
     struct mp_log *log;
     struct sh_stream *header;
@@ -202,6 +210,17 @@ struct priv {
     double start, end;
     struct demux_packet *new_segment;
     struct mp_frame packet;
+    bool using_spdif;
+    bool using_raw;
+    struct mp_frame *passthrough_packets;
+    int num_passthrough_packets;
+    struct mp_frame *replay_packets;
+    int num_replay_packets;
+    struct mp_aframe *accepted_passthrough_format;
+    struct mp_aframe *pending_passthrough_format;
+    struct passthrough_output *passthrough_outputs;
+    int num_passthrough_outputs;
+    int queued_passthrough_packets;
     bool packet_fed, preroll_discard;
 
     size_t reverse_queue_byte_size;
@@ -229,6 +248,8 @@ struct priv {
     // --- Protected by cache_lock.
     char *cur_hwdec;
     bool try_spdif;
+    bool try_raw;
+    bool dts_core_only;
     bool attached_picture;
     bool pts_reset;
     int attempt_framedrops; // try dropping this many frames
@@ -321,6 +342,18 @@ static void reset_decoder(struct priv *p)
     p->has_broken_decoded_pts = 0;
     p->packets_without_output = 0;
     mp_frame_unref(&p->packet);
+    for (int n = 0; n < p->num_passthrough_packets; n++)
+        mp_frame_unref(&p->passthrough_packets[n]);
+    p->num_passthrough_packets = 0;
+    for (int n = 0; n < p->num_replay_packets; n++)
+        mp_frame_unref(&p->replay_packets[n]);
+    p->num_replay_packets = 0;
+    TA_FREEP(&p->accepted_passthrough_format);
+    TA_FREEP(&p->pending_passthrough_format);
+    for (int n = 0; n < p->num_passthrough_outputs; n++)
+        talloc_free(p->passthrough_outputs[n].format);
+    p->num_passthrough_outputs = 0;
+    p->queued_passthrough_packets = 0;
     p->packet_fed = false;
     p->preroll_discard = false;
     talloc_free(p->new_segment);
@@ -419,14 +452,28 @@ struct mp_decoder_list *audio_decoder_list(void)
     return list;
 }
 
-static bool reinit_decoder(struct priv *p)
+// Call with cache_lock held. A rejected DTS-HD output only changes the current
+// decoder's negotiation; preserve the user's codec list for other streams.
+static const char *passthrough_codecs(struct priv *p)
+{
+    if (p->dts_core_only && p->codec->codec &&
+        strcmp(p->codec->codec, "dts") == 0)
+        return "dts";
+    return p->opts->audio_spdif;
+}
+
+static bool reinit_decoder(struct priv *p, bool reset)
 {
     if (p->decoder)
         talloc_free(p->decoder->f);
     p->decoder = NULL;
 
-    reset_decoder(p);
-    p->has_broken_packet_pts = -10; // needs 10 packets to reach decision
+    if (reset) {
+        reset_decoder(p);
+        p->has_broken_packet_pts = -10; // needs 10 packets to reach decision
+    }
+    p->using_spdif = false;
+    p->using_raw = false;
 
     const struct mp_decoder_fns *driver = NULL;
     struct mp_decoder_list *list = NULL;
@@ -443,12 +490,22 @@ static bool reinit_decoder(struct priv *p)
         fallback = "aac";
 
         mp_mutex_lock(&p->cache_lock);
-        bool try_spdif = p->try_spdif;
+        bool try_spdif = p->try_spdif && p->play_dir > 0;
+        bool try_raw = p->try_raw;
+        const char *codecs = passthrough_codecs(p);
         mp_mutex_unlock(&p->cache_lock);
 
-        if (try_spdif && p->codec->codec) {
+        if (try_spdif && p->codec->codec && try_raw) {
+            list = select_passthrough_codec(p->codec->codec, codecs);
+            if (list->num_entries) {
+                driver = &ad_passthrough;
+            } else {
+                TA_FREEP(&list);
+            }
+        }
+        if (try_spdif && p->codec->codec && !list) {
             struct mp_decoder_list *spdif =
-                select_spdif_codec(p->codec->codec, p->opts->audio_spdif);
+                select_spdif_codec(p->codec->codec, codecs);
             if (spdif->num_entries) {
                 driver = &ad_spdif;
                 list = spdif;
@@ -487,6 +544,10 @@ static bool reinit_decoder(struct priv *p)
 
         p->decoder = driver->create(p->decf, p->codec, sel->decoder);
         if (p->decoder) {
+            p->using_raw = driver == &ad_passthrough;
+            p->using_spdif = driver == &ad_spdif || p->using_raw;
+            if (p->using_spdif)
+                mp_filter_set_error_handler(p->decoder->f, p->decf);
             p->codec->decoder = talloc_strdup(p->codec, sel->decoder);
             p->codec->decoder_desc = talloc_strdup(p->codec, sel->desc && sel->desc[0] ? sel->desc : NULL);
             MP_VERBOSE(p, "Selected decoder: %s", sel->decoder);
@@ -497,6 +558,14 @@ static bool reinit_decoder(struct priv *p)
         }
 
         MP_WARN(p, "Decoder init failed for %s\n", sel->decoder);
+    }
+
+    if (!p->decoder && driver == &ad_passthrough) {
+        mp_mutex_lock(&p->cache_lock);
+        p->try_raw = false;
+        mp_mutex_unlock(&p->cache_lock);
+        talloc_free(list);
+        return reinit_decoder(p, false);
     }
 
     if (!p->decoder) {
@@ -523,7 +592,7 @@ static bool reinit_decoder(struct priv *p)
 static bool decoder_wrapper_reinit(struct mp_decoder_wrapper *d)
 {
     struct priv *p = d->f->priv;
-    return reinit_decoder(p);
+    return reinit_decoder(p, true);
 }
 
 bool mp_decoder_wrapper_reinit(struct mp_decoder_wrapper *d)
@@ -537,7 +606,8 @@ bool mp_decoder_wrapper_reinit(struct mp_decoder_wrapper *d)
         return true;
     }
     thread_lock(p);
-    bool res = reinit_decoder(p);
+    bool res = reinit_decoder(p, true);
+    mp_filter_wakeup(p->decf);
     thread_unlock(p);
     return res;
 }
@@ -586,7 +656,138 @@ void mp_decoder_wrapper_set_spdif_flag(struct mp_decoder_wrapper *d, bool spdif)
     struct priv *p = d->f->priv;
     mp_mutex_lock(&p->cache_lock);
     p->try_spdif = spdif;
+    p->try_raw = spdif && HAVE_AUDIOTRACK;
+    p->dts_core_only = false;
     mp_mutex_unlock(&p->cache_lock);
+}
+
+static bool fallback_passthrough(struct priv *p, int failed_format, bool force_pcm)
+{
+    mp_mutex_lock(&p->cache_lock);
+    p->try_raw = false;
+    if (force_pcm) {
+        p->try_spdif = false;
+    } else if (failed_format == AF_FORMAT_S_DTSHD && !p->dts_core_only) {
+        // The output rejected DTS-HD. Try the DTS core once before decoding PCM.
+        p->dts_core_only = true;
+        p->try_spdif = true;
+    } else {
+        p->try_spdif = p->using_raw;
+    }
+    bool passthrough = p->try_spdif;
+    mp_mutex_unlock(&p->cache_lock);
+    return passthrough;
+}
+
+static void discard_passthrough_packets(struct priv *p, int first, int count)
+{
+    mp_assert(first >= 0 && count >= 0 && first + count <= p->num_passthrough_packets);
+    if (!count)
+        return;
+    for (int n = 0; n < count; n++)
+        mp_frame_unref(&p->passthrough_packets[first + n]);
+    memmove(p->passthrough_packets + first, p->passthrough_packets + first + count,
+            (p->num_passthrough_packets - first - count) * sizeof(p->passthrough_packets[0]));
+    p->num_passthrough_packets -= count;
+}
+
+static bool same_passthrough_frame(struct mp_aframe *a, struct mp_aframe *b)
+{
+    if (!mp_aframe_is_allocated(a) || !mp_aframe_is_allocated(b) ||
+        !mp_aframe_config_equals(a, b))
+        return false;
+    if (af_fmt_is_encoded(mp_aframe_get_format(a)))
+        return mp_aframe_get_encoded_data(a) == mp_aframe_get_encoded_data(b);
+    return mp_aframe_get_data_ro(a)[0] == mp_aframe_get_data_ro(b)[0];
+}
+
+void mp_decoder_wrapper_accept_passthrough(struct mp_decoder_wrapper *d,
+                                           struct mp_aframe *format)
+{
+    struct priv *p = d->f->priv;
+    thread_lock(p);
+    if (p->pending_passthrough_format &&
+        mp_aframe_config_equals(p->pending_passthrough_format, format))
+    {
+        TA_FREEP(&p->accepted_passthrough_format);
+        p->accepted_passthrough_format = p->pending_passthrough_format;
+        p->pending_passthrough_format = NULL;
+        mp_filter_wakeup(p->decf);
+    }
+    // Format acknowledgement unlocks decoding; packet ownership lasts until
+    // the corresponding access unit reaches the AO input. A user filter can
+    // reject a later access unit even when its codec format has not changed.
+    if (mp_aframe_is_allocated(format) && p->num_passthrough_outputs) {
+        struct passthrough_output *out = &p->passthrough_outputs[0];
+        if (same_passthrough_frame(out->format, format))
+        {
+            discard_passthrough_packets(p, 0, out->packets);
+            p->queued_passthrough_packets -= out->packets;
+            talloc_free(out->format);
+            MP_TARRAY_REMOVE_AT(p->passthrough_outputs, p->num_passthrough_outputs, 0);
+            mp_filter_wakeup(p->decf);
+        }
+    }
+    while (p->num_passthrough_packets &&
+           p->passthrough_packets[0].type == MP_FRAME_EOF)
+        discard_passthrough_packets(p, 0, 1);
+    thread_unlock(p);
+}
+
+static struct mp_frame *take_passthrough_packets(struct priv *p, int *count)
+{
+    struct mp_frame *packets = p->passthrough_packets;
+    int num = p->num_passthrough_packets;
+    p->passthrough_packets = NULL;
+    p->num_passthrough_packets = 0;
+    for (int n = 0; n < p->num_replay_packets; n++)
+        MP_TARRAY_APPEND(p, packets, num, p->replay_packets[n]);
+    p->num_replay_packets = 0;
+    if (p->packet.type) {
+        MP_TARRAY_APPEND(p, packets, num, p->packet);
+        p->packet = MP_NO_FRAME;
+    }
+    *count = num;
+    return packets;
+}
+
+// The decoder and its output are reset as one operation. Keep the original
+// demux packets, including an unread EOF, until the new transport accepts them.
+static bool reinit_passthrough(struct priv *p, bool reset)
+{
+    double start = p->start, end = p->end, start_pts = p->start_pts;
+    struct demux_packet *new_segment = p->new_segment;
+    p->new_segment = NULL;
+    int count;
+    struct mp_frame *packets = take_passthrough_packets(p, &count);
+    if (reset)
+        mp_filter_reset(p->dec_root_filter);
+    bool ok = reinit_decoder(p, true);
+    p->start = start;
+    p->end = end;
+    p->start_pts = start_pts;
+    p->new_segment = new_segment;
+    talloc_free(p->replay_packets);
+    p->replay_packets = packets;
+    p->num_replay_packets = count;
+    return ok;
+}
+
+bool mp_decoder_wrapper_fallback_passthrough(struct mp_decoder_wrapper *d,
+                                            int failed_format, bool *passthrough,
+                                            bool force_pcm)
+{
+    struct priv *p = d->f->priv;
+    if (p->queue)
+        mp_async_queue_reset(p->queue);
+    thread_lock(p);
+    *passthrough = fallback_passthrough(p, failed_format, force_pcm);
+    bool ok = reinit_passthrough(p, true);
+    mp_filter_wakeup(p->decf);
+    thread_unlock(p);
+    if (p->queue && !p->queue_suspended)
+        mp_async_queue_resume(p->queue);
+    return ok;
 }
 
 void mp_decoder_wrapper_set_coverart_flag(struct mp_decoder_wrapper *d, bool c)
@@ -616,7 +817,13 @@ void mp_decoder_wrapper_set_play_dir(struct mp_decoder_wrapper *d, int dir)
         return;
     }
     thread_lock(p);
+    mp_mutex_lock(&p->cache_lock);
+    bool reinit = p->play_dir != dir && p->codec->type == STREAM_AUDIO &&
+                  p->decoder && p->try_spdif;
+    mp_mutex_unlock(&p->cache_lock);
     p->play_dir = dir;
+    if (reinit && !reinit_decoder(p, true))
+        mp_filter_internal_mark_failed(p->decf);
     thread_unlock(p);
 }
 
@@ -954,8 +1161,22 @@ static bool is_new_segment(struct priv *p, struct mp_frame frame)
 
 static void feed_packet(struct priv *p)
 {
+    if (p->pending_passthrough_format)
+        return;
     if (!p->decoder || !mp_pin_in_needs_data(p->decoder->f->pins[0]))
         return;
+
+    if (p->num_replay_packets) {
+        // These packets already passed the recorder and input-PTS bookkeeping.
+        struct mp_frame packet = p->replay_packets[0];
+        MP_TARRAY_REMOVE_AT(p->replay_packets, p->num_replay_packets, 0);
+        if (p->using_spdif)
+            MP_TARRAY_APPEND(p, p->passthrough_packets,
+                             p->num_passthrough_packets, mp_frame_ref(packet));
+        mp_pin_in_write(p->decoder->f->pins[0], packet);
+        p->packet_fed = true;
+        return;
+    }
 
     if (p->decoded_coverart.type)
         return;
@@ -1028,6 +1249,9 @@ static void feed_packet(struct priv *p)
         packet->pts = packet->dts = MP_NOPTS_VALUE;
     }
 
+    if (p->using_spdif)
+        MP_TARRAY_APPEND(p, p->passthrough_packets,
+                         p->num_passthrough_packets, mp_frame_ref(p->packet));
     mp_pin_in_write(p->decoder->f->pins[0], p->packet);
     p->packet_fed = true;
     p->packet = MP_NO_FRAME;
@@ -1066,6 +1290,8 @@ static void enqueue_backward_frame(struct priv *p, struct mp_frame frame)
 
 static void read_frame(struct priv *p)
 {
+    if (p->pending_passthrough_format)
+        return;
     struct mp_pin *pin = p->decf->ppins[0];
     struct mp_frame frame = {0};
 
@@ -1100,6 +1326,8 @@ static void read_frame(struct priv *p)
     frame = mp_pin_out_read(p->decoder->f->pins[1]);
     if (!frame.type)
         return;
+    bool nonempty_audio = frame.type == MP_FRAME_AUDIO &&
+                          mp_aframe_get_size(frame.data) > 0;
 
     mp_mutex_lock(&p->cache_lock);
     if (p->attached_picture && frame.type == MP_FRAME_VIDEO)
@@ -1121,6 +1349,11 @@ static void read_frame(struct priv *p)
     if (p->preroll_discard && frame.type != MP_FRAME_EOF) {
         double ts = mp_frame_get_pts(frame);
         if (ts == MP_NOPTS_VALUE) {
+            if (p->using_spdif && nonempty_audio) {
+                discard_passthrough_packets(p, p->queued_passthrough_packets,
+                                             p->decoder->passthrough_consumed);
+                p->decoder->passthrough_consumed = 0;
+            }
             mp_frame_unref(&frame);
             mp_filter_internal_mark_progress(p->decf);
             return;
@@ -1130,6 +1363,22 @@ static void read_frame(struct priv *p)
 
     bool segment_ended = process_decoded_frame(p, &frame);
 
+    if (p->using_spdif && frame.type == MP_FRAME_AUDIO &&
+        mp_aframe_get_size(frame.data) > 0)
+    {
+        if (!p->accepted_passthrough_format ||
+            !mp_aframe_config_equals(p->accepted_passthrough_format, frame.data))
+        {
+            p->pending_passthrough_format = mp_aframe_create();
+            talloc_steal(p, p->pending_passthrough_format);
+            mp_aframe_config_copy(p->pending_passthrough_format, frame.data);
+        }
+    } else if (p->using_spdif && nonempty_audio) {
+        discard_passthrough_packets(p, p->queued_passthrough_packets,
+                                     p->decoder->passthrough_consumed);
+        p->decoder->passthrough_consumed = 0;
+    }
+
     if (p->play_dir < 0 && frame.type) {
         enqueue_backward_frame(p, frame);
         frame = MP_NO_FRAME;
@@ -1137,6 +1386,12 @@ static void read_frame(struct priv *p)
 
     // If there's a new segment, start it as soon as we're drained/finished.
     if (segment_ended && p->new_segment) {
+        // The old segment's output can still be waiting for format acceptance
+        // or filtering. Keep its input ownership until it reaches the AO.
+        if (p->using_spdif && p->num_passthrough_outputs) {
+            mp_pin_out_repeat_eof(p->decoder->f->pins[1]);
+            return;
+        }
         struct demux_packet *new_segment = p->new_segment;
         p->new_segment = NULL;
 
@@ -1167,6 +1422,18 @@ static void read_frame(struct priv *p)
 
 output_frame:
     process_output_frame(p, frame);
+    if (p->using_spdif && frame.type == MP_FRAME_AUDIO &&
+        mp_aframe_get_size(frame.data) > 0)
+    {
+        struct mp_aframe *format = talloc_steal(p, mp_aframe_new_ref(frame.data));
+        struct passthrough_output out = {
+            .format = format,
+            .packets = p->decoder->passthrough_consumed,
+        };
+        p->decoder->passthrough_consumed = 0;
+        p->queued_passthrough_packets += out.packets;
+        MP_TARRAY_APPEND(p, p->passthrough_outputs, p->num_passthrough_outputs, out);
+    }
     mp_pin_in_write(pin, frame);
 }
 
@@ -1184,6 +1451,14 @@ static void update_queue_config(struct priv *p)
     mp_async_queue_set_config(p->queue, cfg);
 }
 
+static bool passthrough_decoder_failed(struct priv *p)
+{
+    // Reading the filter failure clears it. Preserve it while emitted access
+    // units still await downstream acceptance, before changing their transport.
+    return p->using_spdif && !p->num_passthrough_outputs &&
+           mp_filter_has_failed(p->decoder->f);
+}
+
 static void decf_process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
@@ -1191,6 +1466,22 @@ static void decf_process(struct mp_filter *f)
 
     if (m_config_cache_update(p->opt_cache))
         update_queue_config(p);
+
+    if (p->using_spdif && p->decoder->passthrough_discarded) {
+        discard_passthrough_packets(p, p->queued_passthrough_packets,
+                                     p->decoder->passthrough_discarded);
+        p->decoder->passthrough_discarded = 0;
+    }
+
+    if (passthrough_decoder_failed(p)) {
+        bool passthrough = fallback_passthrough(p, AF_FORMAT_UNKNOWN, false);
+        MP_VERBOSE(p, "Passthrough preparation failed. Falling back to %s.\n",
+                   passthrough ? "IEC61937" : "PCM decoding");
+        if (!reinit_passthrough(p, false)) {
+            mp_filter_internal_mark_failed(f);
+            return;
+        }
+    }
 
     feed_packet(p);
     read_frame(p);
