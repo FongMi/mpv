@@ -410,6 +410,14 @@ if features['dvdnav']
     test('dvdnav', dvdnav_test)
 endif
 
+dovi_bsf_header = custom_target('dovi-bsf-functions',
+    input: files('../demux/dovi_split.c', '../demux/demux.h'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'dovi_bsf_functions.h',
+    command: [python, files('dovi_bsf.py'), '--generate', '@OUTPUT@'])
+dovi_bsf = executable('dovi-bsf', ['dovi_bsf.c', dovi_bsf_header])
+test('dovi-bsf', dovi_bsf)
+
 disc_segment_headers = custom_target('disc-segment-functions',
     input: files('../demux/demux_disc.c', '../stream/stream.h'),
     output: ['disc_segments_functions.h', 'disc_segment_types.h'],

@@ -65,6 +65,17 @@
  */
 JNIEnv *mp_jni_get_env(struct mp_log *log);
 
+// Hardware decoder support for this video format, as reported by Android.
+// The bit values correspond to P7, P8.1, and HDR10-compatible HEVC.
+enum mp_android_dovi_decoder_support {
+    MP_ANDROID_DOVI_P7 = 1 << 0,
+    MP_ANDROID_DOVI_P81 = 1 << 1,
+    MP_ANDROID_HEVC_MAIN10 = 1 << 2,
+};
+
+int mp_jni_dovi_decoder_support(struct mp_log *log, int width, int height,
+                                double fps);
+
 /*
  * Convert a jstring to its utf characters equivalent.
  *
