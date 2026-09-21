@@ -55,6 +55,14 @@ enum af_format {
     // Raw DSD bitstream, MSBF interleaved.
     AF_FORMAT_DSD,
 
+    // Compressed access units. Payload bytes and decoded sample counts are
+    // independent; these formats cannot be read or sliced as PCM samples.
+    AF_FORMAT_RAW_AC3,
+    AF_FORMAT_RAW_EAC3,
+    AF_FORMAT_RAW_DTS,
+    AF_FORMAT_RAW_DTSHD,
+    AF_FORMAT_RAW_TRUEHD,
+
     AF_FORMAT_COUNT
 };
 
@@ -68,6 +76,7 @@ bool af_fmt_is_float(int format);
 bool af_fmt_is_int(int format);
 bool af_fmt_is_planar(int format);
 bool af_fmt_is_spdif(int format);
+bool af_fmt_is_encoded(int format);
 bool af_fmt_is_pcm(int format);
 
 int af_fmt_to_planar(int format);
