@@ -4201,8 +4201,19 @@ static int access_options(struct m_property_action_arg *ka, bool local,
     case M_PROPERTY_SET: {
         if (local && !mpctx->playing)
             return M_PROPERTY_ERROR;
-        int flags = local ? M_SETOPT_BACKUP : 0;
-        int r = m_config_set_option_raw(mpctx->mconfig, opt, ka->arg, flags);
+        int r;
+        if (opt->data == &mpctx->opts->af_settings ||
+            opt->data == &mpctx->opts->vf_settings)
+        {
+            if (local)
+                m_config_backup_opt(mpctx->mconfig, opt->name);
+            int type = opt->data == &mpctx->opts->af_settings ?
+                       STREAM_AUDIO : STREAM_VIDEO;
+            r = set_filters(mpctx, type, *(struct m_obj_settings **)ka->arg);
+        } else {
+            int flags = local ? M_SETOPT_BACKUP : 0;
+            r = m_config_set_option_raw(mpctx->mconfig, opt, ka->arg, flags);
+        }
         mp_wakeup_core(mpctx);
         return r < 0 ? M_PROPERTY_ERROR : M_PROPERTY_OK;
     }

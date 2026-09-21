@@ -1,4 +1,5 @@
 #include "audio/aframe.h"
+#include "audio/format.h"
 #include "audio/out/ao.h"
 #include "common/global.h"
 #include "common/msg.h"
@@ -51,9 +52,28 @@ struct chain {
 
     struct vo *vo;
     struct ao *ao;
+    bool audio_speed_requires_pcm;
+    bool audio_speed_pending;
+    double audio_speed, audio_resample, audio_drop;
 
     struct mp_output_chain public;
 };
+
+static void apply_audio_speed(struct chain *p);
+
+static bool reject_passthrough(struct chain *p, int format)
+{
+    if ((af_fmt_is_encoded(format) || af_fmt_is_spdif(format)) &&
+        mp_output_chain_requires_pcm(&p->public))
+    {
+        if (!p->public.passthrough_rejected) {
+            p->public.passthrough_rejected = true;
+            mp_filter_wakeup(p->f);
+        }
+        return true;
+    }
+    return false;
+}
 
 // This wraps each individual "actual" filter for:
 //  - isolating against its failure (logging it and disabling the filter)
@@ -142,9 +162,7 @@ static void check_in_format_change(struct mp_user_filter *u,
                        mp_aframe_format_str(aframe));
             mp_aframe_config_copy(u->last_in_aformat, aframe);
 
-            if (u == p->input) {
-                mp_aframe_config_copy(p->public.input_aformat, aframe);
-            } else if (u == p->output) {
+            if (u == p->output) {
                 mp_aframe_config_copy(p->public.output_aformat, aframe);
             }
 
@@ -157,6 +175,9 @@ static void user_wrapper_process(struct mp_filter *f)
 {
     struct mp_user_filter *u = f->priv;
     struct chain *p = u->p;
+
+    if (p->public.passthrough_rejected)
+        return;
 
     mp_filter_set_error_handler(u->f, f);
     const char *name = u->label ? u->label : u->name;
@@ -305,8 +326,26 @@ static void output_chain_process(struct mp_filter *f)
 {
     struct chain *p = f->priv;
 
+    if (p->public.passthrough_rejected)
+        return;
+
     if (mp_pin_can_transfer_data(p->filters_in, f->ppins[0])) {
         struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
+
+        int afmt = frame.type == MP_FRAME_AUDIO ? mp_aframe_get_format(frame.data) : 0;
+        if (reject_passthrough(p, afmt)) {
+            // Reject before a processing filter can buffer or discard the
+            // negotiation frame. The decoder retains its input for PCM replay.
+            mp_pin_out_unread(f->ppins[0], frame);
+            return;
+        }
+
+        if (af_fmt_is_pcm(afmt) && p->audio_speed_pending)
+            apply_audio_speed(p);
+
+        if (frame.type == MP_FRAME_AUDIO &&
+            !mp_aframe_config_equals(p->public.input_aformat, frame.data))
+            mp_aframe_config_copy(p->public.input_aformat, frame.data);
 
         if (frame.type == MP_FRAME_EOF)
             MP_VERBOSE(p, "filter input EOF\n");
@@ -335,6 +374,7 @@ static void output_chain_reset(struct mp_filter *f)
     struct chain *p = f->priv;
 
     p->public.ao_needs_update = false;
+    p->public.passthrough_rejected = false;
 
     p->public.got_output_eof = false;
 }
@@ -357,6 +397,7 @@ void mp_output_chain_reset_harder(struct mp_output_chain *c)
     if (p->type == MP_OUTPUT_CHAIN_AUDIO) {
         p->ao = NULL;
         mp_autoconvert_clear(p->convert);
+        mp_aframe_reset(p->public.input_aformat);
     }
 }
 
@@ -543,6 +584,26 @@ void mp_output_chain_set_audio_speed(struct mp_output_chain *c,
                                      double speed, double resample, double drop)
 {
     struct chain *p = c->f->priv;
+    p->audio_speed_requires_pcm = speed != 1.0 || resample != 1.0 || drop != 1.0;
+    p->audio_speed = speed;
+    p->audio_resample = resample;
+    p->audio_drop = drop;
+    p->audio_speed_pending = true;
+
+    // A compressed tail may already be buffered in the chain, with no next
+    // input frame to reject. Preserve its input ownership and defer commands
+    // until the caller resets the chain and starts PCM replay.
+    reject_passthrough(p, mp_aframe_get_format(c->input_aformat));
+    if (!c->passthrough_rejected)
+        apply_audio_speed(p);
+}
+
+static void apply_audio_speed(struct chain *p)
+{
+    double speed = p->audio_speed;
+    double resample = p->audio_resample;
+    double drop = p->audio_drop;
+    p->audio_speed_pending = false;
 
     // We always resample with the final libavresample instance.
     set_speed_any(p->post_filters, p->num_post_filters,
@@ -558,6 +619,13 @@ void mp_output_chain_set_audio_speed(struct mp_output_chain *c,
                   MP_FILTER_COMMAND_SET_SPEED_DROP, &drop);
     set_speed_any(p->post_filters, p->num_post_filters,
                   MP_FILTER_COMMAND_SET_SPEED_DROP, &drop);
+}
+
+bool mp_output_chain_requires_pcm(struct mp_output_chain *c)
+{
+    struct chain *p = c->f->priv;
+    return p->type == MP_OUTPUT_CHAIN_AUDIO &&
+           (p->num_user_filters > 0 || p->audio_speed_requires_pcm);
 }
 
 double mp_output_get_measured_total_delay(struct mp_output_chain *c)
@@ -650,6 +718,9 @@ bool mp_output_chain_update_filters(struct mp_output_chain *c,
     talloc_free(p->user_filters);
     p->user_filters = res;
     p->num_user_filters = num_res;
+
+    if (p->type == MP_OUTPUT_CHAIN_AUDIO)
+        reject_passthrough(p, mp_aframe_get_format(c->input_aformat));
 
     relink_filter_list(p);
 
