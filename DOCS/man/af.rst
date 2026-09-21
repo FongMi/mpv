@@ -177,7 +177,7 @@ Available filters are:
     have the same values as in chromium.
 
     ``min-speed=<speed>``
-        Mute audio if the playback speed is below ``<speed>``. (default: 0.25)
+        Mute audio if the playback speed is below ``<speed>``. (default: 0.1)
 
     ``max-speed=<speed>``
         Mute audio if the playback speed is above ``<speed>``
