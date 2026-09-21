@@ -1125,8 +1125,8 @@ end
 
 
 -- Determine whether ASS formatting shall/can be used and set formatting sequences
-local function eval_ass_formatting()
-    o.use_ass = o.ass_formatting and has_vo_window()
+local function eval_ass_formatting(plain_text)
+    o.use_ass = not plain_text and o.ass_formatting and has_vo_window()
     if o.use_ass then
         o.nl = o.ass_nl
         o.indent = o.ass_indent
@@ -1166,7 +1166,7 @@ end
 -- header      : table of the header where each entry is one line
 -- content     : table of the content where each entry is one line
 -- apply_scroll: scroll the content
-local function finalize_page(header, content, apply_scroll)
+local function finalize_page(header, content, apply_scroll, plain_text)
     local term_height = mp.get_property_native("term-size/h", 24)
     local from, to = 1, #content
     if apply_scroll then
@@ -1181,7 +1181,7 @@ local function finalize_page(header, content, apply_scroll)
         pages[curr_page].offset = from
     end
     local output = table.concat(header) .. table.concat(content, "", from, to)
-    if not o.use_ass and o.term_clip then
+    if not o.use_ass and o.term_clip and not plain_text then
         local clip = mp.get_property("term-clip-cc")
         local t = split(output, "\n", true)
         output = clip .. table.concat(t, "\n" .. clip)
@@ -1190,16 +1190,24 @@ local function finalize_page(header, content, apply_scroll)
 end
 
 -- Returns an ASS string with "normal" stats
-local function default_stats()
+local function default_stats(_, plain_text)
     local stats = {}
-    eval_ass_formatting()
+    eval_ass_formatting(plain_text)
     add_header(stats)
     add_file(stats, true, false)
     add_video_out(stats)
     add_video(stats)
     add_audio(stats)
-    return finalize_page({}, stats, false)
+    return finalize_page({}, stats, false, plain_text)
 end
+
+-- Let embedding applications display the general page in their own UI without
+-- scaling its text with the video output. This does not toggle the OSD or timers.
+mp.add_key_binding(nil, "export-stats", function()
+    local text = default_stats(nil, true):gsub("\027%[[%d;]*m", "")
+    eval_ass_formatting()
+    mp.set_property_native("user-data/stats", {text = text})
+end)
 
 -- Returns an ASS string with extended VO stats
 local function vo_stats()
