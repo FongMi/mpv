@@ -52,6 +52,7 @@ extern const stream_info_t stream_info_ffmpeg;
 extern const stream_info_t stream_info_ffmpeg_unsafe;
 extern const stream_info_t stream_info_avdevice;
 extern const stream_info_t stream_info_file;
+extern const stream_info_t stream_info_iso;
 extern const stream_info_t stream_info_slice;
 extern const stream_info_t stream_info_aes_ctr;
 extern const stream_info_t stream_info_fd;
@@ -76,6 +77,7 @@ static const stream_info_t *const stream_list[] = {
 #if HAVE_DVBIN
     &stream_info_dvb,
 #endif
+    &stream_info_iso,
 #if HAVE_DVDA
     &stream_info_ifo_dvda,
     &stream_info_dvda,
@@ -990,6 +992,11 @@ bool stream_has_proto(const char *proto)
 {
     for (int i = 0; i < MP_ARRAY_SIZE(stream_list); i++) {
         const stream_info_t *stream_info = stream_list[i];
+
+        // ISO probing wraps a backing stream; it does not own its transport.
+        // In particular, its callback-backed protocol must remain registrable.
+        if (stream_info == &stream_info_iso)
+            continue;
 
         bool match = false;
         char **get_protocols = stream_info->get_protocols ? stream_info->get_protocols() : NULL;
