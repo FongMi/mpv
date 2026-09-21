@@ -62,11 +62,7 @@ struct buffer_state {
     bool hw_paused;             // driver->set_pause() was used successfully
 
     int64_t end_time_ns;        // absolute output time of last played sample
-    int64_t queued_time_ns;     // duration of samples that have been queued to
-                                // the device but have not been played.
-                                // This field is only set in ao_set_paused(),
-                                // and is considered as a temporary solution;
-                                // DO NOT USE IT IN OTHER PLACES.
+    int64_t queued_time_ns;     // remaining device time while a pull AO is paused
 
     // "Push" AOs only (AOs with driver->write).
     bool recover_pause;         // non-hw_paused: needs to recover delay
@@ -232,6 +228,23 @@ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, b
     return pos;
 }
 
+// Read a padded callback buffer unless playback is paused. A driver that
+// preserves its queue on pause must not enqueue silence during the transition
+// from the core's pause state to the hardware pause.
+bool ao_read_data_unpaused(struct ao *ao, void **data, int samples,
+                           int64_t out_time_ns)
+{
+    struct buffer_state *p = ao->buffer_state;
+    mp_mutex_lock(&p->lock);
+    bool read = !p->paused || ao->stream_silence;
+    if (read) {
+        bool eof;
+        ao_read_data_locked(ao, data, samples, out_time_ns, &eof, true);
+    }
+    mp_mutex_unlock(&p->lock);
+    return read;
+}
+
 // Same as ao_read_data(), but convert data according to *fmt.
 // fmt->src_fmt and fmt->channels must be the same as the AO parameters.
 int ao_read_data_converted(struct ao *ao, struct ao_convert_fmt *fmt,
@@ -309,9 +322,9 @@ double ao_get_delay(struct ao *ao)
         get_dev_state(ao, &state);
         driver_delay = state.delay;
     } else {
-        int64_t end = p->end_time_ns;
-        int64_t now = mp_time_ns();
-        driver_delay = MPMAX(0, MP_TIME_NS_TO_S(end - now));
+        int64_t queued = p->hw_paused ? p->queued_time_ns
+                                      : p->end_time_ns - mp_time_ns();
+        driver_delay = MPMAX(0, MP_TIME_NS_TO_S(queued));
     }
 
     int64_t pending = mp_async_queue_get_samples(p->queue);
@@ -420,6 +433,8 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
                 do_change_state = true;
                 p->streaming = false;
                 is_hw_paused = p->hw_paused = !!ao->driver->set_pause;
+                if (is_hw_paused)
+                    p->queued_time_ns = p->end_time_ns - mp_time_ns();
             }
         }
         wakeup = true;
@@ -433,6 +448,8 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
                 do_change_state = true;
             p->streaming = true;
             is_hw_paused = p->hw_paused;
+            if (is_hw_paused)
+                p->end_time_ns = p->queued_time_ns + mp_time_ns();
             p->hw_paused = false;
         }
         wakeup = true;
@@ -442,20 +459,12 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
     mp_mutex_unlock(&p->lock);
 
     if (do_change_state) {
-        if (is_hw_paused) {
-            if (paused) {
-                ao->driver->set_pause(ao, true);
-                p->queued_time_ns = p->end_time_ns - mp_time_ns();
-            } else {
-                p->end_time_ns = p->queued_time_ns + mp_time_ns();
-                ao->driver->set_pause(ao, false);
-            }
-        } else {
-            if (paused)
-                ao->driver->reset(ao);
-            else
-                ao->driver->start(ao);
-        }
+        if (is_hw_paused)
+            ao->driver->set_pause(ao, paused);
+        else if (paused)
+            ao->driver->reset(ao);
+        else
+            ao->driver->start(ao);
     }
 
     if (wakeup)
