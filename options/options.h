@@ -3,8 +3,14 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "mpv/client.h"
 #include "m_option.h"
 #include "common/common.h"
+
+enum android_dolby_vision_output {
+    ANDROID_DOLBY_VISION_OUTPUT_CONFIGURED = 0,
+    ANDROID_DOLBY_VISION_OUTPUT_DIRECT,
+};
 
 typedef struct mp_vo_opts {
     struct m_obj_settings *video_driver_list;
@@ -86,6 +92,12 @@ typedef struct mp_vo_opts {
     int video_sync;
 
     struct m_geometry android_surface_size;
+    struct mpv_node android_surface_frame;
+    int android_dolby_vision_output;
+    int64_t android_osd_wid;
+    bool android_keep_video_frame;
+    bool android_video_surface_transform;
+    struct m_geometry android_osd_surface_size;
 
     struct m_geometry d3d11_composition_size;
 

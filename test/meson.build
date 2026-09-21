@@ -77,6 +77,18 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+android_surface_frame_header = custom_target('android-surface-frame-functions',
+    input: files('../video/out/android_common.c', '../video/out/vo.h',
+                 '../player/command.c', '../video/out/vo.c',
+                 '../video/out/vo_gpu_next.c', '../video/out/vo_mediacodec_embed.c',
+                 '../video/out/opengl/context_android.c'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'android_surface_frame_functions.h',
+    command: [python, files('android_surface_frame.py'), '--generate', '@OUTPUT@'])
+android_surface_frame = executable('android-surface-frame',
+    ['android_surface_frame.c', android_surface_frame_header])
+test('android-surface-frame', android_surface_frame)
+
 chmap_files = [
     'audio/chmap_avchannel.c',
     'audio/chmap_sel.c',
@@ -117,6 +129,22 @@ gl_video = executable('gl-video', 'gl_video.c', objects: gl_video_objects,
                       dependencies: [libavutil, libplacebo], include_directories: incdir,
                       link_with: [img_utils, test_utils])
 test('gl-video', gl_video)
+
+android_osd_source = custom_target('android-osd-contracts-source',
+    input: files('../video/out/android_osd_overlay.c', '../video/out/aspect.c'),
+    output: 'android_osd_contracts.c',
+    command: [python, files('android_osd_overlay.py'), '--generate', '@OUTPUT@'])
+android_osd = executable('android-osd-contracts', android_osd_source,
+                         dependencies: libm)
+test('android-osd-contracts', android_osd)
+
+android_frame_functions = custom_target('android-frame-contracts-functions',
+    input: files('../video/out/vo.c', '../player/playloop.c'),
+    output: 'vo_android_frame_functions.h',
+    command: [python, files('vo_android_frame.py'), '--generate', '@OUTPUT@'])
+android_frame = executable('android-frame-contracts',
+                          ['vo_android_frame.c', android_frame_functions])
+test('android-frame-contracts', android_frame)
 
 json = executable('json', 'json.c', include_directories: [incdir, incdir_public], link_with: test_utils)
 test('json', json)

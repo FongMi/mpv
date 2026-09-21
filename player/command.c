@@ -3123,6 +3123,37 @@ static int mp_property_vo_configured(void *ctx, struct m_property *prop,
                         mpctx->video_out && mpctx->video_out->config_ok);
 }
 
+static int mp_property_android_video_surface_transform(void *ctx,
+    struct m_property *prop, int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    bool active = false;
+    if (mpctx->video_out)
+        vo_control(mpctx->video_out,
+                   VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM, &active);
+    return m_property_bool_ro(action, arg, active);
+}
+
+#if HAVE_ANDROID
+static int mp_property_android_surface_frame(void *ctx, struct m_property *prop,
+                                             int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_STRING};
+        return M_PROPERTY_OK;
+    }
+    if (action != M_PROPERTY_GET)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    struct vo_android_surface_frame frame = {0};
+    if (mpctx->video_out)
+        vo_control(mpctx->video_out, VOCTRL_GET_ANDROID_SURFACE_FRAME, &frame);
+    *(char **)arg = talloc_asprintf(NULL, "%"PRId64":%d:%d",
+                                   frame.token, frame.width, frame.height);
+    return M_PROPERTY_OK;
+}
+#endif
+
 static void get_frame_perf(struct mpv_node *node, struct mp_frame_perf *perf)
 {
     for (int i = 0; i < perf->count; i++) {
@@ -4863,6 +4894,11 @@ static const struct m_property mp_properties_base[] = {
     M_PROPERTY_ALIAS("height", "video-params/h"),
     {"current-window-scale", mp_property_current_window_scale},
     {"vo-configured", mp_property_vo_configured},
+    {"android-video-surface-transform-active",
+        mp_property_android_video_surface_transform},
+#if HAVE_ANDROID
+    {"android-video-surface-frame", mp_property_android_surface_frame},
+#endif
     {"vo-passes", mp_property_vo_passes},
     {"perf-info", mp_property_perf_info},
     {"current-vo", mp_property_vo},
@@ -5012,7 +5048,8 @@ static const char *const *const mp_event_property_change[] = {
       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
       "video-dec-params", "osd-dimensions", "hwdec", "hwdec-current", "hwdec-interop",
-      "window-id", "track-list", "current-tracks"),
+      "window-id", "track-list", "current-tracks",
+      "android-video-surface-transform-active", "android-video-surface-frame"),
     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
       "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",
@@ -5029,7 +5066,8 @@ static const char *const *const mp_event_property_change[] = {
     E(MP_EVENT_WIN_RESIZE, "current-window-scale", "osd-width", "osd-height",
       "osd-par", "osd-dimensions"),
     E(MP_EVENT_WIN_STATE, "display-names", "display-fps", "display-width",
-      "display-height"),
+      "display-height", "android-video-surface-transform-active",
+      "android-video-surface-frame"),
     E(MP_EVENT_WIN_STATE2, "display-hidpi-scale"),
     E(MP_EVENT_FOCUS, "focused"),
     E(MP_EVENT_AMBIENT_LIGHTING_CHANGED, "ambient-light"),
@@ -7546,6 +7584,34 @@ static void cmd_dump_cache_ab(void *p)
                  cmd->args[0].v.s);
 }
 
+#if HAVE_ANDROID
+static void cmd_android_surface_frame(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct MPContext *mpctx = cmd->mpctx;
+    int64_t token = cmd->args[0].v.i64;
+    int w = cmd->args[1].v.i;
+    int h = cmd->args[2].v.i;
+    int64_t wid = mpctx->opts->vo->WinID;
+    if (token <= 0 || w <= 0 || h <= 0 || wid == 0 || wid == -1) {
+        cmd->success = false;
+        return;
+    }
+    // One cache update binds the resize to its token and the current Surface.
+    // A VO created later inherits the same request.
+    struct mpv_node values[] = {
+        {.format = MPV_FORMAT_INT64, .u.int64 = token},
+        {.format = MPV_FORMAT_INT64, .u.int64 = wid},
+        {.format = MPV_FORMAT_INT64, .u.int64 = w},
+        {.format = MPV_FORMAT_INT64, .u.int64 = h},
+    };
+    struct mpv_node_list list = {.num = 4, .values = values};
+    struct mpv_node request = {.format = MPV_FORMAT_NODE_ARRAY, .u.list = &list};
+    cmd->success = m_config_set_option_node(mpctx->mconfig,
+        bstr0("android-surface-frame"), &request, 0) >= 0;
+}
+#endif
+
 static void cmd_begin_vo_dragging(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -8211,6 +8277,11 @@ const struct mp_cmd_def mp_cmds[] = {
     { "flush-status-line", cmd_flush_status_line, { {"clear", OPT_BOOL(v.b)} } },
 
     { "notify-property", cmd_notify_property, { {"property", OPT_STRING(v.s)} } },
+#if HAVE_ANDROID
+    { "android-surface-frame", cmd_android_surface_frame,
+        { {"token", OPT_INT64(v.i64)}, {"width", OPT_INT(v.i)},
+          {"height", OPT_INT(v.i)} } },
+#endif
 
     {0}
 };
@@ -8472,6 +8543,118 @@ void mp_option_change_callback(void *ctx, struct m_config_option *co, uint64_t f
     }
 }
 
+// Return whether this replaces the video chain. UPDATE_HWDEC must not
+// reinitialize the new decoder a second time.
+static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
+                                bool hwdec_changed)
+{
+    struct MPOpts *opts = mpctx->opts;
+    bool update_window = opt_ptr == &opts->vo->WinID;
+    bool update_android_osd =
+        opt_ptr == &opts->vo->android_osd_wid;
+    bool update_dovi_output =
+        opt_ptr == &opts->vo->android_dolby_vision_output;
+    if (update_window || update_android_osd || update_dovi_output ||
+        hwdec_changed)
+        mpctx->android_dolby_vision_direct_failed_track = NULL;
+
+    struct track *video_track = mpctx->current_track[0][STREAM_VIDEO];
+    bool should_use_dovi_direct =
+        should_use_android_dolby_vision_direct_output(mpctx, video_track);
+    bool wants_dovi_direct =
+        should_use_dovi_direct ||
+        wants_android_dolby_vision_direct_output(mpctx, video_track);
+    bool dovi_direct_active =
+        is_android_dolby_vision_direct_output_active(mpctx);
+    bool video_surface_ready =
+        opts->vo->WinID != 0 && opts->vo->WinID != -1;
+    bool osd_surface_ready =
+        opts->vo->android_osd_wid != 0 &&
+        opts->vo->android_osd_wid != -1;
+    bool video_chain_reinitialized = false;
+
+    bool restore_video =
+        video_track &&
+        (update_window || update_dovi_output || hwdec_changed ||
+         (update_android_osd && wants_dovi_direct));
+
+    // The VO can outlive a failed decoder. Restore its selected track when
+    // applying a new decoding or output policy, once its Surfaces are ready.
+    if (!mpctx->video_out || (!mpctx->vo_chain && restore_video)) {
+        bool wait_for_dovi_surfaces =
+            wants_dovi_direct && !should_use_dovi_direct;
+        if (video_surface_ready && !wait_for_dovi_surfaces) {
+            if (restore_video) {
+                double resume_pts = get_current_time(mpctx);
+                reinit_video_chain(mpctx);
+                video_chain_reinitialized = mpctx->vo_chain != NULL;
+                if (mpctx->vo_chain && resume_pts != MP_NOPTS_VALUE) {
+                    queue_seek(mpctx, MPSEEK_ABSOLUTE, resume_pts,
+                               MPSEEK_EXACT, 0);
+                    execute_queued_seek(mpctx);
+                }
+            } else if (!video_track && update_window) {
+                handle_force_window(mpctx, true);
+            }
+        }
+        mp_wakeup_core(mpctx);
+        return video_chain_reinitialized;
+    }
+
+    if (update_window && dovi_direct_active && !video_surface_ready) {
+        MP_VERBOSE(mpctx, "Direct Dolby Vision video Surface detached; "
+                           "stopping MediaCodec output.\n");
+        uninit_video_out(mpctx);
+        mp_wakeup_core(mpctx);
+        return false;
+    }
+
+    bool update_vo_in_place =
+        update_window || update_android_osd;
+    bool reselect_dovi_output =
+        (update_window || update_android_osd || update_dovi_output ||
+         hwdec_changed) &&
+        dovi_direct_active != should_use_dovi_direct;
+    bool dovi_output_unchanged =
+        update_dovi_output &&
+        dovi_direct_active == should_use_dovi_direct;
+    bool rebuild_video_out =
+        reselect_dovi_output ||
+        (!hwdec_changed &&
+         !dovi_output_unchanged &&
+         (!update_vo_in_place ||
+          vo_control(mpctx->video_out, VOCTRL_UPDATE_WINDOW, NULL) <= 0));
+
+    if (rebuild_video_out) {
+        bool wait_for_dovi_surfaces =
+            wants_dovi_direct &&
+            (!video_surface_ready || !osd_surface_ready);
+        if (!wait_for_dovi_surfaces) {
+            double last_pts = mpctx->video_pts;
+            struct mp_decoder_wrapper *dec =
+                video_track ? video_track->dec : NULL;
+            if (dec && last_pts != MP_NOPTS_VALUE) {
+                mp_decoder_wrapper_suspend(dec);
+                queue_seek(mpctx, MPSEEK_ABSOLUTE, last_pts,
+                           MPSEEK_EXACT, 0);
+                execute_queued_seek(mpctx);
+            }
+        }
+        uninit_video_out(mpctx);
+        if (!wait_for_dovi_surfaces) {
+            if (video_track)
+                reinit_video_chain(mpctx);
+            else
+                handle_force_window(mpctx, true);
+            video_chain_reinitialized =
+                video_track != NULL && mpctx->vo_chain != NULL;
+        }
+    }
+
+    mp_wakeup_core(mpctx);
+    return video_chain_reinitialized;
+}
+
 void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *callback)
 {
     struct MPOpts *opts = mpctx->opts;
@@ -8520,15 +8703,15 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
         mpctx->ipc_ctx = mp_init_ipc(mpctx->clients, mpctx->global);
     }
 
-    if (flags & UPDATE_VO && mpctx->video_out) {
-        struct track *track = mpctx->current_track[0][STREAM_VIDEO];
-        uninit_video_out(mpctx);
-        handle_force_window(mpctx, true);
-        reinit_video_chain(mpctx);
-        if (track)
-            queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
-
-        mp_wakeup_core(mpctx);
+    bool video_chain_reinitialized = false;
+    if (flags & UPDATE_VO) {
+        video_chain_reinitialized =
+            update_video_output(mpctx, opt_ptr, !!(flags & UPDATE_HWDEC));
+#if HAVE_ANDROID
+    } else if (flags & UPDATE_HWDEC) {
+        video_chain_reinitialized =
+            update_video_output(mpctx, opt_ptr, true);
+#endif
     }
 
     if (flags & UPDATE_AUDIO)
@@ -8556,14 +8739,21 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
     if (flags & UPDATE_HWDEC) {
         struct track *track = mpctx->current_track[0][STREAM_VIDEO];
         struct mp_decoder_wrapper *dec = track ? track->dec : NULL;
-        if (dec) {
+        if (dec && !video_chain_reinitialized) {
+            double last_pts = mpctx->video_pts;
+            bool seek_decoder = last_pts != MP_NOPTS_VALUE;
+            if (seek_decoder) {
+                mp_decoder_wrapper_suspend(dec);
+                queue_seek(mpctx, MPSEEK_ABSOLUTE, last_pts, MPSEEK_EXACT, 0);
+                execute_queued_seek(mpctx);
+            }
             mp_decoder_wrapper_control(dec, VDCTRL_REINIT, NULL);
+            update_vo_chain_el_state(mpctx);
+            if (seek_decoder)
+                mp_decoder_wrapper_resume(dec);
             // filter chain might not change (which normally triggers this), but
             // hwdec will.
             mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
-            double last_pts = mpctx->video_pts;
-            if (last_pts != MP_NOPTS_VALUE)
-                queue_seek(mpctx, MPSEEK_ABSOLUTE, last_pts, MPSEEK_EXACT, 0);
         }
     }
 
@@ -8588,10 +8778,19 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
             queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
     }
 
-    if (opt_ptr == &opts->vo->android_surface_size || opt_ptr == &opts->vo->d3d11_composition_size) {
-        if (mpctx->video_out)
+    if (opt_ptr == &opts->vo->android_surface_size ||
+        opt_ptr == &opts->vo->android_surface_frame ||
+        opt_ptr == &opts->vo->d3d11_composition_size)
+    {
+        if (mpctx->video_out) {
             vo_control(mpctx->video_out, VOCTRL_EXTERNAL_RESIZE, NULL);
+            if (opt_ptr == &opts->vo->android_surface_frame)
+                vo_redraw(mpctx->video_out);
+        }
     }
+
+    if (opt_ptr == &opts->vo->android_osd_surface_size && mpctx->video_out)
+        vo_control(mpctx->video_out, VOCTRL_UPDATE_OSD_SIZE, NULL);
 
     if (opt_ptr == &opts->input_commands) {
         mpctx->command_ctx->command_opts_processed = false;
