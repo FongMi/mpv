@@ -669,6 +669,7 @@ struct mp_scripting {
 bool mp_load_scripts(struct MPContext *mpctx);
 void mp_load_builtin_scripts(struct MPContext *mpctx);
 int64_t mp_load_user_script(struct MPContext *mpctx, const char *fname);
+bool mp_unload_script(struct MPContext *mpctx, int64_t client_id);
 
 // sub.c
 void redraw_subs(struct MPContext *mpctx);
