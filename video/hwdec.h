@@ -18,6 +18,10 @@ struct mp_conversion_filter {
 struct mp_hwdec_ctx {
     const char *driver_name; // NULL if unknown/not loaded
 
+    // The mapped hardware frames preserve raw Dolby Vision samples for the
+    // renderer to reshape with per-frame metadata.
+    bool supports_gpu_dovi_mapping;
+
     // libavutil-wrapped context, if available.
     struct AVBufferRef *av_device_ref; // AVHWDeviceContext*
 
