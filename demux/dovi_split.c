@@ -83,7 +83,9 @@ struct mp_dovi_split *mp_dovi_split_create(struct demuxer *demuxer,
     }
     s->bsf->time_base_in = mp_get_codec_timebase(bl->codec);
 
-    if (av_opt_set(s->bsf, "mode", "el", AV_OPT_SEARCH_CHILDREN) < 0)
+    // The enhancement pairing filter inherits Dolby Vision metadata from the
+    // decoded EL frame, so the companion stream must retain its RPU.
+    if (av_opt_set(s->bsf, "mode", "el_rpu", AV_OPT_SEARCH_CHILDREN) < 0)
         goto fail;
     if (av_bsf_init(s->bsf) < 0)
         goto fail;
