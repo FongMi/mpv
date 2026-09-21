@@ -136,6 +136,9 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
                 continue;
             }
             p->pending = frame.data;
+            // A new audio frame resumes the stream after an EOF marker,
+            // including when returning an entire frame to a packet writer.
+            *eof = false;
         }
 
         if (!data)
@@ -156,9 +159,11 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
     if (!data) {
         if (!p->pending)
             return 0;
-        void **pd = (void *)mp_aframe_get_data_rw(p->pending);
-        if (pd)
-            ao_post_process_data(ao, pd, mp_aframe_get_size(p->pending));
+        if (!af_fmt_is_encoded(ao->format)) {
+            void **pd = (void *)mp_aframe_get_data_rw(p->pending);
+            if (pd)
+                ao_post_process_data(ao, pd, mp_aframe_get_size(p->pending));
+        }
         return 1;
     }
 
@@ -345,6 +350,7 @@ void ao_reset(struct ao *ao)
     p->playing = false;
     p->recover_pause = false;
     p->hw_paused = false;
+    p->prepause_state = (struct mp_pcm_state){0};
     p->end_time_ns = 0;
 
     mp_mutex_unlock(&p->lock);
@@ -644,7 +650,6 @@ static bool ao_play_data(struct ao *ao)
     int samples = 0;
     bool got_eof = false;
     if (ao->driver->write_frames) {
-        TA_FREEP(&p->pending);
         samples = read_buffer(ao, NULL, 1, &got_eof, false);
         planes = (void **)&p->pending;
     } else {
@@ -672,6 +677,8 @@ static bool ao_play_data(struct ao *ao)
         MP_STATS(ao, "start ao fill");
         if (!ao->driver->write(ao, planes, samples))
             MP_ERR(ao, "Error writing audio to device.\n");
+        if (ao->driver->write_frames)
+            TA_FREEP(&p->pending);
         MP_STATS(ao, "end ao fill");
 
         if (!p->streaming) {
@@ -685,10 +692,16 @@ static bool ao_play_data(struct ao *ao)
     MP_TRACE(ao, "in=%d space=%d(%d) pl=%d, eof=%d\n",
              samples, space, state.free_samples, p->playing, got_eof);
 
-    if (got_eof)
+    if (got_eof) {
+        if (ao->driver->drain)
+            ao->driver->drain(ao);
         goto eof;
+    }
 
-    return samples > 0 && (samples < space || ao->untimed);
+    // Frame-based writers report access units, not their duration. Keep
+    // feeding them until they report backpressure instead of waiting a full
+    // polling interval after every (potentially very short) access unit.
+    return samples > 0 && (ao->driver->write_frames || samples < space || ao->untimed);
 
 eof:
     MP_VERBOSE(ao, "audio end or underrun\n");
@@ -720,7 +733,8 @@ static MP_THREAD_VOID ao_thread(void *arg)
             // Wake up again if half of the audio buffer has been played.
             // Since audio could play at a faster or slower pace, wake up twice
             // as often as ideally needed.
-            timeout = MP_TIME_S_TO_NS(ao->device_buffer / (double)ao->samplerate * 0.25);
+            timeout = ao->poll_interval_ns ? ao->poll_interval_ns :
+                MP_TIME_S_TO_NS(ao->device_buffer / (double)ao->samplerate * 0.25);
         }
 
         mp_mutex_unlock(&p->lock);
