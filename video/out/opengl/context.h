@@ -17,6 +17,9 @@ enum gles_mode ra_gl_ctx_get_glesmode(struct ra_ctx *ctx);
 void ra_gl_ctx_uninit(struct ra_ctx *ctx);
 bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_ctx_params params);
 
+// The configured swap interval, for backends that replace their drawing surface.
+int ra_gl_ctx_get_swap_interval(struct ra_swapchain *sw);
+
 // Call this any time the window size or main framebuffer changes
 void ra_gl_ctx_resize(struct ra_swapchain *sw, int w, int h, int fbo);
 
