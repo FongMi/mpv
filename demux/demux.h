@@ -99,6 +99,7 @@ struct demux_opts {
 #define SEEK_HR       (1 << 5)      // hr-seek (this is a weak hint only)
 #define SEEK_BLOCK    (1 << 6)      // upon successfully queued seek, block readers
                                     // (simplifies syncing multiple reader threads)
+#define SEEK_NAV      (1 << 7)      // acknowledge a disc navigation jump
 
 // Strictness of the demuxer open format check.
 // demux.c will try by default: NORMAL, UNSAFE (in this order)
@@ -122,6 +123,7 @@ enum demux_event {
     DEMUX_EVENT_METADATA = 1 << 2,  // metadata or stream_metadata changed
     DEMUX_EVENT_DURATION = 1 << 3,  // duration updated
     DEMUX_EVENT_LISTS = 1 << 4,     // chapters / editions list changed
+    DEMUX_EVENT_FAILED = 1 << 7,    // unrecoverable demuxer failure
     DEMUX_EVENT_ALL = 0xFFFF,
 };
 
@@ -248,6 +250,7 @@ typedef struct demuxer {
     bool fully_read;
     bool is_network; // opened directly from a network stream
     bool is_streaming; // implies a "slow" input, such as network or FUSE
+    bool failed; // terminal failure; synchronized by demux_update()
     int stream_origin; // any STREAM_ORIGIN_* (set from source stream)
     bool access_references; // allow opening other files/URLs
     int depth; // demuxer depth, 0 for top-level
@@ -317,6 +320,7 @@ int demux_get_num_stream(struct demuxer *demuxer);
 
 struct sh_stream *demux_alloc_sh_stream(enum stream_type type);
 void demux_add_sh_stream(struct demuxer *demuxer, struct sh_stream *sh);
+void demux_set_failed(struct demuxer *demuxer);
 
 struct mp_cancel;
 struct demuxer *demux_open_url(const char *url,

@@ -55,6 +55,13 @@ struct sh_stream {
     // FFmpeg stream index (AVFormatContext.streams[index]), or equivalent.
     int ff_index;
 
+    // DVD logical aliases have a stable identity and codec-qualified PES ID.
+    // The demux thread publishes the current catalog generation atomically;
+    // zero retires this alias. Other streams leave dvd_nav_stream false.
+    bool dvd_nav_stream;
+    int dvd_nav_logical, dvd_nav_id;
+    _Atomic uint64_t dvd_nav_generation;
+
     struct mp_codec_params *codec;
 
     char *title;
