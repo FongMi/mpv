@@ -201,6 +201,26 @@ gl_video = executable('gl-video', 'gl_video.c', objects: gl_video_objects,
                       link_with: [img_utils, test_utils])
 test('gl-video', gl_video)
 
+gpu_dumb_headers = custom_target('gpu-dumb-headers',
+    input: files('../video/out/gpu/video.c', '../video/out/gpu/utils.c',
+                 '../video/out/gpu/utils.h'),
+    depend_files: files('vo_android_frame.py'),
+    output: ['vo_gpu_dumb_functions.h', 'vo_gpu_dumb_types.h'],
+    command: [python, files('vo_gpu_dumb.py'), '--generate', '@OUTPUT0@'])
+gpu_dumb = executable('gpu-dumb', ['vo_gpu_dumb.c', gpu_dumb_headers],
+                      dependencies: libm)
+test('gpu-dumb', gpu_dumb)
+
+gpu_next_headers = custom_target('gpu-next-mapping-headers',
+    input: files('../video/mp_image.h', '../video/out/gpu/hwdec.h',
+                 '../video/mp_image.c', '../video/out/vo_gpu_next.c'),
+    output: ['vo_gpu_next_contracts.h', 'vo_gpu_next_functions.h'],
+    command: [python, files('vo_gpu_next.py'), '--mpv', source_root,
+              '--generate', '@OUTPUT0@', '@OUTPUT1@'])
+gpu_next_mapping = executable('gpu-next-mapping',
+                              ['vo_gpu_next.c', gpu_next_headers])
+test('gpu-next-mapping', gpu_next_mapping)
+
 android_osd_source = custom_target('android-osd-contracts-source',
     input: files('../video/out/android_osd_overlay.c', '../video/out/aspect.c',
                  '../player/command.c', '../sub/osd.c', '../sub/sd_ass.c',
