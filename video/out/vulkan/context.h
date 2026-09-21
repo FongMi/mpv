@@ -8,6 +8,12 @@ void ra_vk_ctx_uninit(struct ra_ctx *ctx);
 bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
                     struct ra_ctx_params params,
                     VkPresentModeKHR preferred_mode);
+bool ra_vk_ctx_has_surface(struct ra_ctx *ctx);
+// Destroys the active surface/swapchain, but keeps the Vulkan device alive.
+bool ra_vk_ctx_detach_surface(struct ra_ctx *ctx);
+// Takes ownership of surface on success. The caller owns it on failure.
+bool ra_vk_ctx_replace_surface(struct ra_ctx *ctx, VkSurfaceKHR surface,
+                               VkPresentModeKHR preferred_mode);
 
 // Helper for initializing mpvk_ctx->vulkan
 pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,

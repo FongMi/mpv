@@ -193,9 +193,6 @@ struct gl_next_opts {
     struct user_lut lut;
     struct user_lut image_lut;
     struct user_lut target_lut;
-    int target_hint;
-    int target_hint_mode;
-    bool target_hint_strict;
     char **raw_opts;
 };
 
@@ -239,9 +236,6 @@ const struct m_sub_options gl_next_conf = {
         {"image-lut", OPT_STRING(image_lut.opt), .flags = M_OPT_FILE},
         {"image-lut-type", OPT_CHOICE_C(image_lut.type, lut_types)},
         {"target-lut", OPT_STRING(target_lut.opt), .flags = M_OPT_FILE},
-        {"target-colorspace-hint", OPT_CHOICE(target_hint, {"auto", -1}, {"no", 0}, {"yes", 1})},
-        {"target-colorspace-hint-mode", OPT_CHOICE(target_hint_mode, {"target", 0}, {"source", 1}, {"source-dynamic", 2})},
-        {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -252,8 +246,6 @@ const struct m_sub_options gl_next_conf = {
         .background_blur_radius = 16.0f,
         .inter_preserve = true,
         .image_subs_hdr_peak = 1000,
-        .target_hint = -1,
-        .target_hint_strict = true,
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -1437,76 +1429,19 @@ enum mppl_video_hint mppl_video_get_target_hint(struct mppl_video *p, struct vo_
                                                 struct pl_color_space *out_hint)
 {
     const struct gl_video_opts *opts = p->opts_cache->opts;
-    bool target_unknown;
-    float target_ref_luma;
-    struct pl_color_space target_csp = get_target_csp(p, &target_unknown, &target_ref_luma);
-
+    struct pl_color_space target_csp = p->display_csp;
+    float target_ref_luma = target_csp.transfer == PL_COLOR_TRC_UNKNOWN
+                          ? 0 : get_ref_luma(p);
+    const struct pl_color_space *source =
+        frame->current ? &frame->current->params.color : NULL;
     struct pl_color_space hint = {0};
-    bool target_hint = p->next_opts->target_hint == 1 ||
-                       (p->next_opts->target_hint == -1 && !target_unknown);
-    if (target_hint && frame->current) {
-        const struct pl_color_space *source = &frame->current->params.color;
-        const struct pl_color_space *target = &target_csp;
-        hint = *source;
-        // Apply target contrast to the hint, this is important for SDR, because
-        // libplacebo defaults to 1000:1 contrast ratio otherwise.
-        if (!hint.hdr.min_luma)
-            hint.hdr.min_luma = target->hdr.min_luma;
-        if (p->next_opts->target_hint_mode == 0) {
-            hint = *target;
-            if (pl_color_transfer_is_hdr(hint.transfer) && !pl_primaries_valid(&hint.hdr.prim))
-                pl_color_space_merge(&hint, source);
-            if (target_unknown && !opts->target_trc && !pl_color_transfer_is_hdr(source->transfer))
-                hint = *source;
-            // Restore target luminance if it was present, note that we check
-            // max_luma only, this make sure that max_cll/max_fall is not take
-            // from source.
-            if (target->hdr.max_luma) {
-                hint.hdr.max_luma = target->hdr.max_luma;
-                hint.hdr.min_luma = target->hdr.min_luma;
-                hint.hdr.max_cll  = target->hdr.max_cll;
-                hint.hdr.max_fall = target->hdr.max_fall;
-            }
-        }
-        if (p->next_opts->target_hint_mode == 2) { // source-dynamic
-            pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
-                .color      = &hint,
-                .metadata   = PL_HDR_METADATA_ANY,
-                .scaling    = PL_HDR_NITS,
-                .out_min    = !hint.hdr.min_luma ? &hint.hdr.min_luma : NULL,
-                .out_max    = &hint.hdr.max_luma,
-            ));
-            // Set maxCLL to dynamic max luminance. Note that libplacebo uses
-            // max luminace as maxCLL in practice.
-            hint.hdr.max_cll = hint.hdr.max_luma;
-            // Keep maxFALL from static metadata, unless its value is too high.
-            // Could be set to 0, but let's keep it for now.
-            if (hint.hdr.max_fall > hint.hdr.max_cll)
-                hint.hdr.max_fall = 0;
-        }
-        // Infer missing bits now. This is important so that we don't lose
-        // information after user option overrides. For example, if the user
-        // sets target_trc to PQ, but the hint(source) is SDR, we want to fill
-        // in SDR luminance values instead of the default PQ range.
-        struct pl_color_space source_csp = *source;
-        bool min_luma_known = hint.hdr.min_luma > 0;
-        pl_color_space_infer_map(&source_csp, &hint);
-        // Always prefer target luminance and transfer for inverse tone mapping
-        if (pl_color_transfer_is_hdr(target->transfer) && opts->tone_map.inverse) {
-            hint.transfer     = target->transfer;
-            hint.hdr.max_luma = target->hdr.max_luma;
-            hint.hdr.min_luma = target->hdr.min_luma;
-            hint.hdr.max_cll  = target->hdr.max_cll;
-            hint.hdr.max_fall = target->hdr.max_fall;
-        }
-        if (opts->target_prim)
-            hint.primaries = opts->target_prim;
+    bool min_luma_known = false;
+    enum gl_target_hint_status hint_status = gl_video_prepare_target_hint(
+        opts, source, &target_csp, p->ra_ctx->supports_auto_colorspace_hint,
+        &hint, &min_luma_known);
+    if (hint_status == GL_TARGET_HINT_VALID) {
         if (opts->target_gamut)
             mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &hint.hdr.prim);
-        if (opts->target_trc)
-            hint.transfer = opts->target_trc;
-        if (opts->target_peak)
-            hint.hdr.max_luma = opts->target_peak;
         if (target_ref_luma && use_ref_luma(&hint, &target_csp))
             hint.hdr.max_luma = target_ref_luma;
         // The SDR black point was inferred from the peak known before the
@@ -1549,7 +1484,8 @@ enum mppl_video_hint mppl_video_get_target_hint(struct mppl_video *p, struct vo_
         return MPPL_VIDEO_HINT_SET;
     }
 
-    return target_hint ? MPPL_VIDEO_HINT_KEEP : MPPL_VIDEO_HINT_NONE;
+    return hint_status == GL_TARGET_HINT_NO_SOURCE
+           ? MPPL_VIDEO_HINT_KEEP : MPPL_VIDEO_HINT_NONE;
 }
 
 bool mppl_video_get_hdr_metadata(struct mppl_video *p, struct pl_hdr_metadata *out)
@@ -1598,7 +1534,7 @@ bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
     // Calculate target
     struct pl_frame target;
     pl_frame_from_swapchain(&target, swframe);
-    bool strict_sw_params = hint && p->next_opts->target_hint_strict;
+    bool strict_sw_params = hint && opts->target_hint_strict;
     apply_target_options(p, &target, hint ? hint->hdr.min_luma : target_csp.hdr.min_luma,
                          strict_sw_params, target_ref_luma, &target_csp);
     bool clip_gamut = pl_primaries_valid(&target.color.hdr.prim);

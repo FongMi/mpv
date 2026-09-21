@@ -42,12 +42,23 @@ struct priv {
     struct mp_image_params target_params;
 };
 
+static pl_swapchain get_active_swapchain(struct priv *p)
+{
+    pl_swapchain sw;
+    return ra_ctx_get_pl_swapchain(p->ra_ctx, &sw) ? sw : p->sw;
+}
+
 static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
 {
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    pl_swapchain pl_sw = get_active_swapchain(p);
+    if (!hint) {
+        ra_swapchain_set_color(sw, pl_sw, NULL);
+        return false;
+    }
 
     struct mp_image_params params = {
-        .color = hint ? *hint : pl_color_space_srgb,
+        .color = *hint,
         .repr = {
             .sys = PL_COLOR_SYSTEM_RGB,
             .levels = mppl_video_get_output_levels(p->renderer),
@@ -55,14 +66,11 @@ static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
         },
     };
 
-    if (sw->fns->set_color && sw->fns->set_color(sw, hint ? &params : NULL)) {
-        if (hint) {
-            *hint = params.color;
-            return true;
-        }
-    }
-    pl_swapchain_colorspace_hint(p->sw, hint);
-    return false;
+    enum ra_color_hint_result result = ra_swapchain_set_color(
+        sw, pl_sw, &params);
+    if (result == RA_COLOR_HINT_EXTERNAL)
+        *hint = params.color;
+    return result == RA_COLOR_HINT_EXTERNAL;
 }
 
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -88,7 +96,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     struct pl_swapchain_frame swframe;
     bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
-    if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
+    pl_swapchain pl_sw = get_active_swapchain(p);
+    if (!pl_sw || !should_draw || !pl_swapchain_start_frame(pl_sw, &swframe)) {
         mppl_video_skip_frame(p->renderer, frame);
         return VO_FALSE;
     }
@@ -125,7 +134,8 @@ static void flip_page(struct vo *vo)
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
 
     if (p->frame_pending) {
-        if (!pl_swapchain_submit_frame(p->sw))
+        pl_swapchain pl_sw = get_active_swapchain(p);
+        if (pl_sw && !pl_swapchain_submit_frame(pl_sw))
             MP_ERR(vo, "Failed presenting frame!\n");
         p->frame_pending = false;
     }
