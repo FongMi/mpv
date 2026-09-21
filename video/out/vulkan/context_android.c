@@ -83,6 +83,13 @@ static bool android_init(struct ra_ctx *ctx)
 
     struct ra_ctx_params params = {
         .check_visible = android_check_visible,
+        // Rotated SurfaceViews may stay suboptimal even after recreation.
+        // surfaceChanged drives explicit resizes through android_reconfig.
+        .allow_suboptimal = true,
+        // Storage-capable 10-bit swapchains can prevent hardware composition
+        // when Android applies a display rotation. Keep the presentation image
+        // renderable and blit-capable so the driver may choose a tiled layout.
+        .disable_swapchain_storage = true,
     };
 
     vk->surface = android_create_surface(ctx, vo_android_native_window(ctx->vo),
