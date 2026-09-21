@@ -278,6 +278,7 @@ static char **get_safe_protocols(void)
         if (strcmp("rtsp", ffmpeg_demuxers[i]) == 0) {
             MP_TARRAY_APPEND(NULL, protocols, num, talloc_strdup(protocols, "rtsp"));
             MP_TARRAY_APPEND(NULL, protocols, num, talloc_strdup(protocols, "rtsps"));
+            MP_TARRAY_APPEND(NULL, protocols, num, talloc_strdup(protocols, "rtspt"));
             break;
         }
     }
@@ -491,6 +492,20 @@ static bool normalize_data_uri_for_lavf(stream_t *stream, void *ta_parent,
     return true;
 }
 
+static void normalize_rtspt_url(stream_t *stream, void *ta_parent,
+                                const char **filename)
+{
+    bstr rest;
+    bstr proto = mp_split_proto(bstr0(*filename), &rest);
+    if (bstrcasecmp0(proto, "rtspt") != 0)
+        return;
+
+    char *normalized = talloc_asprintf(ta_parent, "rtsp://%.*s", BSTR_P(rest));
+    *filename = normalized;
+    stream->lavf_force_rtsp_tcp = true;
+    set_stream_url(stream, normalized);
+}
+
 static int open_f(stream_t *stream)
 {
     AVIOContext *avio = NULL;
@@ -520,6 +535,7 @@ static int open_f(stream_t *stream)
     }
     if (!normalize_data_uri_for_lavf(stream, temp, &filename))
         goto out;
+    normalize_rtspt_url(stream, temp, &filename);
 
     // URLs that libavformat handles in a demuxer rather than in a protocol.
     // The demuxer opens the URL itself, so there is no stream layer and
