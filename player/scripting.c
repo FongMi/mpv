@@ -208,6 +208,15 @@ int64_t mp_load_user_script(struct MPContext *mpctx, const char *fname)
     return ret;
 }
 
+bool mp_unload_script(struct MPContext *mpctx, int64_t client_id)
+{
+    if (client_id <= 0)
+        return false;
+
+    char *name = mp_tprintf(22, "@%"PRIi64, client_id);
+    return mp_client_send_event(mpctx, name, 0, MPV_EVENT_SHUTDOWN, NULL) >= 0;
+}
+
 static int compare_filename(const void *pa, const void *pb)
 {
     char *a = (char *)pa;
@@ -251,9 +260,8 @@ static void load_builtin_script(struct MPContext *mpctx, int slot, bool enable,
         if (enable) {
             *pid = mp_load_script(mpctx, fname);
         } else {
-            char *name = mp_tprintf(22, "@%"PRIi64, *pid);
             MP_DBG(mpctx, "Unloading script %s (disabled by option)\n", fname);
-            mp_client_send_event(mpctx, name, 0, MPV_EVENT_SHUTDOWN, NULL);
+            mp_unload_script(mpctx, *pid);
             // note: there is no synchronization of script exit
         }
     }
