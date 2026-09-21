@@ -215,13 +215,16 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
     ao->init_flags = flags;
     if (ao->driver->encode != !!ao->encode_lavc_ctx)
         goto fail;
+    if (af_fmt_is_encoded(format) && !ao->driver->accepts_encoded)
+        goto fail;
 
     MP_VERBOSE(ao, "requested format: %d Hz, %s channels, %s\n",
                ao->samplerate, mp_chmap_to_str(&ao->channels),
                af_fmt_to_str(ao->format));
 
     ao->device = talloc_strdup(ao, dev);
-    ao->stream_silence = flags & AO_INIT_STREAM_SILENCE;
+    ao->stream_silence = (flags & AO_INIT_STREAM_SILENCE) &&
+                        !af_fmt_is_encoded(format);
 
     init_buffer_pre(ao);
 
@@ -250,7 +253,7 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
     }
     ao->bps = (int64_t)ao->samplerate * ao->sstride;
 
-    if (ao->device_buffer <= 0 && ao->driver->write) {
+    if (ao->device_buffer <= 0 && ao->driver->write && !ao->poll_interval_ns) {
         MP_ERR(ao, "Device buffer size not set.\n");
         goto fail;
     }

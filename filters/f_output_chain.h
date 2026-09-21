@@ -42,6 +42,10 @@ struct mp_output_chain {
     // reference. The API user needs to call mp_output_chain_set_ao() again.
     // Until this is done, the filter chain will not output new data.
     bool ao_needs_update;
+    // Requested processing requires PCM while compressed audio is at the
+    // input or already buffered in the chain. Processing is suspended until
+    // the user renegotiates decoding and resets the chain for PCM replay.
+    bool passthrough_rejected;
 };
 
 // (free by freeing mp_output_chain.f)
@@ -78,6 +82,9 @@ bool mp_output_chain_update_filters(struct mp_output_chain *p,
 // Desired audio speed, with resample being strict resampling.
 void mp_output_chain_set_audio_speed(struct mp_output_chain *p,
                                      double speed, double resample, double drop);
+
+// Whether enabled user filters or requested speed processing require PCM.
+bool mp_output_chain_requires_pcm(struct mp_output_chain *p);
 
 // Total delay incurred by the filter chain, as measured by the recent filtered
 // frames. The intention is that this sums the measured delays for each filter,
