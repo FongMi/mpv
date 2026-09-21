@@ -15,6 +15,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <errno.h>
+#include <limits.h>
 #include <string.h>
 
 #include <libavcodec/avcodec.h>
@@ -31,14 +33,23 @@
 #include "demux/stheader.h"
 #include "dovi_split.h"
 #include "mpv_talloc.h"
+#if HAVE_ANDROID
+#include "misc/jni.h"
+#endif
+
+enum dovi_filter_mode {
+    DOVI_FILTER_SPLIT,
+    DOVI_FILTER_HDR10,
+    DOVI_FILTER_P81,
+};
 
 struct mp_dovi_split {
-    struct mp_log *log;
     struct demuxer *demuxer;
     struct sh_stream *bl;
     struct sh_stream *el;
     AVBSFContext *bsf;
     AVPacket *staging;
+    enum dovi_filter_mode mode;
 };
 
 static void mp_dovi_split_destructor(void *p)
@@ -48,6 +59,133 @@ static void mp_dovi_split_destructor(void *p)
     av_bsf_free(&s->bsf);
 }
 
+static int init_bsf(struct mp_dovi_split *s, const char *name,
+                    const char *option, const char *value)
+{
+    const AVBitStreamFilter *def = av_bsf_get_by_name(name);
+    if (!def)
+        return AVERROR(ENOENT);
+
+    AVBSFContext *bsf = NULL;
+    int ret = av_bsf_alloc(def, &bsf);
+    if (ret < 0)
+        return ret;
+
+    AVCodecParameters *par = mp_codec_params_to_av(s->bl->codec);
+    if (!par) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    ret = avcodec_parameters_copy(bsf->par_in, par);
+    avcodec_parameters_free(&par);
+    if (ret < 0)
+        goto fail;
+
+    bsf->time_base_in = mp_get_codec_timebase(s->bl->codec);
+    ret = av_opt_set(bsf, option, value, AV_OPT_SEARCH_CHILDREN);
+    if (ret < 0)
+        goto fail;
+    if (s->mode == DOVI_FILTER_P81) {
+        // Profile 8 decoder support does not imply support for compressed RPU.
+        ret = av_opt_set(bsf, "compression", "none", AV_OPT_SEARCH_CHILDREN);
+        if (ret < 0)
+            goto fail;
+    }
+    ret = av_bsf_init(bsf);
+    if (ret < 0)
+        goto fail;
+
+    s->bsf = bsf;
+    return 0;
+
+fail:
+    av_bsf_free(&bsf);
+    return ret;
+}
+
+static const AVDOVIDecoderConfigurationRecord *get_dovi_config(
+    const AVCodecParameters *par)
+{
+    if (!par)
+        return NULL;
+
+    for (int i = 0; i < par->nb_coded_side_data; i++) {
+        const AVPacketSideData *sd = &par->coded_side_data[i];
+        if (sd->type == AV_PKT_DATA_DOVI_CONF &&
+            sd->size >= sizeof(AVDOVIDecoderConfigurationRecord))
+        {
+            return (const void *)sd->data;
+        }
+    }
+    return NULL;
+}
+
+static int sync_decoder_parameters(struct mp_dovi_split *s)
+{
+    struct mp_codec_params *codec = s->bl->codec;
+    uint8_t source_profile = mp_codec_params_source_dv_profile(codec);
+    uint8_t source_level = codec->source_dv_profile
+        ? codec->source_dv_level : codec->dv_level;
+
+    if (codec->lav_codecpar) {
+        AVCodecParameters *filtered = avcodec_parameters_alloc();
+        if (!filtered)
+            return AVERROR(ENOMEM);
+
+        int ret = avcodec_parameters_copy(filtered, s->bsf->par_out);
+        if (ret < 0) {
+            avcodec_parameters_free(&filtered);
+            return ret;
+        }
+        MPSWAP(AVCodecParameters, *codec->lav_codecpar, *filtered);
+        avcodec_parameters_free(&filtered);
+    }
+
+    const AVDOVIDecoderConfigurationRecord *dovi =
+        get_dovi_config(s->bsf->par_out);
+    bool output_dovi = dovi && dovi->rpu_present_flag;
+    codec->source_dv_profile = source_profile;
+    codec->source_dv_level = source_level;
+    codec->dovi = output_dovi;
+    codec->dv_profile = output_dovi ? dovi->dv_profile : 0;
+    codec->dv_level = output_dovi ? dovi->dv_level : 0;
+    return 0;
+}
+
+enum demux_dovi_profile7_mode mp_dovi_profile7_mode_for_stream(
+    struct demuxer *demuxer, struct sh_stream *bl,
+    bool interleaved_base_and_rpu, bool *hdr10_hardware_supported)
+{
+    if (hdr10_hardware_supported)
+        *hdr10_hardware_supported = false;
+    enum demux_dovi_profile7_mode requested = demuxer->opts->dovi_profile7_mode;
+    if (requested != DEMUX_DOVI_PROFILE7_AUTO)
+        return requested;
+
+#if HAVE_ANDROID
+    const struct mp_codec_params *codec = bl->codec;
+    const AVCodecParameters *par = codec->lav_codecpar;
+    int width = par && par->width > 0 ? par->width : codec->disp_w;
+    int height = par && par->height > 0 ? par->height : codec->disp_h;
+    int support = mp_jni_dovi_decoder_support(demuxer->log, width, height,
+                                              codec->fps);
+    if (hdr10_hardware_supported)
+        *hdr10_hardware_supported = support & MP_ANDROID_HEVC_MAIN10;
+    MP_VERBOSE(demuxer, "Dolby Vision Profile 7: %dx%d at %.3f fps, "
+               "hardware support P7=%d P8.1=%d HEVC Main10=%d.\n",
+               width, height, codec->fps, !!(support & MP_ANDROID_DOVI_P7),
+               !!(support & MP_ANDROID_DOVI_P81),
+               !!(support & MP_ANDROID_HEVC_MAIN10));
+    if (interleaved_base_and_rpu && (support & MP_ANDROID_DOVI_P7))
+        return DEMUX_DOVI_PROFILE7_PRESERVE;
+    if (interleaved_base_and_rpu && (support & MP_ANDROID_DOVI_P81))
+        return DEMUX_DOVI_PROFILE7_P81;
+    if (support & MP_ANDROID_HEVC_MAIN10)
+        return DEMUX_DOVI_PROFILE7_HDR10;
+#endif
+    return DEMUX_DOVI_PROFILE7_PRESERVE;
+}
+
 struct mp_dovi_split *mp_dovi_split_create(struct demuxer *demuxer,
                                            struct sh_stream *bl)
 {
@@ -55,40 +193,91 @@ struct mp_dovi_split *mp_dovi_split_create(struct demuxer *demuxer,
         !bl->codec->codec || strcmp(bl->codec->codec, "hevc") != 0)
         return NULL;
 
-    const AVBitStreamFilter *def = av_bsf_get_by_name("dovi_split");
-    if (!def) {
-        MP_WARN(demuxer, "Dolby Vision EL: 'dovi_split' BSF not available in "
-                         "libavcodec; rendering base layer only.\n");
+    const AVDOVIDecoderConfigurationRecord *dovi =
+        get_dovi_config(bl->codec->lav_codecpar);
+    enum demux_dovi_profile7_mode requested = DEMUX_DOVI_PROFILE7_PRESERVE;
+    bool hdr10_hardware_supported = false;
+    if (mp_codec_params_source_dv_profile(bl->codec) == 7) {
+        bool interleaved_base_and_rpu = dovi && dovi->bl_present_flag &&
+                                        dovi->rpu_present_flag;
+        requested = mp_dovi_profile7_mode_for_stream(
+            demuxer, bl, interleaved_base_and_rpu, &hdr10_hardware_supported);
+    }
+    if (requested != DEMUX_DOVI_PROFILE7_PRESERVE && dovi &&
+        !dovi->bl_present_flag)
+    {
+        MP_WARN(demuxer, "Dolby Vision Profile 7: %s requires an independently "
+                         "decodable base layer; leaving this stream unchanged.\n",
+                requested == DEMUX_DOVI_PROFILE7_P81
+                    ? "P8.1 conversion" : "HDR10 fallback");
+        return NULL;
+    }
+    if (requested == DEMUX_DOVI_PROFILE7_PRESERVE &&
+        !bl->codec->dv_el_present)
+    {
         return NULL;
     }
 
     struct mp_dovi_split *s = talloc_zero(demuxer, struct mp_dovi_split);
     talloc_set_destructor(s, mp_dovi_split_destructor);
-    s->log = demuxer->log;
     s->demuxer = demuxer;
     s->bl = bl;
 
+    int ret = AVERROR(ENOMEM);
     s->staging = av_packet_alloc();
     if (!s->staging)
         goto fail;
 
-    int ret = av_bsf_alloc(def, &s->bsf);
+    if (requested == DEMUX_DOVI_PROFILE7_P81) {
+        s->mode = DOVI_FILTER_P81;
+        ret = init_bsf(s, "dovi_rpu", "convert", "p81");
+        if (ret < 0) {
+            if (demuxer->opts->dovi_profile7_mode == DEMUX_DOVI_PROFILE7_AUTO) {
+                MP_WARN(demuxer, "Dolby Vision Profile 7: P8.1 conversion "
+                                 "unavailable (%s).\n", av_err2str(ret));
+                if (hdr10_hardware_supported) {
+                    s->mode = DOVI_FILTER_HDR10;
+                    ret = init_bsf(s, "dovi_split", "mode", "bl");
+                }
+                if (!hdr10_hardware_supported || ret < 0) {
+                    if (!bl->codec->dv_el_present) {
+                        talloc_free(s);
+                        return NULL;
+                    }
+                    s->mode = DOVI_FILTER_SPLIT;
+                    ret = init_bsf(s, "dovi_split", "mode", "el_rpu");
+                }
+            } else {
+                MP_WARN(demuxer, "Dolby Vision Profile 7: P8.1 conversion is "
+                                 "unavailable (%s); using the HDR10 base layer.\n",
+                        av_err2str(ret));
+                s->mode = DOVI_FILTER_HDR10;
+                ret = init_bsf(s, "dovi_split", "mode", "bl");
+            }
+        }
+    } else if (requested == DEMUX_DOVI_PROFILE7_HDR10) {
+        s->mode = DOVI_FILTER_HDR10;
+        ret = init_bsf(s, "dovi_split", "mode", "bl");
+    } else {
+        s->mode = DOVI_FILTER_SPLIT;
+        ret = init_bsf(s, "dovi_split", "mode", "el_rpu");
+    }
     if (ret < 0)
         goto fail;
 
-    AVCodecParameters *par = mp_codec_params_to_av(bl->codec);
-    if (par) {
-        avcodec_parameters_copy(s->bsf->par_in, par);
-        avcodec_parameters_free(&par);
+    if (s->mode != DOVI_FILTER_SPLIT) {
+        ret = sync_decoder_parameters(s);
+        if (ret < 0)
+            goto fail;
+        bl->codec->dv_el_present = false;
+        if (s->mode == DOVI_FILTER_HDR10)
+            bl->codec->dv_p7_hdr10_fallback = true;
+        if (s->mode == DOVI_FILTER_P81)
+            MP_INFO(demuxer, "Dolby Vision Profile 7: converting to Profile 8.1.\n");
+        else
+            MP_INFO(demuxer, "Dolby Vision Profile 7: using HDR10 base layer.\n");
+        return s;
     }
-    s->bsf->time_base_in = mp_get_codec_timebase(bl->codec);
-
-    // The enhancement pairing filter inherits Dolby Vision metadata from the
-    // decoded EL frame, so the companion stream must retain its RPU.
-    if (av_opt_set(s->bsf, "mode", "el_rpu", AV_OPT_SEARCH_CHILDREN) < 0)
-        goto fail;
-    if (av_bsf_init(s->bsf) < 0)
-        goto fail;
 
     const AVCodecParameters *par_out = s->bsf->par_out;
 
@@ -135,6 +324,9 @@ struct mp_dovi_split *mp_dovi_split_create(struct demuxer *demuxer,
     return s;
 
 fail:
+    MP_WARN(demuxer, "Dolby Vision: failed to initialize bitstream filter: %s. "
+                     "Leaving the bitstream unchanged.\n",
+            av_err2str(ret));
     talloc_free(s);
     return NULL;
 }
@@ -151,55 +343,116 @@ struct sh_stream *mp_dovi_split_el_stream(struct mp_dovi_split *s)
     return s ? s->el : NULL;
 }
 
-struct demux_packet *mp_dovi_split_dispatch(struct mp_dovi_split *s,
-                                            struct demux_packet *bl_dp)
+static AVPacket *copy_packet_data(struct demux_packet *dp)
 {
-    if (!s || !s->bsf || !bl_dp || !bl_dp->buffer || bl_dp->len <= 0)
+    if (dp->len > INT_MAX)
         return NULL;
 
-    // av_bsf_send_packet takes ownership of the packet's buffer, so copy it,
-    // to not steal it from caller.
     AVPacket *copy = av_packet_alloc();
     if (!copy)
         return NULL;
-    int ret = av_new_packet(copy, bl_dp->len);
+
+    int ret;
+    if (dp->avpacket && dp->avpacket->data == dp->buffer &&
+        dp->avpacket->size == (int)dp->len)
+    {
+        ret = av_packet_ref(copy, dp->avpacket);
+    } else {
+        ret = av_new_packet(copy, (int)dp->len);
+        if (ret >= 0) {
+            memcpy(copy->data, dp->buffer, dp->len);
+            if (dp->avpacket)
+                ret = av_packet_copy_props(copy, dp->avpacket);
+        }
+    }
     if (ret < 0) {
         av_packet_free(&copy);
         return NULL;
     }
-    memcpy(copy->data, bl_dp->buffer, bl_dp->len);
-    copy->flags = bl_dp->keyframe ? AV_PKT_FLAG_KEY : 0;
+    copy->flags &= ~AV_PKT_FLAG_KEY;
+    if (dp->keyframe)
+        copy->flags |= AV_PKT_FLAG_KEY;
+    return copy;
+}
 
-    ret = av_bsf_send_packet(s->bsf, copy);
+enum dovi_packet_result {
+    DOVI_PACKET_ERROR = -1,
+    DOVI_PACKET_EMPTY,
+    DOVI_PACKET_READY,
+};
+
+static enum dovi_packet_result filter_packet(struct mp_dovi_split *s,
+                                             struct demux_packet *src,
+                                             int stream,
+                                             struct demux_packet **out)
+{
+    *out = NULL;
+    if (!s || !s->bsf || !src || !src->buffer || !src->len)
+        return DOVI_PACKET_ERROR;
+
+    AVPacket *copy = copy_packet_data(src);
+    if (!copy)
+        return DOVI_PACKET_ERROR;
+
+    int ret = av_bsf_send_packet(s->bsf, copy);
     av_packet_free(&copy);
     if (ret < 0) {
-        MP_VERBOSE(s->demuxer, "dovi_split: BSF send failed: %s\n",
-                   mp_strerror(AVUNERROR(ret)));
-        return NULL;
+        MP_VERBOSE(s->demuxer, "%s: BSF send failed: %s\n",
+                   s->bsf->filter->name, av_err2str(ret));
+        return DOVI_PACKET_ERROR;
     }
 
     ret = av_bsf_receive_packet(s->bsf, s->staging);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        // No EL NALs in this AU, nothing to emit.
-        return NULL;
-    }
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+        return DOVI_PACKET_EMPTY;
     if (ret < 0) {
-        MP_VERBOSE(s->demuxer, "dovi_split: BSF receive failed: %s; flushing.\n",
-                   mp_strerror(AVUNERROR(ret)));
+        MP_VERBOSE(s->demuxer, "%s: BSF receive failed: %s; flushing.\n",
+                   s->bsf->filter->name, av_err2str(ret));
         av_bsf_flush(s->bsf);
-        return NULL;
+        return DOVI_PACKET_ERROR;
     }
 
-    struct demux_packet *dp =
+    struct demux_packet *dst =
         new_demux_packet_from_avpacket(s->demuxer->packet_pool, s->staging);
-    if (dp) {
-        // Mirror the BL packet's timing so the pairing filter can match by PTS.
-        dp->pts = bl_dp->pts;
-        dp->dts = bl_dp->dts;
-        dp->duration = bl_dp->duration;
-        dp->keyframe = bl_dp->keyframe;
-        dp->stream = s->el->index;
-    }
     av_packet_unref(s->staging);
-    return dp;
+    if (!dst)
+        return DOVI_PACKET_ERROR;
+
+    demux_packet_copy_attribs(dst, src);
+    dst->stream = stream;
+    *out = dst;
+    return DOVI_PACKET_READY;
+}
+
+bool mp_dovi_split_filter_base(struct mp_dovi_split *s,
+                               struct demux_packet **bl_dp)
+{
+    if (!s || s->mode == DOVI_FILTER_SPLIT)
+        return true;
+    if (!bl_dp || !*bl_dp)
+        return false;
+
+    struct demux_packet *filtered = NULL;
+    enum dovi_packet_result ret =
+        filter_packet(s, *bl_dp, s->bl->index, &filtered);
+    if (ret == DOVI_PACKET_ERROR) {
+        MP_ERR(s->demuxer, "Dolby Vision Profile 7: %s filtering failed.\n",
+               s->mode == DOVI_FILTER_P81 ? "P8.1" : "HDR10");
+        return false;
+    }
+
+    free_demux_packet(*bl_dp);
+    *bl_dp = filtered;
+    return true;
+}
+
+struct demux_packet *mp_dovi_split_dispatch(struct mp_dovi_split *s,
+                                            struct demux_packet *bl_dp)
+{
+    if (!s || s->mode != DOVI_FILTER_SPLIT || !s->el)
+        return NULL;
+
+    struct demux_packet *el_dp = NULL;
+    return filter_packet(s, bl_dp, s->el->index, &el_dp) == DOVI_PACKET_READY
+               ? el_dp : NULL;
 }
