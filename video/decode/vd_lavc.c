@@ -910,10 +910,8 @@ static void reset_avctx(struct mp_filter *vd)
     ctx->wait_for_keyframe = ctx->use_hwdec ? HWDEC_WAIT_KEYFRAME_COUNT : 0;
 }
 
-static void flush_all(struct mp_filter *vd)
+static void clear_decoder_queues(vd_ffmpeg_ctx *ctx)
 {
-    vd_ffmpeg_ctx *ctx = vd->priv;
-
     for (int n = 0; n < ctx->num_delay_queue; n++)
         talloc_free(ctx->delay_queue[n]);
     ctx->num_delay_queue = 0;
@@ -925,7 +923,13 @@ static void flush_all(struct mp_filter *vd)
     for (int n = 0; n < ctx->num_requeue_packets; n++)
         talloc_free(ctx->requeue_packets[n]);
     ctx->num_requeue_packets = 0;
+}
 
+static void flush_all(struct mp_filter *vd)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+
+    clear_decoder_queues(ctx);
     reset_avctx(vd);
 }
 
@@ -933,7 +937,9 @@ static void uninit_avctx(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
 
-    flush_all(vd);
+    // Release retained frames before closing. avcodec_free_context() closes the
+    // decoder, so flushing it first is redundant and can touch a dead Surface.
+    clear_decoder_queues(ctx);
     av_frame_free(&ctx->pic);
     mp_free_av_packet(&ctx->avpkt);
     av_buffer_unref(&ctx->cached_hw_frames_ctx);
