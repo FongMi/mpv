@@ -30,7 +30,8 @@ struct sh_stream;
 // enhancement-layer (EL) stream `el_sh` via an internal mp_decoder_wrapper,
 // and attaches each decoded EL frame as `mpi->enhancement_layer` of the BL
 // frame with the matching PTS. Unmatched BL frames are forwarded unchanged
-// (BL-only fallback).
+// (BL-only fallback). `force_swdec` keeps the EL decoder off a hardware output
+// surface which cannot accept a second producer.
 //
 // `el_sh` must be a dependent sibling of the BL stream via sh_stream_group,
 // it is auto-selected by the demuxer when the BL is selected.
@@ -38,4 +39,5 @@ struct sh_stream;
 // 1 input pin (BL frames), 1 output pin (paired BL frames). Returns NULL
 // on init failure. The caller should fall back to BL-only rendering.
 struct mp_filter *mp_enhancement_pair_create(struct mp_filter *parent,
-                                             struct sh_stream *el_sh);
+                                             struct sh_stream *el_sh,
+                                             bool force_swdec);

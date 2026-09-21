@@ -367,6 +367,14 @@ dvd_segment_header = custom_target('dvd-segment-functions',
 dvd_segments = executable('dvd-segments', ['dvd_segments.c', dvd_segment_header])
 test('dvd-segments', dvd_segments)
 
+decoder_lifecycle_header = custom_target('decoder-lifecycle-functions',
+    input: files('../player/video.c', '../player/audio.c', '../player/playloop.c'),
+    output: 'decoder_lifecycle_functions.h',
+    depend_files: files('vo_android_frame.py'),
+    command: [python, files('decoder_lifecycle.py'), '--generate', '@OUTPUT@'])
+decoder_lifecycle = executable('decoder-lifecycle', ['decoder_lifecycle.c', decoder_lifecycle_header])
+test('decoder-lifecycle', decoder_lifecycle)
+
 filter_options_header = custom_target('filter-options-functions',
     input: files('../player/command.c'),
     output: 'filter_options_functions.h',

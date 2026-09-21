@@ -209,7 +209,9 @@ end
 
 
 local function has_vo_window()
-    return mp.get_property_native("vo-configured") and mp.get_property_native("video-osd")
+    -- Unlike vo-configured, current-vo doesn't become falsy while switching VO,
+    -- which would render terminal formatting on the OSD.
+    return mp.get_property("current-vo") and mp.get_property_native("video-osd")
 end
 
 
