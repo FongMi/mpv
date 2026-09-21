@@ -77,19 +77,25 @@ static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
 #define HWDEC_EXTRA_INFLIGHT_FRAMES 3
 
 static void set_decoder_avopts(struct mp_log *log, AVCodecContext *avctx,
-                               char **kv, bool native_dovi_sink)
+                               char **kv, bool native_dovi_sink,
+                               bool gpu_dovi_mapping)
 {
     for (int n = 0; kv && kv[n * 2]; n++) {
         char *option[] = {kv[n * 2], kv[n * 2 + 1], NULL};
         // The active VO, rather than a user avopt or the decoder default,
         // determines whether MediaCodec has a native Dolby Vision sink.
         if (strcmp(option[0], "dovi_sink_support") == 0) {
-            bool requested = strcmp(option[1], "1") == 0;
-            if (requested != native_dovi_sink) {
-                mp_verbose(log, "Ignoring dovi_sink_support=%s; the active "
-                                "video output requires %d.\n",
-                           option[1], native_dovi_sink);
-            }
+            mp_verbose(log, "Ignoring user dovi_sink_support=%s; the active "
+                            "video output requires %d.\n",
+                       option[1], native_dovi_sink);
+            continue;
+        }
+        // Raw Dolby Vision is safe only when both the hardware mapper and the
+        // renderer preserve its representation for libplacebo.
+        if (strcmp(option[0], "dovi_gpu_mapping_support") == 0) {
+            mp_verbose(log, "Ignoring user dovi_gpu_mapping_support=%s; the "
+                            "active video output requires %d.\n",
+                       option[1], gpu_dovi_mapping);
             continue;
         }
         mp_set_avopts(log, avctx, option);
@@ -102,6 +108,14 @@ static void set_decoder_avopts(struct mp_log *log, AVCodecContext *avctx,
             "dovi_sink_support", native_dovi_sink ? "1" : "0", NULL
         };
         mp_set_avopts(log, avctx, sink_option);
+    }
+    if (av_opt_find(avctx, "dovi_gpu_mapping_support", NULL, 0,
+                    AV_OPT_SEARCH_CHILDREN))
+    {
+        char *mapping_option[] = {
+            "dovi_gpu_mapping_support", gpu_dovi_mapping ? "1" : "0", NULL
+        };
+        mp_set_avopts(log, avctx, mapping_option);
     }
 }
 
@@ -611,6 +625,21 @@ static AVBufferRef *hwdec_create_dev(struct mp_filter *vd,
     return NULL;
 }
 
+static bool supports_gpu_dovi_mapping(vd_ffmpeg_ctx *ctx)
+{
+    if (!ctx->vo || !(ctx->vo->driver->caps & VO_CAP_GPU_DOVI) ||
+        !ctx->use_hwdec || ctx->hwdec.copying || !ctx->hwdec_devs ||
+        ctx->hwdec.lavc_device != AV_HWDEVICE_TYPE_MEDIACODEC ||
+        ctx->hwdec.pix_fmt != AV_PIX_FMT_MEDIACODEC)
+        return false;
+
+    const struct mp_hwdec_ctx *hwctx =
+        hwdec_devices_get_by_imgfmt_and_type(ctx->hwdec_devs,
+                                             IMGFMT_MEDIACODEC,
+                                             AV_HWDEVICE_TYPE_MEDIACODEC);
+    return hwctx && hwctx->supports_gpu_dovi_mapping;
+}
+
 // Select if and which hwdec to use. Also makes sure to get the decode device.
 static void select_and_set_hwdec(struct mp_filter *vd)
 {
@@ -977,8 +1006,9 @@ static void init_avctx(struct mp_filter *vd)
 
     bool native_dovi_sink =
         ctx->vo && (ctx->vo->driver->caps & VO_CAP_NATIVE_DOVI);
+    bool gpu_dovi_mapping = supports_gpu_dovi_mapping(ctx);
     set_decoder_avopts(vd->log, avctx, lavc_param->avopts,
-                       native_dovi_sink);
+                       native_dovi_sink, gpu_dovi_mapping);
 
     // Do this after the above avopt handling in case it changes values
     ctx->skip_frame = avctx->skip_frame;

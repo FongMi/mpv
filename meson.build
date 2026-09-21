@@ -1335,6 +1335,11 @@ if plain_gl.allowed()
     features += {'gl': true}
 endif
 
+features += {'libplacebo-opengl-external-yuv': features['gl'] and
+    cc.has_members('struct pl_opengl_wrap_params', ['external_yuv'],
+                   prefix: '#include <libplacebo/opengl.h>',
+                   dependencies: libplacebo)}
+
 if features['egl'] or features['egl-android'] or features['egl-angle-win32']
     sources += files('video/out/opengl/egl_helpers.c')
 endif
@@ -1366,13 +1371,34 @@ features += {'vulkan': vulkan.found() and (vulkan.type_name() == 'internal' or
                        cc.has_header_symbol('vulkan/vulkan_core.h',
                                             'VK_VERSION_1_3',
                                             dependencies: vulkan))}
+libplacebo_vulkan_disable_storage = false
+libplacebo_vulkan_ycbcr = false
 if features['vulkan']
+    libplacebo_vulkan_disable_storage = cc.has_members(
+        'struct pl_vulkan_swapchain_params', ['disable_storage'],
+        prefix: '#include <libplacebo/vulkan.h>',
+        dependencies: [libplacebo, vulkan])
+    libplacebo_vulkan_ycbcr = (
+        cc.has_members('struct pl_vulkan_ycbcr_params',
+                       ['external_format', 'components', 'model', 'range',
+                        'x_chroma_offset', 'y_chroma_offset', 'chroma_filter',
+                        'separate_reconstruction_filter', 'sample_depth'],
+                       prefix: '#include <libplacebo/vulkan.h>',
+                       dependencies: [libplacebo, vulkan]) and
+        cc.has_members('struct pl_vulkan_wrap_params', ['ycbcr'],
+                       prefix: '#include <libplacebo/vulkan.h>',
+                       dependencies: [libplacebo, vulkan])
+    )
     dependencies += vulkan
     sources += files('video/out/hwdec/hwdec_vulkan.c',
                      'video/out/vulkan/context.c',
                      'video/out/vulkan/utils.c',
                      'video/filter/vf_gpu_vulkan.c')
 endif
+features += {
+    'libplacebo-vulkan-disable-storage': libplacebo_vulkan_disable_storage,
+    'libplacebo-vulkan-ycbcr': libplacebo_vulkan_ycbcr,
+}
 
 if features['vulkan'] and features['android']
     sources += files('video/out/vulkan/context_android.c')
@@ -1442,6 +1468,11 @@ features += {'android-media-ndk': android_media_ndk.allowed()}
 if features['android-media-ndk']
     # header only, library is dynamically loaded
     sources += files('video/out/hwdec/hwdec_aimagereader.c')
+endif
+if features['android-media-ndk'] and features['vulkan']
+    sources += files('video/out/hwdec/hwdec_aimagereader_vk.c',
+                     'video/out/hwdec/hwdec_aimagereader_vk_convert.c',
+                     'video/out/hwdec/hwdec_aimagereader_vk_direct.c')
 endif
 
 d3d_hwaccel = get_option('d3d-hwaccel').require(
