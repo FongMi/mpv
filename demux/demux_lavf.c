@@ -138,6 +138,17 @@ const struct m_sub_options demux_lavf_conf = {
     .change_flags = UPDATE_DEMUXER,
 };
 
+static const char *rtsp_transport_name(int transport)
+{
+    switch (transport) {
+    case 1: return "udp";
+    case 2: return "tcp";
+    case 3: return "http";
+    case 4: return "udp_multicast";
+    }
+    return NULL;
+}
+
 struct format_hack {
     const char *ff_name;
     const char *mime_type;
@@ -1482,13 +1493,9 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     }
 
     if (matches_avinputformat_name(priv, "rtsp")) {
-        const char *transport = NULL;
-        switch (lavfdopts->rtsp_transport) {
-        case 1: transport = "udp";  break;
-        case 2: transport = "tcp";  break;
-        case 3: transport = "http"; break;
-        case 4: transport = "udp_multicast"; break;
-        }
+        const char *transport = rtsp_transport_name(lavfdopts->rtsp_transport);
+        if (priv->stream && priv->stream->lavf_force_rtsp_tcp)
+            transport = "tcp";
         if (transport)
             av_dict_set(&dopts, "rtsp_transport", transport, 0);
     }
