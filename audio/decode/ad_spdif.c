@@ -51,6 +51,7 @@ struct spdifContext {
     bool             need_close;
     bool             use_dts_hd;
     bool             codec_params_probed;
+    bool             failed;
     int              codec_profile;
     int              codec_rate;
     unsigned int     dropped_startup_packets;
@@ -112,6 +113,11 @@ static void ad_spdif_reset(struct mp_filter *da)
 
     close_lavf_context(spdif_ctx, false);
     spdif_ctx->dropped_startup_packets = 0;
+    spdif_ctx->public.passthrough_consumed = 0;
+    spdif_ctx->public.passthrough_discarded = 0;
+    spdif_ctx->failed = false;
+    // A seek must also cancel a pending fallback for the discarded packet.
+    mp_filter_has_failed(da);
 }
 
 static bool truehd_has_major_sync(const AVPacket *pkt)
@@ -354,6 +360,9 @@ static void ad_spdif_process(struct mp_filter *da)
 {
     struct spdifContext *spdif_ctx = da->priv;
 
+    if (spdif_ctx->failed)
+        return;
+
     if (!mp_pin_can_transfer_data(da->ppins[1], da->ppins[0]))
         return;
 
@@ -434,12 +443,17 @@ static void ad_spdif_process(struct mp_filter *da)
     mp_aframe_set_pts(out, pts);
 
 done:
-    talloc_free(mpkt);
     if (out) {
+        spdif_ctx->public.passthrough_consumed++;
+        talloc_free(mpkt);
         mp_pin_in_write(da->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
     } else if (drop_packet) {
+        spdif_ctx->public.passthrough_discarded++;
+        talloc_free(mpkt);
         mp_filter_internal_mark_progress(da);
     } else {
+        spdif_ctx->failed = true;
+        talloc_free(mpkt);
         mp_filter_internal_mark_failed(da);
     }
 }
