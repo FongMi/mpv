@@ -398,6 +398,8 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
         demux_flags |= SEEK_CACHED;
 
     demux_flags |= SEEK_BLOCK;
+    if (seek.flags & MPSEEK_FLAG_NAV)
+        demux_flags |= SEEK_NAV;
 
     if (!demux_seek(mpctx->demuxer, demux_pts, demux_flags)) {
         if (!mpctx->demuxer->seekable) {
@@ -489,6 +491,7 @@ void queue_seek(struct MPContext *mpctx, enum seek_type type, double amount,
 
     switch (type) {
     case MPSEEK_RELATIVE:
+        seek->flags &= ~MPSEEK_FLAG_NAV;
         seek->flags |= flags;
         if (seek->type == MPSEEK_FACTOR)
             return;  // Well... not common enough to bother doing better
@@ -1262,18 +1265,18 @@ static void handle_eof(struct MPContext *mpctx)
     bool prevent_eof =
         mpctx->paused && mpctx->video_out && vo_has_frame(mpctx->video_out) &&
         !mpctx->vo_chain->is_coverart;
-    /* A disc menu parked on an infinite still frame reports EOF so the decoder
-     * drains and the menu frame is shown. Hold it until the user navigates,
-     * rather than ending the file. */
-    prevent_eof |= mpctx->disc_nav_still_frame;
     /* It's possible for the user to simultaneously switch both audio
      * and video streams to "disabled" at runtime. Handle this by waiting
      * rather than immediately stopping playback due to EOF.
      */
+    /* Disc stills and VM transitions also drain the decoders. Read the current
+     * state: a transition can begin or settle after disc_nav_update(). Fatal
+     * navigation errors must reach the demuxer error path before we stop. */
     if ((mpctx->ao_chain || mpctx->vo_chain) && !prevent_eof &&
         mpctx->audio_status == STATUS_EOF &&
         mpctx->video_status == STATUS_EOF &&
-        !mpctx->stop_play)
+        !mpctx->stop_play &&
+        !disc_nav_prevents_eof(mpctx))
     {
         mpctx->stop_play = AT_END_OF_FILE;
     }

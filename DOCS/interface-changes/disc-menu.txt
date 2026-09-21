@@ -1,3 +1,5 @@
 add `--disc-menu` option
+add `disc-navigation-active` property
 add `disc-menu-active` property
+add `disc-menu-supported` property
 add `discnav` command

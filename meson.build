@@ -196,6 +196,7 @@ sources = files(
     'stream/stream_concat.c',
     'stream/stream_edl.c',
     'stream/stream_file.c',
+    'stream/stream_iso.c',
     'stream/stream_lavf.c',
     'stream/stream_memory.c',
     'stream/stream_mf.c',
@@ -679,6 +680,17 @@ dvdnav_opt = get_option('dvdnav').require(
 dvdnav = dependency('dvdnav', version: '>= 6.1.0', required: dvdnav_opt)
 features += {'dvdnav': dvdnav.found()}
 if features['dvdnav']
+    if not cc.has_header_symbol('dvdnav/dvdnav.h', 'DVDNAV_HAVE_TIME_SEARCH_FLOOR',
+                                dependencies: dvdnav)
+        error('dvdnav requires libdvdnav with verified floor time seeking')
+    endif
+    foreach function : ['dvdnav_menu_available', 'dvdnav_time_search_floor']
+        if not cc.has_function(function,
+                               prefix: '#include <dvdnav/dvdnav.h>',
+                               dependencies: dvdnav)
+            error('dvdnav requires libdvdnav with ' + function)
+        endif
+    endforeach
     dependencies += dvdnav
     sources += files('stream/stream_dvdnav.c')
 endif
@@ -721,6 +733,12 @@ endif
 libbluray = dependency('libbluray', version: '>= 1.0.2', required: get_option('libbluray'))
 features += {'libbluray': libbluray.found()}
 if features['libbluray']
+    foreach function : ['bd_get_titles_with_menu_info', 'bd_seek_time_checked']
+        if not cc.has_header_symbol('libbluray/bluray.h', function,
+                                    dependencies: libbluray)
+            error('libbluray requires ' + function)
+        endif
+    endforeach
     dependencies += libbluray
     sources += files('stream/stream_bluray.c')
 endif

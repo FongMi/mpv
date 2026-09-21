@@ -84,6 +84,7 @@ enum seek_precision {
 enum seek_flags {
     MPSEEK_FLAG_DELAY = 1 << 0, // give player chance to coalesce multiple seeks
     MPSEEK_FLAG_NOFLUSH = 1 << 1, // keeping remaining data for seamless loops
+    MPSEEK_FLAG_NAV = 1 << 2, // synchronize a jump made by the disc VM
 };
 
 struct seek_params {
@@ -323,6 +324,8 @@ typedef struct MPContext {
     // There can be num_ptracks[type] of the same STREAM_TYPE selected at once.
     // Currently, this is used for the secondary subtitle track only.
     struct track *current_track[MAX_PTRACKS][STREAM_TYPE_COUNT];
+    // Last accepted options, for rejecting asynchronous option callbacks.
+    int accepted_track_selection[MAX_PTRACKS][STREAM_TYPE_COUNT];
 
     struct mp_filter *filter_root;
 
@@ -550,7 +553,7 @@ void mark_track_selection(struct MPContext *mpctx, int order,
 #define FLAG_MARK_SELECTION 1
 void mp_switch_track(struct MPContext *mpctx, enum stream_type type,
                      struct track *track, int flags);
-void mp_switch_track_n(struct MPContext *mpctx, int order,
+bool mp_switch_track_n(struct MPContext *mpctx, int order,
                        enum stream_type type, struct track *track, int flags);
 void mp_deselect_track(struct MPContext *mpctx, struct track *track);
 struct track *mp_track_by_tid(struct MPContext *mpctx, enum stream_type type,
@@ -678,10 +681,13 @@ bool update_subtitles(struct MPContext *mpctx, double video_pts);
 // discnav.c
 struct stream;
 struct stream_nav_state;
+bool disc_nav_select_track(struct MPContext *mpctx, int order,
+                            enum stream_type type, struct track *track);
 void disc_nav_update(struct MPContext *mpctx);
 void disc_nav_reset(struct MPContext *mpctx);
 void disc_nav_destroy(struct MPContext *mpctx);
 struct stream *disc_nav_get_stream(struct MPContext *mpctx);
+bool disc_nav_prevents_eof(struct MPContext *mpctx);
 bool disc_nav_mouse_pos_to_src(struct MPContext *mpctx, int src_w, int src_h,
                                int *out_x, int *out_y);
 
