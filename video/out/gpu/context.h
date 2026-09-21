@@ -1,6 +1,7 @@
 #pragma once
 
 #include <libplacebo/colorspace.h>
+#include <libplacebo/swapchain.h>
 
 #include "video/out/vo.h"
 #include "video/csputils.h"
@@ -29,6 +30,9 @@ struct ra_ctx {
     const struct ra_ctx_fns *fns;
     struct ra_swapchain *swapchain;
     struct spirv_compiler *spirv;
+
+    // Auto may use source colorspace hints when target parameters are unknown.
+    bool supports_auto_colorspace_hint;
 
     void *priv;
 };
@@ -93,12 +97,31 @@ struct ra_ctx_params {
     void (*swap_buffers)(struct ra_ctx *ctx);
 };
 
+enum ra_color_hint_result {
+    RA_COLOR_HINT_NONE,
+    // The request was delegated to libplacebo. The actual colorspace is
+    // reported by the next swapchain frame.
+    RA_COLOR_HINT_SWAPCHAIN,
+    RA_COLOR_HINT_EXTERNAL,
+};
+
 // Extra struct for the swapchain-related functions so they can be easily
 // inherited from helpers.
 struct ra_swapchain {
     struct ra_ctx *ctx;
     struct priv *priv;
     const struct ra_swapchain_fns *fns;
+
+    // Avoid repeating stateful platform/swapchain color updates for every
+    // frame when the effective source and target state is unchanged.
+    bool color_hint_cache_enabled;
+    bool color_hint_valid;
+    bool color_hint_has_params;
+    pl_swapchain color_hint_swapchain;
+    struct pl_color_space color_hint_request_color;
+    enum pl_color_primaries color_hint_output_primaries;
+    enum pl_color_transfer color_hint_output_transfer;
+    enum ra_color_hint_result color_hint_result;
 };
 
 // Represents a framebuffer / render target
@@ -109,6 +132,7 @@ struct ra_fbo {
     // Host system's colorspace that it will be interpreting
     // the frame buffer as.
     struct pl_color_space color_space;
+    bool color_space_strict;
 };
 
 struct ra_swapchain_fns {
@@ -149,6 +173,15 @@ struct ra_swapchain_fns {
 // the underlying `struct ra`, and perhaps the underlying VO backend.
 struct ra_ctx *ra_ctx_create(struct vo *vo, struct ra_ctx_opts opts);
 void ra_ctx_destroy(struct ra_ctx **ctx);
+
+// Returns whether the context owns a libplacebo swapchain. The returned
+// swapchain may be NULL while a detachable surface is unavailable.
+bool ra_ctx_get_pl_swapchain(struct ra_ctx *ctx, pl_swapchain *swapchain);
+
+enum ra_color_hint_result ra_swapchain_set_color(
+    struct ra_swapchain *sw, pl_swapchain pl_sw,
+    struct mp_image_params *params);
+void ra_swapchain_invalidate_color(struct ra_swapchain *sw);
 
 // Special case of creating a ra_ctx while specifying a specific context by name.
 struct ra_ctx *ra_ctx_create_by_name(struct vo *vo, const char *name);

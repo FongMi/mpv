@@ -168,6 +168,12 @@ fail:
     return false;
 }
 
+int ra_gl_ctx_get_swap_interval(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    return p->opts->swapinterval;
+}
+
 void ra_gl_ctx_resize(struct ra_swapchain *sw, int w, int h, int fbo)
 {
     struct priv *p = sw->priv;

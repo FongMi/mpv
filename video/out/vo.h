@@ -123,6 +123,12 @@ enum mp_voctrl {
     /* private to vo_gpu and vo_gpu_next */
     VOCTRL_EXTERNAL_RESIZE,
 
+    // The Android embedding application changed the secondary OSD size.
+    VOCTRL_UPDATE_OSD_SIZE,
+
+    // Replace or detach the platform window without recreating the VO.
+    VOCTRL_UPDATE_WINDOW,
+
     // Begin VO dragging.
     VOCTRL_BEGIN_DRAGGING,
 
@@ -205,6 +211,10 @@ enum {
     VO_CAP_FRAMEOWNER   = 1 << 5,
     // VO does handle mp_image_params.vflip
     VO_CAP_VFLIP        = 1 << 6,
+    // VO_CAP_NORETAIN backend can redraw overlays without a retained frame.
+    VO_CAP_NORETAIN_REDRAW = 1 << 7,
+    // VO is a native Dolby Vision sink rather than a GPU-rendered output.
+    VO_CAP_NATIVE_DOVI  = 1 << 8,
 };
 
 enum {
@@ -226,6 +236,7 @@ struct vo_extra {
     struct encode_lavc_context *encode_lavc_ctx;
     void (*wakeup_cb)(void *ctx);
     void *wakeup_ctx;
+    bool prefer_hdr_output;
 };
 
 struct vo_frame {
@@ -524,6 +535,8 @@ struct vo {
 
 struct mpv_global;
 struct vo *init_best_video_out(struct mpv_global *global, struct vo_extra *ex);
+struct vo *init_video_out_by_name(struct mpv_global *global,
+                                  struct vo_extra *ex, const char *name);
 int vo_reconfig(struct vo *vo, struct mp_image_params *p);
 int vo_reconfig2(struct vo *vo, struct mp_image *img);
 
@@ -536,6 +549,8 @@ void vo_wait_frame(struct vo *vo);
 void vo_wait_on_vo(struct vo *vo, bool wait);
 bool vo_still_displaying(struct vo *vo);
 void vo_request_wakeup_on_done(struct vo *vo);
+void vo_report_backend_error(struct vo *vo);
+bool vo_query_backend_error(struct vo *vo);
 bool vo_has_frame(struct vo *vo);
 void vo_redraw(struct vo *vo);
 bool vo_want_redraw(struct vo *vo);
