@@ -73,6 +73,23 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+disc_still_header = custom_target('disc-still-functions',
+    input: files('../demux/demux_disc.c', '../stream/stream_bluray.c'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'disc_still_functions.h',
+    command: [python, files('disc_still.py'), '--generate', '@OUTPUT@'])
+disc_still = executable('disc-still', ['disc_still.c', disc_still_header])
+test('disc-still', disc_still)
+
+dvdnav_commands_header = custom_target('dvdnav-commands-functions',
+    input: files('../stream/stream_dvdnav.c', '../stream/stream.h'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'dvdnav_commands_functions.h',
+    command: [python, files('dvdnav_commands.py'), '--generate', '@OUTPUT@'])
+dvdnav_commands = executable('dvdnav-commands',
+    ['dvdnav_commands.c', dvdnav_commands_header])
+test('dvdnav-commands', dvdnav_commands)
+
 drm_modeset_functions = custom_target('drm-modeset-functions',
     input: files('../video/out/opengl/context_drm_egl.c'),
     output: 'drm_modeset_functions.h',
@@ -241,3 +258,33 @@ if refdir != ''
         test('scale-zimg', scale_zimg, args: [refdir, outdir], suite: 'ffmpeg')
     endif
 endif
+
+if features['dvdnav']
+    dvdnav_test = executable('dvdnav', 'dvdnav.c',
+        gnu_symbol_visibility: 'hidden',
+        include_directories: incdir,
+        dependencies: [libavutil, libplacebo,
+                      dvdnav.partial_dependency(compile_args: true, includes: true)],
+        link_with: [img_utils, test_utils],
+        c_args: cc.get_supported_arguments('-ffunction-sections', '-fdata-sections'),
+        link_args: cc.get_supported_link_arguments('-Wl,--gc-sections',
+                                                   '-Wl,--no-export-dynamic',
+                                                   '-Wl,-dead_strip'))
+    test('dvdnav', dvdnav_test)
+endif
+
+disc_segment_headers = custom_target('disc-segment-functions',
+    input: files('../demux/demux_disc.c', '../stream/stream.h'),
+    output: ['disc_segments_functions.h', 'disc_segment_types.h'],
+    depend_files: files('vo_android_frame.py'),
+    command: [python, files('disc_segments.py'), '--generate', '@OUTPUT0@'])
+disc_segments = executable('disc-segments', ['disc_segments.c', disc_segment_headers])
+test('disc-segments', disc_segments)
+
+dvd_segment_header = custom_target('dvd-segment-functions',
+    input: files('../stream/stream_dvdnav.c'),
+    output: 'dvd_segments_functions.h',
+    depend_files: files('vo_android_frame.py'),
+    command: [python, files('dvd_segments.py'), '--generate', '@OUTPUT@'])
+dvd_segments = executable('dvd-segments', ['dvd_segments.c', dvd_segment_header])
+test('dvd-segments', dvd_segments)
