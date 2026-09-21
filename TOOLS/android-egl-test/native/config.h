@@ -1,0 +1,9 @@
+#pragma once
+#define HAVE_ANDROID 1
+#define HAVE_GL 1
+#define HAVE_EGL 1
+#define HAVE_GPL 1
+#define HAVE_POSIX 1
+#define HAVE_PTHREAD_CONDATTR_SETCLOCK 1
+#define HAVE_PTHREAD_SETNAME_NP 1
+#define HAVE_STDATOMIC 1
