@@ -252,6 +252,14 @@ static const m_option_t mp_vo_opt_list[] = {
 #if HAVE_EGL_ANDROID
     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
 #endif
+#if HAVE_ANDROID
+    {"android-dolby-vision-output", OPT_CHOICE(android_dolby_vision_output,
+        {"configured", ANDROID_DOLBY_VISION_OUTPUT_CONFIGURED},
+        {"direct", ANDROID_DOLBY_VISION_OUTPUT_DIRECT}), .flags = UPDATE_VO},
+    {"android-osd-wid", OPT_INT64(android_osd_wid),
+        .flags = UPDATE_VO},
+    {"android-osd-surface-size", OPT_SIZE_BOX(android_osd_surface_size)},
+#endif
 #if HAVE_D3D11
     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
 #endif
