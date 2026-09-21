@@ -253,6 +253,10 @@ typedef struct lavf_priv {
     bool own_stream;
     bool is_dvd_bd;
     bool is_dvd;
+    bool default_seekable;
+    bool requires_explicit_live_status;
+    bool poll_runtime_duration;
+    bool poll_runtime_state;
     char *filename;
     struct format_hack format_hack;
     const AVInputFormat *avif;
@@ -274,6 +278,7 @@ typedef struct lavf_priv {
     bool any_ts_fixed;
 
     int retry_counter;
+    bool stream_size_known;
 
     struct demux_packet *pending_pkt;
 
@@ -586,6 +591,55 @@ static char *replace_idx_ext(void *ta_ctx, bstr f)
         return NULL;
     char *ext = bstr_endswith0(f, "IDX") ? "SUB" : "sub"; // match case
     return talloc_asprintf(ta_ctx, "%.*s.%s", BSTR_P(bstr_splice(f, 0, -4)), ext);
+}
+
+static enum demux_live_state get_live_state(lavf_priv_t *priv,
+                                             AVFormatContext *avfc)
+{
+#if defined(AVFMTCTX_LIVE) && defined(AVFMTCTX_LIVE_STATUS_KNOWN)
+    if (avfc->ctx_flags & AVFMTCTX_LIVE_STATUS_KNOWN) {
+        return avfc->ctx_flags & AVFMTCTX_LIVE
+            ? DEMUX_LIVE_YES : DEMUX_LIVE_NO;
+    }
+#endif
+
+    if (priv->requires_explicit_live_status)
+        return DEMUX_LIVE_UNKNOWN;
+
+    if (priv->stream_size_known)
+        return DEMUX_LIVE_NO;
+
+    bool duration_known = avfc->duration != AV_NOPTS_VALUE;
+    for (int n = 0; n < avfc->nb_streams && !duration_known; n++)
+        duration_known = avfc->streams[n]->duration != AV_NOPTS_VALUE;
+
+    return duration_known ? DEMUX_LIVE_NO : DEMUX_LIVE_YES;
+}
+
+static bool should_poll_runtime_state(lavf_priv_t *priv,
+                                      enum demux_live_state live_state)
+{
+    return priv->poll_runtime_duration ||
+           live_state == DEMUX_LIVE_YES ||
+           (live_state == DEMUX_LIVE_UNKNOWN &&
+            priv->requires_explicit_live_status);
+}
+
+static bool get_seekable(struct demuxer *demuxer, lavf_priv_t *priv,
+                         AVFormatContext *avfc)
+{
+    if (demuxer->partially_seekable)
+        return true;
+    bool seekable = priv->default_seekable;
+#ifdef AVFMTCTX_UNSEEKABLE
+    seekable &= !(avfc->ctx_flags & AVFMTCTX_UNSEEKABLE);
+#endif
+    if (priv->format_hack.no_seek_on_no_duration &&
+        avfc->duration == AV_NOPTS_VALUE)
+    {
+        seekable = false;
+    }
+    return seekable;
 }
 
 static void guess_and_set_vobsub_name(struct demuxer *demuxer, AVDictionary **d)
@@ -1620,6 +1674,8 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
 
     demuxer->fully_read = priv->format_hack.fully_read;
 
+    priv->default_seekable =
+        demuxer->seekable && !priv->format_hack.no_seek;
 #ifdef AVFMTCTX_UNSEEKABLE
     if (avfc->ctx_flags & AVFMTCTX_UNSEEKABLE)
         demuxer->seekable = false;
@@ -1647,6 +1703,23 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     if (duration <= 0 && priv->avfc->duration > 0)
         duration = (double)priv->avfc->duration / AV_TIME_BASE;
     demuxer->duration = duration;
+    priv->stream_size_known =
+        priv->stream && stream_get_size(priv->stream) >= 0;
+    // HLS duration can shrink after opening when background ad probes finish.
+    bool is_hls = matches_avinputformat_name(priv, "hls");
+    int64_t hls_adblock = 0;
+    priv->poll_runtime_duration =
+        is_hls && priv->avfc->priv_data &&
+        av_opt_get_int(priv->avfc->priv_data, "hls_adblock", 0,
+                       &hls_adblock) >= 0 && hls_adblock != 0;
+    priv->requires_explicit_live_status =
+        is_hls ||
+        matches_avinputformat_name(priv, "dash") ||
+        matches_avinputformat_name(priv, "rtsp") ||
+        matches_avinputformat_name(priv, "sdp");
+    demuxer->live_state = get_live_state(priv, avfc);
+    priv->poll_runtime_state =
+        should_poll_runtime_state(priv, demuxer->live_state);
 
     if (demuxer->duration < 0 && priv->format_hack.no_seek_on_no_duration)
         demuxer->seekable = false;
@@ -1708,6 +1781,24 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
     MP_HANDLE_OOM(pkt);
     int r = av_read_frame(priv->avfc, pkt);
     update_read_stats(demux);
+    if (priv->poll_runtime_state) {
+        enum demux_live_state live_state = get_live_state(priv, priv->avfc);
+        double duration = demux->duration;
+        bool update_duration = live_state == DEMUX_LIVE_NO &&
+            (priv->poll_runtime_duration ||
+             demux->live_state == DEMUX_LIVE_YES);
+        if (update_duration && priv->avfc->duration != AV_NOPTS_VALUE)
+        {
+            duration = (double)priv->avfc->duration / AV_TIME_BASE;
+        }
+        bool seekable = get_seekable(demux, priv, priv->avfc);
+        if (duration != demux->duration || live_state != demux->live_state ||
+            seekable != demux->seekable)
+        {
+            demux_set_runtime_state(demux, duration, live_state, seekable);
+        }
+        priv->poll_runtime_state = should_poll_runtime_state(priv, live_state);
+    }
     if (r < 0) {
         av_packet_free(&pkt);
         if (r == AVERROR_EOF)
