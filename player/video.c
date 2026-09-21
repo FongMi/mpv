@@ -1063,7 +1063,10 @@ void write_video(struct MPContext *mpctx)
     if (mpctx->video_status == STATUS_READY)
         return;
 
-    if (mpctx->paused && mpctx->video_status >= STATUS_READY)
+    // A seek can report EOF before its first frame arrives. While the restart
+    // is in progress, let a paused player recover that frame below.
+    if (mpctx->paused && mpctx->video_status >= STATUS_READY &&
+        (mpctx->video_status != STATUS_EOF || mpctx->restart_complete))
         return;
 
     bool logical_eof = false;
