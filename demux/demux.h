@@ -121,11 +121,19 @@ enum demux_event {
     DEMUX_EVENT_INIT = 1 << 0,      // complete (re-)initialization
     DEMUX_EVENT_STREAMS = 1 << 1,   // a stream was added
     DEMUX_EVENT_METADATA = 1 << 2,  // metadata or stream_metadata changed
-    DEMUX_EVENT_DURATION = 1 << 3,  // duration updated
+    DEMUX_EVENT_DURATION = 1 << 3,  // duration or playback timeline updated
     DEMUX_EVENT_LISTS = 1 << 4,     // chapters / editions list changed
     DEMUX_EVENT_CODEC = 1 << 5,     // codec params of a stream replaced
+    DEMUX_EVENT_LIVE = 1 << 6,      // live state updated
+    DEMUX_EVENT_SEEKABLE = 1 << 7,  // seekable state updated
     DEMUX_EVENT_FAILED = 1 << 8,    // unrecoverable demuxer failure
     DEMUX_EVENT_ALL = 0xFFFF,
+};
+
+enum demux_live_state {
+    DEMUX_LIVE_UNKNOWN,
+    DEMUX_LIVE_NO,
+    DEMUX_LIVE_YES,
 };
 
 struct demuxer;
@@ -238,6 +246,7 @@ typedef struct demuxer {
     bool partially_seekable; // true if _maybe_ seekable; implies seekable=true
     double start_time;
     double duration;  // -1 if unknown
+    char *hls_ad_timeline;
     // File format allows PTS resets (even if the current file is without)
     bool ts_resets_possible;
     // The underlying source can switch to different content at any time, and
@@ -251,6 +260,7 @@ typedef struct demuxer {
     bool fully_read;
     bool is_network; // opened directly from a network stream
     bool is_streaming; // implies a "slow" input, such as network or FUSE
+    enum demux_live_state live_state;
     bool failed; // terminal failure; synchronized by demux_update()
     int stream_origin; // any STREAM_ORIGIN_* (set from source stream)
     bool access_references; // allow opening other files/URLs
@@ -324,6 +334,9 @@ int demux_get_num_stream(struct demuxer *demuxer);
 
 struct sh_stream *demux_alloc_sh_stream(enum stream_type type);
 void demux_add_sh_stream(struct demuxer *demuxer, struct sh_stream *sh);
+void demux_set_runtime_state(struct demuxer *demuxer, double duration,
+                             enum demux_live_state live_state, bool seekable,
+                             const char *hls_ad_timeline);
 void demux_set_failed(struct demuxer *demuxer);
 
 struct mp_cancel;

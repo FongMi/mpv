@@ -2364,6 +2364,26 @@ Property list
     ``duration/full``
         ``duration`` with milliseconds.
 
+``hls-ad-timeline``
+    The original playlist duration in microseconds, followed by semicolon-separated
+    removed intervals as ``start:end`` pairs. Interval endpoints refer to the
+    original playlist and the end is exclusive. With no removal, the value
+    contains only the duration. This property is available for single-playlist
+    HLS VOD with ad filtering enabled and a libavformat that exports the timeline.
+
+``media-live``
+    Whether the current media is live. The property is unavailable until the
+    demuxer can determine the value. HLS, DASH, and RTSP/SDP use
+    protocol-specific signalling when supported by the linked libavformat;
+    otherwise the property remains unavailable for these formats. Other
+    libavformat inputs follow progressive playback semantics: an input is
+    considered live when both its byte length and duration are unknown.
+    Consequently, a finite progressive input that provides neither value is
+    also reported as live.
+
+    This property does not describe seekability or whether the available media
+    window changes over time.
+
 ``avsync``
     Last A/V synchronization difference. Unavailable if audio or video is
     disabled.

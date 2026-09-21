@@ -737,6 +737,27 @@ static int mp_property_duration(void *ctx, struct m_property *prop,
     return property_time(action, arg, len);
 }
 
+static int mp_property_hls_ad_timeline(void *ctx, struct m_property *prop,
+                                       int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (!mpctx->demuxer)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_strdup_ro(action, arg, mpctx->demuxer->hls_ad_timeline);
+}
+
+static int mp_property_media_live(void *ctx, struct m_property *prop,
+                                  int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (!mpctx->demuxer ||
+        mpctx->demuxer->live_state == DEMUX_LIVE_UNKNOWN)
+        return M_PROPERTY_UNAVAILABLE;
+
+    return m_property_bool_ro(action, arg,
+                              mpctx->demuxer->live_state == DEMUX_LIVE_YES);
+}
+
 static int mp_property_avsync(void *ctx, struct m_property *prop,
                               int action, void *arg)
 {
@@ -4766,6 +4787,8 @@ static const struct m_property mp_properties_base[] = {
     {"stream-pos", mp_property_stream_pos},
     {"stream-end", mp_property_stream_end},
     {"duration", mp_property_duration},
+    {"hls-ad-timeline", mp_property_hls_ad_timeline},
+    {"media-live", mp_property_media_live},
     {"avsync", mp_property_avsync},
     {"total-avsync-change", mp_property_total_avsync_change},
     {"mistimed-frame-count", mp_property_mistimed_frame_count},
@@ -5007,7 +5030,7 @@ static const char *const *const mp_event_property_change[] = {
       "vf-metadata", "af-metadata", "sub-start", "sub-end", "secondary-sub-start",
       "secondary-sub-end", "sub-lines", "secondary-sub-lines", "video-out-params",
       "video-dec-params", "video-params", "deinterlace-active", "video-target-params"),
-    E(MP_EVENT_DURATION_UPDATE, "duration"),
+    E(MP_EVENT_DURATION_UPDATE, "duration", "hls-ad-timeline"),
     E(MPV_EVENT_VIDEO_RECONFIG, "video-out-params", "video-params",
       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
