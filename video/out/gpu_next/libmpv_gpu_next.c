@@ -179,11 +179,14 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     };
 
     // There is no display to take a color space from and none to hint one to.
-    mppl_video_begin_frame(p->renderer, frame, (struct pl_color_space){0}, 0);
-    struct mp_image_params target_params;
-    bool rendered_video;
-    mppl_video_render_frame(p->renderer, frame, &target, depth, NULL, false,
-                            &target_params, &rendered_video);
+    bool backend_error;
+    if (mppl_video_begin_frame(p->renderer, frame, (struct pl_color_space){0},
+                               0, &backend_error)) {
+        struct mp_image_params target_params;
+        bool rendered_video;
+        mppl_video_render_frame(p->renderer, frame, &target, depth, NULL, false,
+                                &target_params, &rendered_video, &backend_error);
+    }
 
     gpu_ctx_unwrap_ra_tex(gpu, ra, &fbo);
     p->context->fns->done_frame(p->context, frame->display_synced);

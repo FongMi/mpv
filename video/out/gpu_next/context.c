@@ -187,6 +187,9 @@ pl_tex gpu_ctx_wrap_ra_tex(pl_gpu gpu, struct ra *ra, struct ra_tex *ratex)
         struct pl_opengl_wrap_params par = {
             .width = ratex->params.w,
             .height = ratex->params.h,
+#if HAVE_LIBPLACEBO_OPENGL_EXTERNAL_YUV
+            .external_yuv = ratex->params.external_yuv,
+#endif
         };
 
         ra_gl_get_format(ratex->params.format, &par.iformat,

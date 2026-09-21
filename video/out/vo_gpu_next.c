@@ -107,7 +107,14 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     if (sw->fns->target_csp)
         display_csp = sw->fns->target_csp(sw);
     float display_ref_luma = sw->fns->target_ref_luma ? sw->fns->target_ref_luma(sw) : 0;
-    mppl_video_begin_frame(p->renderer, frame, display_csp, display_ref_luma);
+    bool backend_error;
+    if (!mppl_video_begin_frame(p->renderer, frame, display_csp,
+                                display_ref_luma, &backend_error))
+    {
+        if (backend_error)
+            vo_report_backend_error(vo);
+        return VO_FALSE;
+    }
 
     struct pl_color_space hint = {0};
     bool external_params = false;
@@ -134,7 +141,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     bool rendered_video;
     bool ok = mppl_video_render_frame(p->renderer, frame, &swframe, fb_depth,
                                       hint_mode == MPPL_VIDEO_HINT_NONE ? NULL : &hint,
-                                      external_osd, &target_params, &rendered_video);
+                                      external_osd, &target_params,
+                                      &rendered_video, &backend_error);
+    if (backend_error)
+        vo_report_backend_error(vo);
     p->frame_pending = true;
 #if HAVE_ANDROID
     if (rendered_video)
@@ -451,6 +461,7 @@ const struct vo_driver video_out_gpu_next = {
     .caps = VO_CAP_ROTATE90 |
             VO_CAP_FILM_GRAIN |
             VO_CAP_VFLIP |
+            VO_CAP_GPU_DOVI |
             0x0,
     .preinit = preinit,
     .query_format = query_format,
