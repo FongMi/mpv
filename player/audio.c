@@ -385,10 +385,16 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
     // Weak gapless audio: if the filter output format is the same as the
     // previous one, keep the AO and don't reinit anything.
     // Strong gapless: always keep the AO
-    if ((mpctx->ao_filter_fmt && mpctx->ao && opts->gapless_audio < 0 &&
-         keep_weak_gapless_format(mpctx->ao_filter_fmt, out_fmt)) ||
-        (mpctx->ao && opts->gapless_audio > 0))
+    if (((mpctx->ao_filter_fmt && mpctx->ao && opts->gapless_audio < 0 &&
+          keep_weak_gapless_format(mpctx->ao_filter_fmt, out_fmt)) ||
+         (mpctx->ao && opts->gapless_audio > 0)) &&
+        mpctx->ao_filter_fmt &&
+        ((af_fmt_is_pcm(mp_aframe_get_format(out_fmt)) &&
+          af_fmt_is_pcm(mp_aframe_get_format(mpctx->ao_filter_fmt))) ||
+         mp_aframe_config_equals(mpctx->ao_filter_fmt, out_fmt)))
     {
+        if (track && track->dec)
+            mp_decoder_wrapper_accept_passthrough(track->dec, out_fmt);
         ao_chain_set_ao(ao_c, mpctx->ao);
         talloc_free(out_fmt);
         return 0;
@@ -465,17 +471,21 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
     }
 
     if (!mpctx->ao) {
-        // If spdif was used, try to fallback to PCM.
+        // Try the next passthrough format before falling back to PCM.
         if (spdif_fallback && ao_c->track && ao_c->track->dec) {
-            MP_VERBOSE(mpctx, "Falling back to PCM output.\n");
-            ao_c->spdif_passthrough = false;
-            ao_c->spdif_failed = true;
-            mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, false);
-            if (!mp_decoder_wrapper_reinit(ao_c->track->dec))
+            if (!mp_decoder_wrapper_fallback_passthrough(
+                    ao_c->track->dec, out_format, &ao_c->spdif_passthrough, false))
                 goto init_error;
+            MP_VERBOSE(mpctx, "Falling back to %s output.\n",
+                       ao_c->spdif_passthrough ? "IEC61937" : "PCM");
+            ao_c->spdif_failed = true;
             reset_audio_state(mpctx);
             mp_output_chain_reset_harder(ao_c->filter);
-            mp_wakeup_core(mpctx); // reinit with new format next time
+            // The old format change left a pending request at the AO input.
+            // Reissue it so the reset filter chain negotiates the new format.
+            mp_filter_reset(ao_c->ao_filter);
+            mp_filter_wakeup(ao_c->ao_filter);
+            mp_wakeup_core(mpctx);
             return 0;
         }
 
@@ -496,6 +506,9 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
 
     bool eof = mpctx->audio_status == STATUS_EOF;
     ao_set_paused(mpctx->ao, get_internal_paused(mpctx), eof);
+
+    if (track && track->dec)
+        mp_decoder_wrapper_accept_passthrough(track->dec, out_fmt);
 
     ao_chain_set_ao(ao_c, mpctx->ao);
 
@@ -675,6 +688,16 @@ static void ao_process(struct mp_filter *f)
         mp_async_queue_is_full(ao_c->ao_queue))
         mp_wakeup_core(mpctx);
 
+    // Finish audio already accepted by the AO before changing transport.
+    if (ao_c->filter->passthrough_rejected) {
+        if (!ao_c->out_eof && mp_pin_in_needs_data(ao_c->queue_filter->pins[0])) {
+            ao_c->out_eof = true;
+            mp_pin_in_write(ao_c->queue_filter->pins[0], MP_EOF_FRAME);
+            mp_wakeup_core(mpctx);
+        }
+        return;
+    }
+
     if (mpctx->audio_status == STATUS_SYNCING && !ao_c->start_pts_known)
         return;
 
@@ -707,6 +730,9 @@ static void ao_process(struct mp_filter *f)
 
         int samples = mp_aframe_get_size(af);
         if (!samples) {
+            if (!af_fmt_is_pcm(mp_aframe_get_format(af)) &&
+                ao_c->track && ao_c->track->dec)
+                mp_decoder_wrapper_accept_passthrough(ao_c->track->dec, af);
             mp_filter_internal_mark_progress(f);
             mp_frame_unref(&frame);
             return;
@@ -748,6 +774,9 @@ static void ao_process(struct mp_filter *f)
             MP_VERBOSE(mpctx, "previous audio still playing; continuing\n");
         }
 
+        if (!af_fmt_is_pcm(mp_aframe_get_format(af)) &&
+            ao_c->track && ao_c->track->dec)
+            mp_decoder_wrapper_accept_passthrough(ao_c->track->dec, af);
         mp_pin_in_write(ao_c->queue_filter->pins[0], frame);
     } else if (frame.type == MP_FRAME_EOF) {
         MP_VERBOSE(mpctx, "audio filter EOF\n");
@@ -878,6 +907,36 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (!ao_c)
         return;
+
+    if (ao_c->filter->passthrough_rejected && ao_c->track && ao_c->track->dec) {
+        if (ao_c->ao && (ao_is_playing(ao_c->ao) ||
+                        mp_async_queue_get_frames(ao_c->ao_queue)))
+        {
+            if (mpctx->audio_status == STATUS_SYNCING) {
+                mpctx->audio_status = STATUS_READY;
+                mp_wakeup_core(mpctx);
+            } else if (mpctx->audio_status != STATUS_READY &&
+                       !ao_is_playing(ao_c->ao))
+            {
+                ao_start(ao_c->ao);
+            }
+            mp_filter_wakeup(ao_c->ao_filter);
+            return;
+        }
+        if (!mp_decoder_wrapper_fallback_passthrough(
+                ao_c->track->dec, AF_FORMAT_UNKNOWN, &ao_c->spdif_passthrough, true))
+        {
+            error_on_track(mpctx, ao_c->track);
+            return;
+        }
+        uninit_audio_out(mpctx);
+        reset_audio_state(mpctx);
+        mp_output_chain_reset_harder(ao_c->filter);
+        mp_filter_reset(ao_c->ao_filter);
+        mp_filter_wakeup(ao_c->ao_filter);
+        mp_wakeup_core(mpctx);
+        return;
+    }
 
     if (ao_c->filter->failed_output_conversion) {
         error_on_track(mpctx, ao_c->track);
