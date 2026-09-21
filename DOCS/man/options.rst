@@ -7219,6 +7219,48 @@ them.
 
     Android with ``--gpu-context=android`` only.
 
+``--android-dolby-vision-output=<configured|direct>``
+    Select how Dolby Vision video tracks are sent to an Android rendering
+    surface:
+
+    :configured: Keep the configured video output. This is the default.
+    :direct: Use ``vo=mediacodec_embed`` for Dolby Vision tracks so MediaCodec
+             renders directly to the application surface. Non-Dolby Vision
+             tracks continue to use the configured video output.
+
+    ``direct`` requires ``hwdec=mediacodec``, a SurfaceView-backed video
+    surface (``--wid``), and a transparent OSD surface
+    (``--android-osd-wid``). The video bypasses mpv's GPU renderer.
+    Subtitles and mpv OSD are rendered into the separate transparent surface,
+    including styled ASS/SSA, text subtitles, image subtitles, primary plus
+    secondary tracks, and script-provided OSD such as the stats overlay. Video
+    filters, screenshots, and GPU tone mapping remain unavailable while a
+    Dolby Vision track is using direct output. If the direct video surface,
+    decoder initialization, or overlay surface repeatedly fails, mpv retries
+    the track through the configured video output. Profiles without a
+    standards-compatible base layer then require software decoding; compatible
+    profiles may fall back to their base-layer HDR or SDR representation
+    instead of native Dolby Vision.
+
+    Android only.
+
+``--android-osd-wid=<ID>``
+    Android embedding option that supplies a retained Java ``Surface`` global
+    reference for the transparent OSD plane used by direct MediaCodec output.
+    It carries subtitles, mpv OSD, and script-provided overlays. The embedding
+    application owns the reference and must keep it valid until the option is
+    replaced or reset to ``0``.
+
+    Android only.
+
+``--android-osd-surface-size=<WxH>``
+    Set the dimensions of the transparent OSD surface used by direct
+    MediaCodec output. The embedding application should update this option
+    from the OSD surfaceChanged callback so subtitle and OSD geometry follows
+    runtime layout changes without waiting for a later buffer swap.
+
+    Android only.
+
 ``--d3d11-composition-size=<WxH>``
     Set size of the output for d3d11 composition mode.
     When use composition mode, there is no window, must set the output size by
@@ -7357,11 +7399,15 @@ them.
     depending on the GPU context and platform this may affect compositor/display.
     This can be used for "HDR passthrough" and to set the output colorspace
     for SDR content. In ``auto`` mode, the target colorspace is only set if the
-    current display parameters are known. Currently, this is supported on
-    Wayland, D3D11 and winvk contexts. The ``yes`` option will always try to set
+    current display parameters are known, or if the output context can safely
+    negotiate the requested colorspace. Currently, this is supported on Wayland,
+    winvk, androidvk and Android/EGL contexts with ``--vo=gpu`` or
+    ``--vo=gpu-next``, and on D3D11 with ``--vo=gpu-next``. Android/EGL requires
+    the requested EGL colorspace extension. If the display parameters are
+    unknown, ``auto`` uses source metadata and respects the colorspace actually
+    negotiated by the output context. The ``yes`` option will always try to set
     the colorspace, you may need to adjust the ``--target-*`` options to match
-    your display capabilities.
-    Requires a supporting driver and ``--vo=gpu-next``. (Default: ``auto``)
+    your display capabilities. (Default: ``auto``)
 
     .. note::
         Auto detected target colorspace metadata is not guaranteed to be always
@@ -7370,7 +7416,6 @@ them.
 
 ``--target-colorspace-hint-mode=<target|source|source-dynamic>``
     Select which metadata to use for the ``--target-colorspace-hint``.
-    (Only for ``--vo=gpu-next``)
 
     target
         Uses metadata based on the target display's actual capabilities. This
@@ -7463,7 +7508,7 @@ them.
     hint, while the negotiated swapchain format is used for rendering output.
     This ensures correct results, since downstream processing depends on the
     signaled colorspace. When disabled, the swapchain colorspace will be
-    overridden to match the ``--target-*`` options. (Only for ``--vo=gpu-next``)
+    overridden to match the ``--target-*`` options.
 
 ``--target-prim=<value>``
     Specifies the primaries of the display. Video colors will be adapted to
