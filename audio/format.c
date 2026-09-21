@@ -70,7 +70,12 @@ bool af_fmt_is_spdif(int format)
 bool af_fmt_is_pcm(int format)
 {
     return af_fmt_is_valid(format) && !af_fmt_is_spdif(format) &&
-           format != AF_FORMAT_S_DOP;
+           !af_fmt_is_encoded(format) && format != AF_FORMAT_S_DOP;
+}
+
+bool af_fmt_is_encoded(int format)
+{
+    return format >= AF_FORMAT_RAW_AC3 && format <= AF_FORMAT_RAW_TRUEHD;
 }
 
 static const int planar_formats[][2] = {
@@ -144,6 +149,11 @@ const char *af_fmt_to_str(int format)
     case AF_FORMAT_S_TRUEHD:    return "spdif-truehd";
     case AF_FORMAT_S_DOP:       return "dop";
     case AF_FORMAT_DSD:         return "dsd";
+    case AF_FORMAT_RAW_AC3:     return "raw-ac3";
+    case AF_FORMAT_RAW_EAC3:    return "raw-eac3";
+    case AF_FORMAT_RAW_DTS:     return "raw-dts";
+    case AF_FORMAT_RAW_DTSHD:   return "raw-dtshd";
+    case AF_FORMAT_RAW_TRUEHD:  return "raw-truehd";
     }
     return "??";
 }
