@@ -94,6 +94,15 @@ dvdnav_commands = executable('dvdnav-commands',
     ['dvdnav_commands.c', dvdnav_commands_header])
 test('dvdnav-commands', dvdnav_commands)
 
+if features['lua']
+    lua_test = find_program('luajit', 'lua5.2', 'lua52', 'lua5.1', 'lua51', 'lua',
+                            native: true, required: false)
+    if lua_test.found()
+        test('stats-audio', lua_test,
+             args: [files('stats_audio.lua'), files('../player/lua/stats.lua')])
+    endif
+endif
+
 drm_modeset_functions = custom_target('drm-modeset-functions',
     input: files('../video/out/opengl/context_drm_egl.c'),
     output: 'drm_modeset_functions.h',
@@ -291,6 +300,15 @@ if features['audiotrack']
         c_args: ['-ffunction-sections', '-fdata-sections'],
         link_args: ['-Wl,--gc-sections'])
     test('decoder-passthrough', decoder_passthrough)
+
+    # Keep unused driver/core functions discardable when cplugins adds -rdynamic.
+    ao_audiotrack = executable('ao-audiotrack', 'ao_audiotrack.c',
+        '../audio/chmap_sel.c', '../audio/out/ao.c',
+        include_directories: incdir, dependencies: [libavutil],
+        objects: aframe_objects, link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections', '-Wl,--no-export-dynamic'])
+    test('ao-audiotrack', ao_audiotrack)
 
     ao_buffer = executable('ao-buffer', 'ao_buffer.c',
         include_directories: incdir, dependencies: [libavutil],
