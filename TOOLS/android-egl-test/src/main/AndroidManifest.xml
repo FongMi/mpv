@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:theme="@android:style/Theme.Material.NoActionBar"
+        android:label="mpv EGL regression" android:allowBackup="false">
+        <activity android:name=".SurfaceActivity" android:exported="false"
+            android:screenOrientation="landscape" />
+    </application>
+</manifest>
