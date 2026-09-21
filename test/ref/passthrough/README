@@ -1,0 +1,7 @@
+These fixtures contain generated 48 kHz, six-channel digital silence.
+They were created with FFmpeg's anullsrc filter, without media from another work.
+
+ffmpeg -f lavfi -i anullsrc=r=48000:cl=5.1 -t 0.032 -c:a ac3 -b:a 192k silence.ac3
+ffmpeg -f lavfi -i anullsrc=r=48000:cl=5.1 -t 0.032 -c:a eac3 -b:a 192k silence.eac3
+ffmpeg -f lavfi -i anullsrc=r=48000:cl=5.1 -t 0.01066667 -c:a dca -strict -2 -b:a 768k silence.dts
+ffmpeg -f lavfi -i anullsrc=r=48000:cl=5.1 -t 0.04 -c:a truehd -strict -2 silence.thd

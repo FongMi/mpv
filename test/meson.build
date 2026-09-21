@@ -242,6 +242,44 @@ if refdir != ''
     endif
 endif
 
+if features['audiotrack']
+    ad_passthrough = executable('ad-passthrough', 'ad_passthrough.c',
+        include_directories: incdir,
+        dependencies: [libavutil, libavcodec, libavformat,
+                      libplacebo.partial_dependency(compile_args: true, includes: true)],
+        objects: aframe_objects,
+        link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections'])
+    test('ad-passthrough', ad_passthrough,
+         args: join_paths(source_root, 'test/ref/passthrough'))
+
+    decoder_passthrough = executable('decoder-passthrough', 'decoder_passthrough.c',
+        include_directories: incdir,
+        dependencies: [libavutil,
+                      libplacebo.partial_dependency(compile_args: true, includes: true)],
+        objects: aframe_objects, link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections'])
+    test('decoder-passthrough', decoder_passthrough)
+
+    ao_buffer = executable('ao-buffer', 'ao_buffer.c',
+        include_directories: incdir, dependencies: [libavutil],
+        objects: aframe_objects, link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections', '-Wl,--no-export-dynamic'])
+    test('ao-buffer', ao_buffer)
+
+    output_chain = executable('output-chain', 'output_chain.c',
+        include_directories: incdir,
+        dependencies: [libavutil,
+                      libplacebo.partial_dependency(compile_args: true, includes: true)],
+        objects: aframe_objects, link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections'])
+    test('output-chain', output_chain)
+endif
+
 if features['dvdnav']
     dvdnav_test = executable('dvdnav', 'dvdnav.c',
         gnu_symbol_visibility: 'hidden',

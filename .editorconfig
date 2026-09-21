@@ -24,3 +24,11 @@ trim_trailing_whitespace = unset
 
 [menu.conf]
 indent_style = tab
+
+[test/ref/passthrough/*.{ac3,dts,eac3,thd}]
+charset = unset
+insert_final_newline = unset
+indent_style = unset
+indent_size = unset
+max_line_length = unset
+trim_trailing_whitespace = unset
