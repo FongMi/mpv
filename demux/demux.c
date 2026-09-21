@@ -1110,6 +1110,33 @@ void demux_add_sh_stream(struct demuxer *demuxer, struct sh_stream *sh)
     mp_mutex_unlock(&in->lock);
 }
 
+void demux_set_runtime_state(struct demuxer *demuxer, double duration,
+                             enum demux_live_state live_state, bool seekable)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_assert(demuxer == in->d_thread);
+
+    mp_mutex_lock(&in->lock);
+    int events = 0;
+    if (demuxer->duration != duration) {
+        demuxer->duration = duration;
+        in->duration = duration;
+        events |= DEMUX_EVENT_DURATION;
+    }
+    if (demuxer->live_state != live_state) {
+        demuxer->live_state = live_state;
+        events |= DEMUX_EVENT_LIVE;
+    }
+    if (demuxer->seekable != seekable) {
+        demuxer->seekable = seekable;
+        events |= DEMUX_EVENT_SEEKABLE;
+    }
+    in->events |= events;
+    if (events && in->wakeup_cb)
+        in->wakeup_cb(in->wakeup_cb_ctx);
+    mp_mutex_unlock(&in->lock);
+}
+
 // Report an unrecoverable failure from the demuxer thread. The player maps
 // this to a playback error, rather than treating the following EOF as an end.
 void demux_set_failed(struct demuxer *demuxer)
@@ -3228,6 +3255,7 @@ static void demux_copy(struct demuxer *dst, struct demuxer *src)
     dst->duration = src->duration;
     dst->is_network = src->is_network;
     dst->is_streaming = src->is_streaming;
+    dst->live_state = src->live_state;
     dst->stream_origin = src->stream_origin;
     dst->priv = src->priv;
     dst->metadata = mp_tags_dup(dst, src->metadata);
@@ -3460,6 +3488,10 @@ void demux_update(demuxer_t *demuxer, double pts)
         demux_update_replaygain(demuxer);
     if (demuxer->events & DEMUX_EVENT_DURATION)
         demuxer->duration = in->duration;
+    if (demuxer->events & DEMUX_EVENT_LIVE)
+        demuxer->live_state = in->d_thread->live_state;
+    if (demuxer->events & DEMUX_EVENT_SEEKABLE)
+        demuxer->seekable = in->d_thread->seekable;
     if (demuxer->events & DEMUX_EVENT_FAILED)
         demuxer->failed = in->d_thread->failed;
 
@@ -3591,6 +3623,7 @@ static struct demuxer *open_given_type(struct mpv_global *global,
         .opts_cache = opts_cache,
         .events = DEMUX_EVENT_INIT | DEMUX_EVENT_DURATION | DEMUX_EVENT_METADATA | DEMUX_EVENT_STREAMS,
         .duration = -1,
+        .live_state = DEMUX_LIVE_UNKNOWN,
         .depth = params ? params->depth : 0,
     };
 
