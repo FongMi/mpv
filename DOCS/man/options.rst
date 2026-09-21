@@ -2141,6 +2141,10 @@ Audio
     (receiver and OS support varies). If both ``dts`` and ``dts-hd`` are
     specified, it behaves equivalent to specifying ``dts-hd`` only.
 
+    On Android, ``audiotrack`` first tries sending the original compressed
+    access units to the platform. If the output rejects the stream format,
+    mpv tries IEC61937 encapsulation before falling back to PCM decoding.
+
     ``dsd`` enables bit-perfect passthrough of DSD audio, requires an audio
     output with exclusive device access (currently ``wasapi``) and a DAC that
     accepts DoP at the resulting PCM rate (176.4 kHz for DSD64, 352.8 kHz for
