@@ -36,6 +36,8 @@ struct ao {
     bool untimed;               // don't assume realtime playback
     int device_buffer;          // device buffer in samples (guessed by
                                 // common init code if not set by driver)
+    int64_t poll_interval_ns;    // push AO polling interval if the device buffer
+                                // cannot be expressed in samples
     const struct ao_driver *driver;
     bool driver_initialized;
     void *priv;
@@ -130,12 +132,16 @@ struct mp_pcm_state {
 struct ao_driver {
     // If true, use with encoding only.
     bool encode;
+    // Accept raw compressed access units, with byte lengths independent of
+    // decoded sample counts. Other drivers must not receive these formats.
+    bool accepts_encoded;
     // Name used for --ao.
     const char *name;
     // Description shown with --ao=help.
     const char *description;
-    // If true, write units of entire frames. The write() call is modified to
-    // use data==mp_aframe. Useful for encoding AO only.
+    // If true, write units of entire frames. write() receives a pointer to a
+    // borrowed mp_aframe reference. The driver must reference it if needed
+    // after write() returns. free_samples is a count of these frames.
     bool write_frames;
     // Init the device using ao->format/ao->channels/ao->samplerate. If the
     // device doesn't accept these parameters, you can attempt to negotiate
@@ -171,6 +177,9 @@ struct ao_driver {
     // immediately reported an underrun.
     // Return false on failure.
     bool (*write)(struct ao *ao, void **data, int samples);
+    // push based: no more data will be written until the queued audio drains.
+    // Optional. get_state() must keep reporting the remaining delay.
+    void (*drain)(struct ao *ao);
     // push based: return mandatory stream information
     void (*get_state)(struct ao *ao, struct mp_pcm_state *state);
 
