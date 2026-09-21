@@ -241,12 +241,19 @@ void step_frame_mute(struct MPContext *mpctx, bool mute)
 static void update_sparse_video(struct MPContext *mpctx)
 {
     struct vo_chain *vo_c = mpctx->vo_chain;
-    if (vo_c && !vo_c->is_sparse && vo_c->track && vo_c->track->stream &&
-        vo_c->track->stream->still_image)
-    {
-        MP_VERBOSE(mpctx, "video track consists of sparse still images\n");
-        vo_c->is_sparse = true;
-    }
+    if (!vo_c || !vo_c->track || !vo_c->track->stream)
+        return;
+
+    bool still_image = demux_get_stream_still_image(vo_c->track->demuxer,
+                                                    vo_c->track->stream);
+    if (still_image == vo_c->demuxer_still_image)
+        return;
+
+    // Preserve single-image detection while the demuxer declaration is unchanged.
+    vo_c->demuxer_still_image = still_image;
+    vo_c->is_sparse = still_image || vo_c->is_coverart;
+    MP_VERBOSE(mpctx, "video track sparse still images: %s\n",
+               vo_c->is_sparse ? "yes" : "no");
 }
 
 // Clear some playback-related fields on file loading or after seeks.

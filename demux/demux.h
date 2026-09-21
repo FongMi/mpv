@@ -332,6 +332,7 @@ void demux_drive_nav(struct demuxer *demuxer);
 void demux_nav_refresh(struct demuxer *demuxer);
 void demux_set_stream_still_image(struct demuxer *demuxer,
                                   struct sh_stream *sh, bool still_image);
+bool demux_get_stream_still_image(struct demuxer *demuxer, struct sh_stream *sh);
 void demux_set_stream_absent(struct demuxer *demuxer, struct sh_stream *sh,
                              bool absent);
 
