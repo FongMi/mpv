@@ -22,6 +22,13 @@ struct AVFrame *mp_aframe_get_raw_avframe(struct mp_aframe *frame);
 bool mp_aframe_is_allocated(struct mp_aframe *frame);
 bool mp_aframe_alloc_data(struct mp_aframe *frame, int samples);
 
+// Store a complete compressed access unit. The format, rate and channel map
+// must be configured first. samples is the decoded sample count, not bytes.
+bool mp_aframe_set_encoded_data(struct mp_aframe *frame, const uint8_t *data,
+                               int bytes, int samples);
+const uint8_t *mp_aframe_get_encoded_data(struct mp_aframe *frame);
+int mp_aframe_get_encoded_size(struct mp_aframe *frame);
+
 void mp_aframe_config_copy(struct mp_aframe *dst, struct mp_aframe *src);
 bool mp_aframe_config_equals(struct mp_aframe *a, struct mp_aframe *b);
 bool mp_aframe_config_is_valid(struct mp_aframe *frame);

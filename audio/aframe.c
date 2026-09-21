@@ -30,9 +30,12 @@
 
 struct mp_aframe {
     AVFrame *av_frame;
+    // Raw compressed access units are not PCM planes. nb_samples still holds
+    // their decoded sample count for timestamps and queue duration accounting.
+    AVBufferRef *encoded;
     // We support channel layouts different from AVFrame channel masks
     struct mp_chmap chmap;
-    // We support bitstream formats, which are allocated as fake integer PCM
+    // IEC61937 bitstream formats are allocated as fake integer PCM
     // of matching sample size.
     int format;
     double pts;
@@ -46,6 +49,7 @@ struct avframe_opaque {
 static void free_frame(void *ptr)
 {
     struct mp_aframe *frame = ptr;
+    av_buffer_unref(&frame->encoded);
     av_frame_free(&frame->av_frame);
 }
 
@@ -71,7 +75,12 @@ struct mp_aframe *mp_aframe_new_ref(struct mp_aframe *frame)
     dst->pts = frame->pts;
     dst->speed = frame->speed;
 
-    if (mp_aframe_is_allocated(frame)) {
+    if (frame->encoded) {
+        mp_aframe_config_copy(dst, frame);
+        dst->encoded = av_buffer_ref(frame->encoded);
+        MP_HANDLE_OOM(dst->encoded);
+        dst->av_frame->nb_samples = frame->av_frame->nb_samples;
+    } else if (mp_aframe_is_allocated(frame)) {
         if (av_frame_ref(dst->av_frame, frame->av_frame) < 0)
             abort();
     } else {
@@ -85,6 +94,7 @@ struct mp_aframe *mp_aframe_new_ref(struct mp_aframe *frame)
 // Revert to state after mp_aframe_create().
 void mp_aframe_reset(struct mp_aframe *frame)
 {
+    av_buffer_unref(&frame->encoded);
     av_frame_unref(frame->av_frame);
     frame->chmap.num = 0;
     frame->format = 0;
@@ -114,6 +124,31 @@ bool mp_aframe_alloc_data(struct mp_aframe *frame, int samples)
     int r = mp_aframe_pool_allocate(p, frame, samples);
     talloc_free(p);
     return r >= 0;
+}
+
+bool mp_aframe_set_encoded_data(struct mp_aframe *frame, const uint8_t *data,
+                               int bytes, int samples)
+{
+    if (!af_fmt_is_encoded(frame->format) || !mp_aframe_config_is_valid(frame) ||
+        mp_aframe_is_allocated(frame) || !data || bytes <= 0 || samples <= 0)
+        return false;
+
+    frame->encoded = av_buffer_alloc(bytes);
+    if (!frame->encoded)
+        return false;
+    memcpy(frame->encoded->data, data, bytes);
+    frame->av_frame->nb_samples = samples;
+    return true;
+}
+
+const uint8_t *mp_aframe_get_encoded_data(struct mp_aframe *frame)
+{
+    return frame->encoded ? frame->encoded->data : NULL;
+}
+
+int mp_aframe_get_encoded_size(struct mp_aframe *frame)
+{
+    return frame->encoded ? frame->encoded->size : 0;
 }
 
 // Return a new reference to the data in av_frame. av_frame itself is not
@@ -158,7 +193,7 @@ struct mp_aframe *mp_aframe_from_avframe(struct AVFrame *av_frame)
 // Does not copy the timestamps.
 struct AVFrame *mp_aframe_to_avframe(struct mp_aframe *frame)
 {
-    if (!frame)
+    if (!frame || af_fmt_is_encoded(frame->format))
         return NULL;
 
     if (af_to_avformat(frame->format) != frame->av_frame->format)
@@ -196,7 +231,8 @@ struct AVFrame *mp_aframe_get_raw_avframe(struct mp_aframe *frame)
 // Return whether it has associated audio data. (If not, metadata only.)
 bool mp_aframe_is_allocated(struct mp_aframe *frame)
 {
-    return frame->av_frame->buf[0] || frame->av_frame->extended_data[0];
+    return frame->encoded || frame->av_frame->buf[0] ||
+           frame->av_frame->extended_data[0];
 }
 
 // Clear dst, and then copy the configuration to it.
@@ -254,6 +290,8 @@ bool mp_aframe_config_is_valid(struct mp_aframe *frame)
 // the audio data. Returns NULL if no frame allocated.
 uint8_t **mp_aframe_get_data_ro(struct mp_aframe *frame)
 {
+    if (af_fmt_is_encoded(frame->format))
+        return NULL;
     return mp_aframe_is_allocated(frame) ? frame->av_frame->extended_data : NULL;
 }
 
@@ -261,6 +299,8 @@ uint8_t **mp_aframe_get_data_ro(struct mp_aframe *frame)
 // Additionally, it will return NULL if copy-on-write fails.
 uint8_t **mp_aframe_get_data_rw(struct mp_aframe *frame)
 {
+    if (af_fmt_is_encoded(frame->format))
+        return NULL;
     if (!mp_aframe_is_allocated(frame))
         return NULL;
     if (av_frame_make_writable(frame->av_frame) < 0)
@@ -306,7 +346,7 @@ bool mp_aframe_set_format(struct mp_aframe *frame, int format)
     if (mp_aframe_is_allocated(frame))
         return false;
     enum AVSampleFormat av_format = af_to_avformat(format);
-    if (av_format == AV_SAMPLE_FMT_NONE && format) {
+    if (av_format == AV_SAMPLE_FMT_NONE && format && !af_fmt_is_encoded(format)) {
         if (af_fmt_is_pcm(format))
             return false;
         av_format = af_fmt_to_bytes(format) == 4 ? AV_SAMPLE_FMT_S32
@@ -341,6 +381,9 @@ bool mp_aframe_set_rate(struct mp_aframe *frame, int rate)
 bool mp_aframe_set_size(struct mp_aframe *frame, int samples)
 {
     if (!mp_aframe_is_allocated(frame) || mp_aframe_get_size(frame) < samples)
+        return false;
+    if (af_fmt_is_encoded(frame->format) && samples > 0 &&
+        samples != mp_aframe_get_size(frame))
         return false;
     frame->av_frame->nb_samples = MPMAX(samples, 0);
     return true;
@@ -421,6 +464,14 @@ char *mp_aframe_format_str_buf(char *buf, size_t buf_size, struct mp_aframe *fmt
 void mp_aframe_skip_samples(struct mp_aframe *f, int samples)
 {
     mp_assert(samples >= 0 && samples <= mp_aframe_get_size(f));
+
+    if (af_fmt_is_encoded(f->format)) {
+        mp_assert(samples == 0 || samples == mp_aframe_get_size(f));
+        f->av_frame->nb_samples -= samples;
+        if (f->pts != MP_NOPTS_VALUE)
+            f->pts += samples / mp_aframe_get_effective_rate(f);
+        return;
+    }
 
     if (av_frame_make_writable(f->av_frame) < 0)
         return; // go complain to ffmpeg
@@ -612,6 +663,8 @@ bool mp_aframe_reverse(struct mp_aframe *f)
 
 int mp_aframe_approx_byte_size(struct mp_aframe *frame)
 {
+    if (af_fmt_is_encoded(frame->format))
+        return sizeof(*frame) + mp_aframe_get_encoded_size(frame);
     // God damn, AVFrame is too fucking annoying. Just go with the size that
     // allocating a new frame would use.
     int planes = mp_aframe_get_planes(frame);

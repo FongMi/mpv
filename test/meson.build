@@ -36,6 +36,10 @@ if win32
     test_utils_files += 'osdep/windows_utils.c'
 endif
 
+if features['android']
+    test_utils_files += 'osdep/android/strnlen.c'
+endif
+
 if features['pthread-debug']
     test_utils_files += 'osdep/threads-posix.c'
 endif
@@ -98,6 +102,14 @@ swresample = executable('swresample', 'swresample.c', include_directories: incdi
                         dependencies: [libavcodec, libavutil, libswresample, libplacebo],
                         objects: swresample_objects, link_with: [img_utils, test_utils])
 test('swresample', swresample)
+
+aframe_objects = libmpv.extract_objects('audio/aframe.c',
+                                       'audio/chmap_avchannel.c',
+                                       'audio/fmt-conversion.c')
+aframe = executable('aframe', 'aframe.c', include_directories: incdir,
+                    dependencies: [libavutil], objects: aframe_objects,
+                    link_with: test_utils)
+test('aframe', aframe)
 
 gl_video_objects = libmpv.extract_objects('video/out/gpu/ra.c',
                                           'video/out/gpu/utils.c')
