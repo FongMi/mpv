@@ -75,6 +75,8 @@ int main(void)
 
     TEST_NORMALIZE("", "");
     TEST_NORMALIZE("https://foo", "https://foo");
+    TEST_NORMALIZE("data:,hello/../world", "data:,hello/../world");
+    TEST_NORMALIZE("DATA:,hello/../world", "DATA:,hello/../world");
 #if !HAVE_DOS_PATHS
     TEST_NORMALIZE("/foo", "/foo");
 #endif
