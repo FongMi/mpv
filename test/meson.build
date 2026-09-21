@@ -263,6 +263,15 @@ if features['audiotrack']
         link_args: ['-Wl,--gc-sections'])
     test('decoder-passthrough', decoder_passthrough)
 
+    # Keep unused driver/core functions discardable when cplugins adds -rdynamic.
+    ao_audiotrack = executable('ao-audiotrack', 'ao_audiotrack.c',
+        '../audio/chmap_sel.c', '../audio/out/ao.c',
+        include_directories: incdir, dependencies: [libavutil],
+        objects: aframe_objects, link_with: test_utils,
+        c_args: ['-ffunction-sections', '-fdata-sections'],
+        link_args: ['-Wl,--gc-sections', '-Wl,--no-export-dynamic'])
+    test('ao-audiotrack', ao_audiotrack)
+
     ao_buffer = executable('ao-buffer', 'ao_buffer.c',
         include_directories: incdir, dependencies: [libavutil],
         objects: aframe_objects, link_with: test_utils,

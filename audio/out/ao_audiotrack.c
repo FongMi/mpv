@@ -24,6 +24,7 @@
 #include "ao.h"
 #include "internal.h"
 #include "common/msg.h"
+#include "audio/aframe.h"
 #include "audio/format.h"
 #include "options/m_option.h"
 #include "osdep/threads.h"
@@ -32,6 +33,12 @@
 
 static mp_static_mutex jni_static_lock = MP_STATIC_MUTEX_INITIALIZER;
 static int jni_static_use_count = 0;
+static const struct ao_driver audio_out_audiotrack_encoded;
+static const struct ao_driver audio_out_audiotrack_pull;
+
+enum {
+    ANDROID_API_LEVEL_S = 31,
+};
 
 struct priv {
     jobject audiotrack;
@@ -39,6 +46,18 @@ struct priv {
     jint channel_config;
     jint format;
     jint size;
+    jint min_buffer_size;
+
+    struct mp_aframe *encoded_frame;
+    int encoded_offset;
+    uint64_t encoded_written;
+    uint64_t encoded_playhead;
+    uint64_t stop_playhead;
+    int64_t stop_time_ns;
+    bool encoded_started;
+    bool encoded_paused;
+    bool encoded_draining;
+    bool encoded_failed;
 
     jobject timestamp;
     int64_t timestamp_fetched;
@@ -52,6 +71,17 @@ struct priv {
 
     void *chunk;
     int chunksize;
+    int pending_bytes;
+    int pending_total;
+    uint64_t pcm_written;
+    uint64_t pcm_playhead;
+    uint64_t pcm_stop_playhead;
+    int64_t pcm_stop_time_ns;
+    bool pcm_started;
+    bool pcm_paused;
+    bool pcm_drain_requested;
+    bool pcm_draining;
+    bool pcm_failed;
     jbyteArray bytearray;
     jshortArray shortarray;
     jfloatArray floatarray;
@@ -69,12 +99,12 @@ struct priv {
 
 static struct JNIByteBuffer {
     jclass clazz;
-    jmethodID clear;
+    jmethodID position;
 } ByteBuffer;
 #define OFFSET(member) offsetof(struct JNIByteBuffer, member)
 static const struct MPJniField ByteBuffer_mapping[] = {
     {"java/nio/ByteBuffer", NULL, MP_JNI_CLASS, OFFSET(clazz), 1},
-    {"clear", "()Ljava/nio/Buffer;", MP_JNI_METHOD, OFFSET(clear), 1},
+    {"position", "(I)Ljava/nio/Buffer;", MP_JNI_METHOD, OFFSET(position), 1},
     {0},
 };
 #undef OFFSET
@@ -95,10 +125,12 @@ static struct JNIAudioTrack {
     jmethodID writeShortV23;
     jmethodID writeBufferV21;
     jmethodID getBufferSizeInFramesV23;
+    jmethodID setStartThresholdInFramesV31;
     jmethodID getPlaybackHeadPosition;
     jmethodID getTimestamp;
     jmethodID getLatency;
     jmethodID getMinBufferSize;
+    jmethodID isDirectPlaybackSupported;
     jmethodID getNativeOutputSampleRate;
     jint STATE_INITIALIZED;
     jint PLAYSTATE_STOPPED;
@@ -128,10 +160,12 @@ static const struct MPJniField AudioTrack_mapping[] = {
     {"write", "([SIII)I", MP_JNI_METHOD, OFFSET(writeShortV23), 0},
     {"write", "(Ljava/nio/ByteBuffer;II)I", MP_JNI_METHOD, OFFSET(writeBufferV21), 1},
     {"getBufferSizeInFrames", "()I", MP_JNI_METHOD, OFFSET(getBufferSizeInFramesV23), 0},
+    {"setStartThresholdInFrames", "(I)I", MP_JNI_METHOD, OFFSET(setStartThresholdInFramesV31), 0},
     {"getTimestamp", "(Landroid/media/AudioTimestamp;)Z", MP_JNI_METHOD, OFFSET(getTimestamp), 1},
     {"getPlaybackHeadPosition", "()I", MP_JNI_METHOD, OFFSET(getPlaybackHeadPosition), 1},
     {"getLatency", "()I", MP_JNI_METHOD, OFFSET(getLatency), 1},
     {"getMinBufferSize", "(III)I", MP_JNI_STATIC_METHOD, OFFSET(getMinBufferSize), 1},
+    {"isDirectPlaybackSupported", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z", MP_JNI_STATIC_METHOD, OFFSET(isDirectPlaybackSupported), 0},
     {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
     {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
     {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
@@ -187,6 +221,11 @@ static struct JNIAudioFormat {
     jint ENCODING_PCM_16BIT;
     jint ENCODING_PCM_FLOAT;
     jint ENCODING_IEC61937;
+    jint ENCODING_AC3;
+    jint ENCODING_E_AC3;
+    jint ENCODING_DTS;
+    jint ENCODING_DTS_HD;
+    jint ENCODING_DOLBY_TRUEHD;
     jint CHANNEL_OUT_MONO;
     jint CHANNEL_OUT_STEREO;
     jint CHANNEL_OUT_FRONT_CENTER;
@@ -202,6 +241,11 @@ static const struct MPJniField AudioFormat_mapping[] = {
     {"ENCODING_PCM_16BIT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_16BIT), 1},
     {"ENCODING_PCM_FLOAT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_FLOAT), 1},
     {"ENCODING_IEC61937", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_IEC61937), 0},
+    {"ENCODING_AC3", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_AC3), 0},
+    {"ENCODING_E_AC3", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_E_AC3), 0},
+    {"ENCODING_DTS", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DTS), 0},
+    {"ENCODING_DTS_HD", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DTS_HD), 0},
+    {"ENCODING_DOLBY_TRUEHD", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DOLBY_TRUEHD), 0},
     {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
     {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
     {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
@@ -229,6 +273,18 @@ static const struct MPJniField AudioFormatBuilder_mapping[] = {
     {"setSampleRate", "(I)Landroid/media/AudioFormat$Builder;", MP_JNI_METHOD, OFFSET(setSampleRate), 0},
     {"setChannelMask", "(I)Landroid/media/AudioFormat$Builder;", MP_JNI_METHOD, OFFSET(setChannelMask), 0},
     {"build", "()Landroid/media/AudioFormat;", MP_JNI_METHOD, OFFSET(build), 0},
+    {0}
+};
+#undef OFFSET
+
+static struct JNIBuildVersion {
+    jclass clazz;
+    jint SDK_INT;
+} BuildVersion;
+#define OFFSET(member) offsetof(struct JNIBuildVersion, member)
+static const struct MPJniField BuildVersion_mapping[] = {
+    {"android/os/Build$VERSION", NULL, MP_JNI_CLASS, OFFSET(clazz), 1},
+    {"SDK_INT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(SDK_INT), 1},
     {0}
 };
 #undef OFFSET
@@ -274,6 +330,7 @@ static const struct {
     ENTRY(AudioAttributesBuilder),
     ENTRY(AudioFormat),
     ENTRY(AudioFormatBuilder),
+    ENTRY(BuildVersion),
     ENTRY(AudioManager),
     ENTRY(AudioTimestamp),
 };
@@ -312,6 +369,31 @@ static int AudioTrack_New(struct ao *ao)
         }
         jobject attr = MP_JNI_CALL_OBJECT(attr_builder, AudioAttributesBuilder.build);
         MP_JNI_LOCAL_FREEP(&attr_builder);
+
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !format || !attr) {
+            MP_JNI_LOCAL_FREEP(&format);
+            MP_JNI_LOCAL_FREEP(&attr);
+            return -1;
+        }
+
+        // Query the format being written: source codec for raw passthrough,
+        // carrier format for IEC61937. Older APIs use track initialization.
+        if ((af_fmt_is_encoded(ao->format) || af_fmt_is_spdif(ao->format)) &&
+            AudioTrack.isDirectPlaybackSupported) {
+            jboolean supported = (*env)->CallStaticBooleanMethod(
+                env, AudioTrack.clazz, AudioTrack.isDirectPlaybackSupported, format, attr);
+            if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+                MP_JNI_LOCAL_FREEP(&format);
+                MP_JNI_LOCAL_FREEP(&attr);
+                return -1;
+            } else if (!supported) {
+                MP_WARN(ao, "Direct playback not supported: encoding %d, %d Hz, channel mask 0x%x\n",
+                        p->format, p->samplerate, (unsigned int)p->channel_config);
+                MP_JNI_LOCAL_FREEP(&format);
+                MP_JNI_LOCAL_FREEP(&attr);
+                return -1;
+            }
+        }
 
         audiotrack = MP_JNI_NEW(
             AudioTrack.clazz,
@@ -354,10 +436,31 @@ static int AudioTrack_New(struct ao *ao)
 
     if (AudioTrack.getBufferSizeInFramesV23) {
         int bufferSize = MP_JNI_CALL_INT(audiotrack, AudioTrack.getBufferSizeInFramesV23);
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+            MP_JNI_CALL_VOID(audiotrack, AudioTrack.release);
+            MP_JNI_EXCEPTION_LOG(ao);
+            MP_JNI_LOCAL_FREEP(&audiotrack);
+            return -1;
+        }
         if (bufferSize > 0) {
             MP_VERBOSE(ao, "AudioTrack.getBufferSizeInFrames = %d\n", bufferSize);
-            ao->device_buffer = bufferSize;
+            // Android reports compressed buffer capacities in bytes. They
+            // must not be used as decoded sample counts by the AO core.
+            if (!af_fmt_is_encoded(ao->format))
+                ao->device_buffer = bufferSize;
         }
+    }
+
+    if (af_fmt_is_encoded(ao->format) && AudioTrack.setStartThresholdInFramesV31) {
+        int threshold = MP_JNI_CALL_INT(audiotrack,
+            AudioTrack.setStartThresholdInFramesV31, p->min_buffer_size);
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0 || threshold <= 0) {
+            MP_JNI_CALL_VOID(audiotrack, AudioTrack.release);
+            MP_JNI_EXCEPTION_LOG(ao);
+            MP_JNI_LOCAL_FREEP(&audiotrack);
+            return -1;
+        }
+        MP_VERBOSE(ao, "AudioTrack start threshold = %d bytes\n", threshold);
     }
 
     p->audiotrack = (*env)->NewGlobalRef(env, audiotrack);
@@ -366,17 +469,6 @@ static int AudioTrack_New(struct ao *ao)
         return -1;
 
     return 0;
-}
-
-static int AudioTrack_Recreate(struct ao *ao)
-{
-    struct priv *p = ao->priv;
-    JNIEnv *env = MP_JNI_GET_ENV(ao);
-
-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
-    MP_JNI_EXCEPTION_LOG(ao);
-    MP_JNI_GLOBAL_FREEP(&p->audiotrack);
-    return AudioTrack_New(ao);
 }
 
 static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
@@ -486,34 +578,33 @@ static double AudioTrack_getLatency(struct ao *ao)
     return MPCLAMP(delay, 0.0, 2.0);
 }
 
-static int AudioTrack_write(struct ao *ao, int len)
+static int AudioTrack_write(struct ao *ao, int offset, int len, int mode)
 {
     struct priv *p = ao->priv;
     if (!p->audiotrack)
         return -1;
     JNIEnv *env = MP_JNI_GET_ENV(ao);
-    void *buf = p->chunk;
+    void *buf = (char *)p->chunk + offset;
 
     jint ret;
     if (p->format == AudioFormat.ENCODING_IEC61937) {
         (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
-        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
+        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, mode);
         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
         if (ret > 0) ret *= 2;
 
     } else if (AudioTrack.writeBufferV21) {
-        // reset positions for reading
-        jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
+        jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.position, offset);
         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
         MP_JNI_LOCAL_FREEP(&bbuf);
-        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, len, AudioTrack.WRITE_BLOCKING);
+        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, len, mode);
         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
 
     } else if (p->format == AudioFormat.ENCODING_PCM_FLOAT) {
         (*env)->SetFloatArrayRegion(env, p->floatarray, 0, len / sizeof(float), buf);
         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
-        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeFloat, p->floatarray, 0, len / sizeof(float), AudioTrack.WRITE_BLOCKING);
+        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeFloat, p->floatarray, 0, len / sizeof(float), mode);
         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
         if (ret > 0) ret *= sizeof(float);
 
@@ -580,20 +671,36 @@ static MP_THREAD_VOID ao_thread(void *arg)
         }
         if (state == AudioTrack.PLAYSTATE_PLAYING) {
             int read_samples = p->chunksize / ao->sstride;
-            int64_t ts = mp_time_ns();
-            ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
-            ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
-            int samples = ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
-            int ret = AudioTrack_write(ao, samples * ao->sstride);
-            if (ret >= 0) {
-                p->written_frames += ret / ao->sstride;
+            int bytes = read_samples * ao->sstride;
+            if (!p->pending_bytes) {
+                int64_t ts = mp_time_ns();
+                ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
+                ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
+                // Keep the device clock running through an underrun, but do
+                // not overwrite data left over from a partial AudioTrack write.
+                ao_read_data(ao, &p->chunk, read_samples, ts, NULL, true, true);
+                p->pending_bytes = bytes;
+            }
+            int offset = bytes - p->pending_bytes;
+            int ret = AudioTrack_write(ao, offset, p->pending_bytes,
+                                       AudioTrack.WRITE_BLOCKING);
+            if (ret > 0) {
+                p->pending_bytes -= ret;
+                p->written_frames += (offset + ret) / ao->sstride -
+                                     offset / ao->sstride;
+            } else if (ret == 0) {
+                // pause() can interrupt a blocking write. Keep the pending data
+                // until reset and avoid spinning if the driver makes no progress.
+                mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(10));
             } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
-                MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Recreating AudioTrack...\n");
-                if (AudioTrack_Recreate(ao) < 0) {
-                    MP_ERR(ao, "AudioTrack_Recreate failed\n");
-                }
+                MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Reloading audio output...\n");
+                // Renegotiate the carrier and reset playback state in the core.
+                ao_request_reload(ao);
+                break;
             } else {
                 MP_ERR(ao, "AudioTrack.write failed with %d\n", ret);
+                ao_request_reload(ao);
+                break;
             }
         } else {
             mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(300));
@@ -636,6 +743,8 @@ static void uninit(struct ao *ao)
 
     MP_JNI_GLOBAL_FREEP(&p->bbuf);
 
+    TA_FREEP(&p->encoded_frame);
+
     MP_JNI_GLOBAL_FREEP(&p->timestamp);
 
     mp_cond_destroy(&p->wakeup);
@@ -654,14 +763,46 @@ static int init(struct ao *ao)
     mp_mutex_init(&p->lock);
     mp_cond_init(&p->wakeup);
 
-    if (init_jni(ao) < 0)
+    if (init_jni(ao) < 0) {
+        mp_cond_destroy(&p->wakeup);
+        mp_mutex_destroy(&p->lock);
         return -1;
+    }
 
-    if (af_fmt_is_spdif(ao->format)) {
+    int encoded_byte_rate = 0;
+    switch (ao->format) {
+    case AF_FORMAT_RAW_AC3:
+        p->format = AudioFormat.ENCODING_AC3;
+        encoded_byte_rate = 640000 / 8;
+        break;
+    case AF_FORMAT_RAW_EAC3:
+        p->format = AudioFormat.ENCODING_E_AC3;
+        encoded_byte_rate = 6144000 / 8;
+        break;
+    case AF_FORMAT_RAW_DTS:
+        p->format = AudioFormat.ENCODING_DTS;
+        encoded_byte_rate = 1536000 / 8;
+        break;
+    case AF_FORMAT_RAW_DTSHD:
+        p->format = AudioFormat.ENCODING_DTS_HD;
+        encoded_byte_rate = 18000000 / 8;
+        break;
+    case AF_FORMAT_RAW_TRUEHD:
+        p->format = AudioFormat.ENCODING_DOLBY_TRUEHD;
+        encoded_byte_rate = 24500000 / 8;
+        break;
+    }
+
+    if (af_fmt_is_encoded(ao->format)) {
+        if (!p->format || !AudioTrack.writeBufferV21) {
+            MP_ERR(ao, "Raw passthrough not supported by API\n");
+            goto error;
+        }
+    } else if (af_fmt_is_spdif(ao->format)) {
         p->format = AudioFormat.ENCODING_IEC61937;
         if (!p->format || !AudioTrack.writeShortV23) {
             MP_ERR(ao, "spdif passthrough not supported by API\n");
-            return -1;
+            goto error;
         }
     } else if (ao->format == AF_FORMAT_U8) {
         p->format = AudioFormat.ENCODING_PCM_8BIT;
@@ -673,7 +814,7 @@ static int init(struct ao *ao)
         p->format = AudioFormat.ENCODING_PCM_16BIT;
     }
 
-    if (AudioTrack.getNativeOutputSampleRate) {
+    if (af_fmt_is_pcm(ao->format) && AudioTrack.getNativeOutputSampleRate) {
         jint samplerate = MP_JNI_CALL_STATIC_INT(
             AudioTrack.clazz,
             AudioTrack.getNativeOutputSampleRate,
@@ -712,6 +853,16 @@ static int init(struct ao *ao)
     static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
     if (p->format == AudioFormat.ENCODING_IEC61937) {
         p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
+        // Android accepts an 8-channel IEC61937 carrier from API 31 onward.
+        if (BuildVersion.SDK_INT >= ANDROID_API_LEVEL_S && ao->channels.num == 8)
+            p->channel_config = AudioFormat.CHANNEL_OUT_7POINT1_SURROUND;
+    } else if (af_fmt_is_encoded(ao->format)) {
+        // The layout describes the compressed stream, not PCM to remix.
+        if (ao->channels.num < 1 || ao->channels.num >= MP_ARRAY_SIZE(layout_map))
+            goto error;
+        p->channel_config = layout_map[ao->channels.num];
+        if (!p->channel_config)
+            goto error;
     } else {
         struct mp_chmap_sel sel = {0};
         for (int i = 0; i < MP_ARRAY_SIZE(layouts); i++) {
@@ -733,7 +884,19 @@ static int init(struct ao *ao)
     );
     if (MP_JNI_EXCEPTION_LOG(ao) < 0 || buffer_size <= 0) {
         MP_FATAL(ao, "AudioTrack.getMinBufferSize returned an invalid size: %d", buffer_size);
-        return -1;
+        goto error;
+    }
+    p->min_buffer_size = buffer_size;
+
+    if (af_fmt_is_encoded(ao->format)) {
+        // Reserve 250 ms at the codec's maximum byte rate. This is only a
+        // capacity policy: playback timing comes from decoded sample counts.
+        p->size = MPMAX(buffer_size, encoded_byte_rate / 4);
+        if (AudioTrack_New(ao) != 0)
+            goto error;
+        ao->poll_interval_ns = MP_TIME_MS_TO_NS(10);
+        ao->driver = &audio_out_audiotrack_encoded;
+        return 1;
     }
 
     // Choose double of the minimum buffer size suggested by the driver, but not
@@ -754,7 +917,7 @@ static int init(struct ao *ao)
     jobject timestamp = MP_JNI_NEW(AudioTimestamp.clazz, AudioTimestamp.ctor);
     if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !timestamp) {
         MP_FATAL(ao, "AudioTimestamp could not be created\n");
-        return -1;
+        goto error;
     }
     p->timestamp = (*env)->NewGlobalRef(env, timestamp);
     MP_JNI_LOCAL_FREEP(&timestamp);
@@ -785,6 +948,12 @@ static int init(struct ao *ao)
         goto error;
     }
 
+    // The push path requires both nonblocking writes and reported capacity.
+    // Keep carrier formats and older AudioTrack APIs on their existing path.
+    if (af_fmt_is_pcm(ao->format) && AudioTrack.writeBufferV21 &&
+        AudioTrack.getBufferSizeInFramesV23)
+        return 1;
+    ao->driver = &audio_out_audiotrack_pull;
     if (mp_thread_create(&p->thread, ao_thread, ao)) {
         MP_ERR(ao, "pthread creation failed\n");
         goto error;
@@ -809,14 +978,18 @@ static void stop(struct ao *ao)
     JNIEnv *env = MP_JNI_GET_ENV(ao);
     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
     MP_JNI_EXCEPTION_LOG(ao);
+    // Interrupt the blocking write before taking the writer's lock.
+    mp_mutex_lock(&p->lock);
     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
     MP_JNI_EXCEPTION_LOG(ao);
 
+    p->pending_bytes = 0;
     p->playhead_offset = 0;
     p->reset_pending = true;
     p->written_frames = 0;
     p->timestamp_fetched = 0;
     p->timestamp_set = false;
+    mp_mutex_unlock(&p->lock);
 }
 
 static void start(struct ao *ao)
@@ -828,21 +1001,403 @@ static void start(struct ao *ao)
     }
 
     JNIEnv *env = MP_JNI_GET_ENV(ao);
+    mp_mutex_lock(&p->lock);
     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
     MP_JNI_EXCEPTION_LOG(ao);
 
     mp_cond_signal(&p->wakeup);
+    mp_mutex_unlock(&p->lock);
 }
+
+static void pcm_error(struct ao *ao, const char *operation, int error)
+{
+    struct priv *p = ao->priv;
+    if (!p->pcm_failed) {
+        MP_ERR(ao, "AudioTrack.%s failed with %d\n", operation, error);
+        p->pcm_failed = true;
+        ao_request_reload(ao);
+    }
+}
+
+static uint64_t pcm_get_playhead(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->pcm_started)
+        return 0;
+    if (p->pcm_draining) {
+        double elapsed = MP_TIME_NS_TO_S(mp_time_ns() - p->pcm_stop_time_ns);
+        uint64_t position = p->pcm_stop_playhead + elapsed * ao->samplerate;
+        return MPMIN(position, p->pcm_written);
+    }
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    uint32_t position = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+        pcm_error(ao, "getPlaybackHeadPosition", AudioTrack.ERROR);
+        return p->pcm_playhead;
+    }
+    p->pcm_playhead += (uint32_t)(position - (uint32_t)p->pcm_playhead);
+    return MPMIN(p->pcm_playhead, p->pcm_written);
+}
+
+static void pcm_reset(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    if (!p->pcm_draining) {
+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+            pcm_error(ao, "pause", AudioTrack.ERROR);
+    }
+    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+        pcm_error(ao, "flush", AudioTrack.ERROR);
+    p->pending_bytes = p->pending_total = 0;
+    p->pcm_written = p->pcm_playhead = 0;
+    p->pcm_stop_playhead = p->pcm_stop_time_ns = 0;
+    p->pcm_started = p->pcm_paused = false;
+    p->pcm_drain_requested = p->pcm_draining = false;
+    p->written_frames = p->playhead_pos = p->playhead_offset = 0;
+    p->timestamp_fetched = 0;
+    p->timestamp_set = false;
+}
+
+static bool pcm_set_pause(struct ao *ao, bool paused)
+{
+    struct priv *p = ao->priv;
+    // A non-offloaded stop() is already draining and its head is reset.
+    if (p->pcm_draining)
+        return true;
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    MP_JNI_CALL_VOID(p->audiotrack, paused ? AudioTrack.pause : AudioTrack.play);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+        pcm_error(ao, paused ? "pause" : "play", AudioTrack.ERROR);
+        return false;
+    }
+    p->pcm_paused = paused;
+    return true;
+}
+
+static void pcm_start(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->pcm_failed && pcm_set_pause(ao, false))
+        p->pcm_started = true;
+}
+
+static void pcm_write_pending(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->pending_bytes || p->pcm_failed || p->pcm_paused)
+        return;
+    int offset = p->pending_total - p->pending_bytes;
+    int ret = AudioTrack_write(ao, offset, p->pending_bytes,
+                              AudioTrack.WRITE_NON_BLOCKING);
+    if (ret < 0) {
+        pcm_error(ao, "write", ret);
+        return;
+    }
+    mp_assert(ret <= p->pending_bytes);
+    p->pcm_written += (offset + ret) / ao->sstride - offset / ao->sstride;
+    p->written_frames = p->pcm_written;
+    p->pending_bytes -= ret;
+}
+
+static bool pcm_write(struct ao *ao, void **data, int samples)
+{
+    struct priv *p = ao->priv;
+    mp_assert(samples > 0 && samples <= p->chunksize / ao->sstride);
+    mp_assert(!p->pending_bytes);
+    if (p->pcm_failed)
+        return false;
+    if (p->pcm_draining)
+        pcm_reset(ao);
+    p->pending_total = p->pending_bytes = samples * ao->sstride;
+    memcpy(p->chunk, data[0], p->pending_bytes);
+    pcm_write_pending(ao);
+    return !p->pcm_failed;
+}
+
+static void pcm_drain(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    p->pcm_drain_requested = true;
+    if (p->pending_bytes || p->pcm_draining || p->pcm_failed)
+        return;
+    p->pcm_stop_playhead = pcm_get_playhead(ao);
+    p->pcm_stop_time_ns = mp_time_ns();
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    // STREAM stop() drains even a tail below the start threshold. Preserve
+    // the final position before Android resets the playback head.
+    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.stop);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+        pcm_error(ao, "stop", AudioTrack.ERROR);
+        return;
+    }
+    p->pcm_draining = true;
+}
+
+static void pcm_get_state(struct ao *ao, struct mp_pcm_state *state)
+{
+    struct priv *p = ao->priv;
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    // Android can enlarge the buffer when the output route changes. The
+    // device's total capacity is independent of our single-write chunk.
+    int capacity = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getBufferSizeInFramesV23);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || capacity <= 0)
+        pcm_error(ao, "getBufferSizeInFrames", AudioTrack.ERROR);
+    else {
+        ao->device_buffer = capacity;
+        // The core can submit at most one chunk per poll. Base its polling
+        // interval on that write limit, even if Android enlarged the buffer.
+        ao->poll_interval_ns = MP_TIME_S_TO_NS(
+            MPMIN(capacity, p->chunksize / ao->sstride) /
+            (double)ao->samplerate * 0.25);
+    }
+    pcm_write_pending(ao);
+    if (p->pcm_drain_requested && !p->pending_bytes)
+        pcm_drain(ao);
+    uint64_t position = pcm_get_playhead(ao);
+    if (p->pcm_failed) {
+        *state = (struct mp_pcm_state){0};
+        return;
+    }
+    // A partial frame is counted once: either it is fully submitted or its
+    // remaining bytes are still owned here. The core may release its buffer.
+    int pending_frames = (p->pending_bytes + ao->sstride - 1) / ao->sstride;
+    uint64_t queued = p->pcm_written - position + pending_frames;
+    bool accepting = !p->pending_bytes &&
+                     (!p->pcm_drain_requested || (p->pcm_draining && !queued));
+    double delay = queued / (double)ao->samplerate;
+    if (!p->pcm_draining)
+        delay = MPMAX(delay, AudioTrack_getLatency(ao) +
+                            pending_frames / (double)ao->samplerate);
+    *state = (struct mp_pcm_state){
+        .free_samples = accepting ? MPMIN(capacity - MPMIN(queued, capacity),
+                                         p->chunksize / ao->sstride) : 0,
+        .queued_samples = MPMIN(queued, capacity),
+        .delay = delay,
+        .playing = p->pcm_started && queued > 0,
+    };
+}
+
+static void encoded_error(struct ao *ao, const char *operation, int error)
+{
+    struct priv *p = ao->priv;
+    if (!p->encoded_failed) {
+        MP_ERR(ao, "AudioTrack.%s failed with %d\n", operation, error);
+        p->encoded_failed = true;
+        ao_request_reload(ao);
+    }
+}
+
+static uint64_t encoded_get_playhead(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->encoded_started)
+        return 0;
+    if (p->encoded_draining) {
+        double elapsed = MP_TIME_NS_TO_S(mp_time_ns() - p->stop_time_ns);
+        uint64_t position = p->stop_playhead + elapsed * ao->samplerate;
+        return MPMIN(position, p->encoded_written);
+    }
+
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    uint32_t position = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+        encoded_error(ao, "getPlaybackHeadPosition", AudioTrack.ERROR);
+        return p->encoded_playhead;
+    }
+    // The Android playback head is an unsigned, wrapping count of decoded
+    // samples, including for compressed tracks.
+    p->encoded_playhead += (uint32_t)(position - (uint32_t)p->encoded_playhead);
+    return p->encoded_playhead;
+}
+
+static void encoded_reset(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    if (!p->encoded_draining) {
+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+            encoded_error(ao, "pause", AudioTrack.ERROR);
+    }
+    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+        encoded_error(ao, "flush", AudioTrack.ERROR);
+    MP_JNI_GLOBAL_FREEP(&p->bbuf);
+    TA_FREEP(&p->encoded_frame);
+    p->encoded_offset = 0;
+    p->encoded_written = 0;
+    p->encoded_playhead = 0;
+    p->stop_playhead = 0;
+    p->stop_time_ns = 0;
+    p->encoded_started = false;
+    p->encoded_paused = false;
+    p->encoded_draining = false;
+}
+
+static bool encoded_set_pause(struct ao *ao, bool paused)
+{
+    struct priv *p = ao->priv;
+    // Non-offloaded tracks keep draining after stop(). Calling pause/play
+    // would interrupt that operation; its remaining duration keeps advancing.
+    if (p->encoded_draining)
+        return true;
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    MP_JNI_CALL_VOID(p->audiotrack, paused ? AudioTrack.pause : AudioTrack.play);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+        encoded_error(ao, paused ? "pause" : "play", AudioTrack.ERROR);
+        return false;
+    }
+    p->encoded_paused = paused;
+    return true;
+}
+
+static void encoded_start(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->encoded_failed && encoded_set_pause(ao, false))
+        p->encoded_started = true;
+}
+
+static void encoded_write_pending(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->encoded_frame || p->encoded_failed || p->encoded_paused)
+        return;
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    int size = mp_aframe_get_encoded_size(p->encoded_frame);
+    jobject buffer = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.position, p->encoded_offset);
+    MP_JNI_LOCAL_FREEP(&buffer);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+        encoded_error(ao, "ByteBuffer.position", AudioTrack.ERROR);
+        return;
+    }
+    int ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21,
+        p->bbuf, size - p->encoded_offset, AudioTrack.WRITE_NON_BLOCKING);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+        ret = AudioTrack.ERROR;
+    if (ret < 0) {
+        encoded_error(ao, "write", ret);
+        return;
+    }
+    mp_assert(ret <= size - p->encoded_offset);
+    p->encoded_offset += ret;
+    if (p->encoded_offset == size) {
+        // A partial byte write never represents a fraction of a decoded
+        // sample. Commit the packet's sample count only when it is complete.
+        p->encoded_written += mp_aframe_get_size(p->encoded_frame);
+        MP_JNI_GLOBAL_FREEP(&p->bbuf);
+        TA_FREEP(&p->encoded_frame);
+        p->encoded_offset = 0;
+    }
+}
+
+static bool encoded_write(struct ao *ao, void **data, int frames)
+{
+    struct priv *p = ao->priv;
+    mp_assert(frames == 1 && !p->encoded_frame);
+    if (p->encoded_failed)
+        return false;
+    if (p->encoded_draining)
+        encoded_reset(ao);
+
+    p->encoded_frame = mp_aframe_new_ref(*(struct mp_aframe **)data);
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    jobject buffer = (*env)->NewDirectByteBuffer(env,
+        (void *)mp_aframe_get_encoded_data(p->encoded_frame),
+        mp_aframe_get_encoded_size(p->encoded_frame));
+    if (buffer) {
+        p->bbuf = (*env)->NewGlobalRef(env, buffer);
+        MP_JNI_LOCAL_FREEP(&buffer);
+    }
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !p->bbuf) {
+        encoded_error(ao, "NewDirectByteBuffer", AudioTrack.ERROR);
+        return false;
+    }
+    encoded_write_pending(ao);
+    return !p->encoded_failed;
+}
+
+static void encoded_drain(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    mp_assert(!p->encoded_frame);
+    if (p->encoded_draining || p->encoded_failed)
+        return;
+    p->stop_playhead = encoded_get_playhead(ao);
+    p->stop_time_ns = mp_time_ns();
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    // STREAM tracks drain queued data on stop(), including a final buffer
+    // shorter than the start threshold. Their playback head then resets;
+    // track the remaining duration from this snapshot, as Media3 does.
+    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.stop);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+        encoded_error(ao, "stop", AudioTrack.ERROR);
+        return;
+    }
+    p->encoded_draining = true;
+}
+
+static void encoded_get_state(struct ao *ao, struct mp_pcm_state *state)
+{
+    struct priv *p = ao->priv;
+    encoded_write_pending(ao);
+    if (p->encoded_failed) {
+        *state = (struct mp_pcm_state){0};
+        return;
+    }
+    uint64_t submitted = p->encoded_written;
+    if (p->encoded_frame)
+        submitted += mp_aframe_get_size(p->encoded_frame);
+    uint64_t position = MPMIN(encoded_get_playhead(ao), submitted);
+    uint64_t queued = submitted - position;
+    *state = (struct mp_pcm_state){
+        .free_samples = !p->encoded_frame &&
+                        (!p->encoded_draining || !queued),
+        .queued_samples = MPMIN(queued, INT_MAX),
+        .delay = queued / (double)ao->samplerate,
+        .playing = p->encoded_started && queued > 0,
+    };
+}
+
+static const struct ao_driver audio_out_audiotrack_encoded = {
+    .accepts_encoded = true,
+    .description = "Android AudioTrack compressed audio output",
+    .name = "audiotrack",
+    .uninit = uninit,
+    .reset = encoded_reset,
+    .start = encoded_start,
+    .set_pause = encoded_set_pause,
+    .write_frames = true,
+    .write = encoded_write,
+    .drain = encoded_drain,
+    .get_state = encoded_get_state,
+};
 
 #define OPT_BASE_STRUCT struct priv
 
+static const struct ao_driver audio_out_audiotrack_pull = {
+    .description = "Android AudioTrack carrier audio output",
+    .name = "audiotrack",
+    .uninit = uninit,
+    .reset = stop,
+    .start = start,
+};
+
 const struct ao_driver audio_out_audiotrack = {
+    .accepts_encoded = true,
     .description = "Android AudioTrack audio output",
     .name      = "audiotrack",
     .init      = init,
     .uninit    = uninit,
-    .reset     = stop,
-    .start     = start,
+    .reset     = pcm_reset,
+    .start     = pcm_start,
+    .set_pause = pcm_set_pause,
+    .write     = pcm_write,
+    .drain     = pcm_drain,
+    .get_state = pcm_get_state,
     .priv_size = sizeof(struct priv),
     .priv_defaults = &(const OPT_BASE_STRUCT) {
         .cfg_pcm_float = 1,
