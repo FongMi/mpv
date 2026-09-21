@@ -249,7 +249,9 @@ char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
         curr_pkt = priv->avpkt_vtt;
     }
 
-    priv->styled = avctx->codec_id == AV_CODEC_ID_DVB_TELETEXT;
+    priv->styled = avctx->codec_id == AV_CODEC_ID_ARIB_CAPTION ||
+                   avctx->codec_id == AV_CODEC_ID_DVB_TELETEXT ||
+                   avctx->codec_id == AV_CODEC_ID_TTML;
 
     if (avctx->codec_id == AV_CODEC_ID_DVB_TELETEXT) {
         if (!priv->opts->teletext_page) {
