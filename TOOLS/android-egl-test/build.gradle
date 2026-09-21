@@ -1,0 +1,40 @@
+plugins {
+    id 'com.android.application' version '9.0.1'
+}
+
+def output = file(providers.gradleProperty('outputDir').get())
+def mpvRoot = file('../..')
+layout.buildDirectory.set(new File(output, 'build'))
+
+android {
+    namespace = 'org.mpv.egl'
+    compileSdk = 36
+    ndkVersion = '29.0.14206865'
+    defaultConfig {
+        applicationId = 'org.mpv.egl.testapp'
+        minSdk = 28
+        targetSdk = 35
+        testInstrumentationRunner = 'androidx.test.runner.AndroidJUnitRunner'
+        ndk { abiFilters providers.gradleProperty('abi').getOrElse('x86_64') }
+        externalNativeBuild.cmake {
+            arguments "-DMPV_ROOT=${mpvRoot}",
+                "-DFFMPEG_INCLUDE_DIR=${providers.gradleProperty('ffmpegInclude').get()}",
+                "-DPLACEBO_INCLUDE_DIR=${providers.gradleProperty('placeboInclude').get()}",
+                "-DCONTEXT_SOURCE=${providers.gradleProperty('contextSource').getOrElse(new File(mpvRoot, 'video/out/opengl/context_android.c').path)}"
+        }
+    }
+    externalNativeBuild.cmake {
+        path = file('CMakeLists.txt')
+        version = '3.22.1'
+        buildStagingDirectory = new File(output, 'cxx')
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+}
