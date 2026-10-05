@@ -133,6 +133,8 @@ struct vo_internal {
 
     bool hasframe;
     bool hasframe_rendered;
+    bool has_video_frame;           // a video frame was submitted to this output
+    int64_t video_wid;              // Surface owning the submitted frame
     bool request_redraw;            // redraw request from player to VO
     bool want_redraw;               // redraw request from VO to player
     bool send_reset;                // send VOCTRL_RESET
@@ -233,6 +235,10 @@ static void read_opts(struct vo *vo)
 
     mp_mutex_lock(&in->lock);
     in->timing_offset = (uint64_t)(MP_TIME_S_TO_NS(vo->opts->timing_offset));
+    if (in->video_wid != vo->opts->WinID) {
+        in->has_video_frame = false;
+        in->video_wid = vo->opts->WinID;
+    }
     mp_mutex_unlock(&in->lock);
 }
 
@@ -1009,6 +1015,7 @@ static bool render_frame(struct vo *vo)
     in->dropped_frame &= !in->paused;
 
     bool use_vsync = in->current_frame->display_synced && !in->paused;
+    bool is_video_frame = frame->current != NULL;
     if (use_vsync && !in->expecting_vsync) // first DS frame in a row
         in->prev_vsync = now;
     in->expecting_vsync = use_vsync;
@@ -1059,6 +1066,8 @@ static bool render_frame(struct vo *vo)
         mp_mutex_lock(&in->lock);
         in->dropped_frame = prev_drop_count < vo->in->drop_count;
         in->rendering = false;
+        if (in->visible && is_video_frame)
+            in->has_video_frame = true;
 
         update_vsync_timing_after_swap(vo, &vsync);
     }
@@ -1104,6 +1113,15 @@ static void do_redraw(struct vo *vo)
     mp_mutex_lock(&in->lock);
     in->request_redraw = false;
 
+    // After reset/reconfig, keep the submitted Surface buffer until a new
+    // video frame arrives. The old image may no longer match the VO config.
+    if (vo->opts->android_keep_video_frame && in->has_video_frame &&
+        !in->hasframe_rendered)
+    {
+        mp_mutex_unlock(&in->lock);
+        return;
+    }
+
     if ((vo->driver->caps & VO_CAP_UNTIMED) ||
         ((vo->driver->caps & VO_CAP_NORETAIN) &&
          !(vo->driver->caps & VO_CAP_NORETAIN_REDRAW)))
@@ -1124,10 +1142,18 @@ static void do_redraw(struct vo *vo)
     frame->still = true;
     frame->pts = 0;
     frame->duration = -1;
+    bool is_video_frame = frame->current != NULL;
     mp_mutex_unlock(&in->lock);
 
-    vo->driver->draw_frame(vo, frame);
+    bool visible = vo->driver->draw_frame(vo, frame);
     vo->driver->flip_page(vo);
+
+    // NORETAIN redraws only update overlays, leaving the video Surface intact.
+    if (visible && !(vo->driver->caps & VO_CAP_NORETAIN)) {
+        mp_mutex_lock(&in->lock);
+        in->has_video_frame = is_video_frame;
+        mp_mutex_unlock(&in->lock);
+    }
 
     if (frame != &dummy && !(vo->driver->caps & VO_CAP_FRAMEOWNER))
         talloc_free(frame);
@@ -1316,6 +1342,16 @@ void vo_seek_reset(struct vo *vo)
 bool vo_has_frame(struct vo *vo)
 {
     return vo->in->hasframe;
+}
+
+// Unlike vo_has_frame(), this survives seek/reset/reconfig on the same Surface.
+bool vo_has_video_frame(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    bool r = in->has_video_frame;
+    mp_mutex_unlock(&in->lock);
+    return r;
 }
 
 static void run_query_format(void *p)
