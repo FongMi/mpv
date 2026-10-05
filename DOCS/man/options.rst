@@ -7261,6 +7261,17 @@ them.
 
     Android only.
 
+``--android-keep-video-frame=<yes|no>``
+    Keep the last submitted video buffer on an attached Android Surface during
+    stop, seek, and file loading, until the next video frame (default: no).
+    Requires ``--force-window=yes`` to keep the video output alive while idle.
+    The old media and audio stop normally, including source and decoder
+    teardown. The embedding application covers the output when it wants a
+    blank reset. Redrawing video and overlays is suspended during the reset.
+    Replacing or detaching the video Surface, or recreating the video output,
+    ends retention. This does not acknowledge compositor presentation.
+
+    Android only.
 ``--d3d11-composition-size=<WxH>``
     Set size of the output for d3d11 composition mode.
     When use composition mode, there is no window, must set the output size by

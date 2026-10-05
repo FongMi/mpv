@@ -1084,6 +1084,12 @@ int handle_force_window(struct MPContext *mpctx, bool force)
     if (mpctx->opts->force_vo != 2 && !act)
         return 0;
 
+#if HAVE_ANDROID
+    if (mpctx->opts->vo->android_keep_video_frame && mpctx->video_out &&
+        vo_has_video_frame(mpctx->video_out))
+        return 0;
+#endif
+
     if (!mpctx->video_out) {
         struct vo_extra ex = {
             .input_ctx = mpctx->input,

@@ -552,6 +552,7 @@ void vo_request_wakeup_on_done(struct vo *vo);
 void vo_report_backend_error(struct vo *vo);
 bool vo_query_backend_error(struct vo *vo);
 bool vo_has_frame(struct vo *vo);
+bool vo_has_video_frame(struct vo *vo);
 void vo_redraw(struct vo *vo);
 bool vo_want_redraw(struct vo *vo);
 void vo_seek_reset(struct vo *vo);
