@@ -117,6 +117,13 @@ gl_video = executable('gl-video', 'gl_video.c', objects: gl_video_objects,
                       dependencies: [libavutil, libplacebo], include_directories: incdir,
                       link_with: [img_utils, test_utils])
 test('gl-video', gl_video)
+android_frame_functions = custom_target('android-frame-contracts-functions',
+    input: files('../video/out/vo.c', '../player/playloop.c'),
+    output: 'vo_android_frame_functions.h',
+    command: [python, files('vo_android_frame.py'), '--generate', '@OUTPUT@'])
+android_frame = executable('android-frame-contracts',
+                          ['vo_android_frame.c', android_frame_functions])
+test('android-frame-contracts', android_frame)
 
 json = executable('json', 'json.c', include_directories: [incdir, incdir_public], link_with: test_utils)
 test('json', json)
