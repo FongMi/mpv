@@ -15,6 +15,9 @@ def generate(root, output):
     common = (root / "video/out/android_common.c").read_text(encoding="utf-8")
     vo = (root / "video/out/vo.h").read_text(encoding="utf-8")
     source = re.search(r"struct vo_android_surface_frame \{.*?\n\};", vo, re.S)[0]
+    command_header = (root / "player/command.h").read_text(encoding="utf-8")
+    source += "\n" + re.search(r"enum \{\n.*?INTERNAL_EVENT_BASE.*?\n\};",
+                              command_header, re.S)[0]
     output.with_name("android_surface_frame_types.h").write_text(source, encoding="utf-8")
     source = re.search(r"struct vo_android_state \{.*?\n\};", common, re.S)[0]
     source += "\n" + function(common, "vo_android_parse_surface_frame_request")
@@ -30,6 +33,14 @@ def generate(root, output):
                  "vo_android_surface_frame_presented"):
         source += "\n" + function(common, name)
     command = (root / "player/command.c").read_text(encoding="utf-8")
+    source += "\n#define E(x, ...) static const char *const event_ ## x[] = {__VA_ARGS__, NULL};\n"
+    for name in ("MP_EVENT_WIN_RESIZE", "MP_EVENT_WIN_STATE", "MP_EVENT_OSD_RESIZE",
+                 "MPV_EVENT_VIDEO_RECONFIG"):
+        source += re.search(r"\bE\(" + name + r",.*?\)", command, re.S)[0] + "\n"
+    source += "#undef E\n"
+    osd = (root / "sub/osd.c").read_text(encoding="utf-8")
+    source += function(osd, "osd_res_equals")
+    source += function(osd, "check_obj_resize")
     source += function(command, "cmd_android_surface_frame")
     source += function(command, "mp_property_android_video_surface_transform")
     source += function(command, "mp_property_android_surface_frame")

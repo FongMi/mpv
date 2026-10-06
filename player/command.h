@@ -116,6 +116,7 @@ enum {
     MP_EVENT_TRACK_SWITCHED,
     MP_EVENT_METADATA_UPDATE,
     MP_EVENT_CHAPTER_CHANGE,
+    MP_EVENT_OSD_RESIZE,
 };
 
 bool mp_hook_test_completion(struct MPContext *mpctx, char *type);

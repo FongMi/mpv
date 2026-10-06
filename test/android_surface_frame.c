@@ -93,7 +93,10 @@ struct ra_ctx {
 };
 typedef void *pl_swapchain;
 struct mp_rect { int x0, y0, x1, y1; };
-struct mp_osd_res { int w, h; };
+struct mp_osd_res { int w, h, ml, mr, mt, mb; double display_par; };
+struct osd_object { struct mp_osd_res vo_res; bool osd_changed; };
+struct mpv_global { void *client_api; };
+struct osd_state { struct mpv_global *global; };
 struct priv {
     struct ra_ctx *ra_ctx;
     bool frame_pending;
@@ -207,9 +210,13 @@ static bool mp_rect_equals(struct mp_rect *a, struct mp_rect *b)
 {
     return a->x0 == b->x0 && a->y0 == b->y0 && a->x1 == b->x1 && a->y1 == b->y1;
 }
-static bool osd_res_equals(struct mp_osd_res a, struct mp_osd_res b)
+static int osd_events, last_osd_event;
+static void mp_client_broadcast_event_external(void *api, int event, void *data)
 {
-    return a.w == b.w && a.h == b.h;
+    (void)api;
+    assert(!data);
+    osd_events++;
+    last_osd_event = event;
 }
 static bool android_osd_overlay_set_surface(void *overlay, int64_t wid)
 {
@@ -330,8 +337,56 @@ static void test_geometry_resize(struct vo *vo)
     vo->priv = previous_priv;
 }
 
+static bool event_has_property(const char *const *properties, const char *name)
+{
+    for (int n = 0; properties[n]; n++) {
+        if (!strcmp(properties[n], name))
+            return true;
+    }
+    return false;
+}
+
+static void test_osd_resize_events(void)
+{
+    struct mpv_global global = {0};
+    struct osd_state osd = {.global = &global};
+    struct mp_osd_res res = {.w = 2400, .h = 1080, .display_par = 1};
+    struct osd_object object = {.vo_res = res};
+    // Video margins change the OSD geometry, not the window geometry.
+    res.ml = res.mr = 240;
+    check_obj_resize(&osd, res, &object);
+    assert(object.osd_changed && object.vo_res.ml == 240);
+    assert(osd_events == 1 && last_osd_event == MP_EVENT_OSD_RESIZE);
+    const char *names[] = {"osd-width", "osd-height", "osd-par", "osd-dimensions"};
+    for (int n = 0; n < 4; n++) {
+        assert(event_has_property(event_MP_EVENT_OSD_RESIZE, names[n]));
+        assert(event_has_property(event_MP_EVENT_WIN_RESIZE, names[n]));
+    }
+    assert(!event_has_property(event_MP_EVENT_OSD_RESIZE, "current-window-scale"));
+    assert(!event_has_property(event_MP_EVENT_OSD_RESIZE, "display-names"));
+    assert(event_has_property(event_MP_EVENT_WIN_RESIZE, "current-window-scale"));
+    assert(event_has_property(event_MPV_EVENT_VIDEO_RECONFIG,
+                              "current-window-scale"));
+    assert(event_has_property(event_MP_EVENT_WIN_STATE, "display-names"));
+    object.osd_changed = false;
+    check_obj_resize(&osd, res, &object);
+    assert(!object.osd_changed && osd_events == 1);
+    // OSD buffer size changes still invalidate all OSD dimension properties.
+    res.w = 1920;
+    check_obj_resize(&osd, res, &object);
+    assert(object.osd_changed && osd_events == 2);
+    assert(last_osd_event == MP_EVENT_OSD_RESIZE);
+    // Pixel aspect changes are also confined to OSD observers.
+    object.osd_changed = false;
+    res.display_par = 1.5;
+    check_obj_resize(&osd, res, &object);
+    assert(object.osd_changed && osd_events == 3);
+    assert(last_osd_event == MP_EVENT_OSD_RESIZE);
+}
+
 int main(void)
 {
+    test_osd_resize_events();
     struct mpv_node values[4];
     struct mpv_node_list list = {.num = 4, .values = values};
     struct mp_vo_opts opts = {
