@@ -3,8 +3,11 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define VO_EVENT_WIN_STATE 1
@@ -27,6 +30,17 @@
 #define EGL_NO_SURFACE 0
 #define EGL_WIDTH 1
 #define EGL_HEIGHT 2
+#define VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM 7
+#define VOCTRL_GET_ANDROID_SURFACE_FRAME 8
+#define talloc_free(ctx) ((void)(ctx))
+#define M_PROPERTY_GET 1
+#define M_PROPERTY_GET_TYPE 2
+#define M_PROPERTY_OK 1
+#define M_PROPERTY_NOT_IMPLEMENTED -1
+#define CONF_TYPE_STRING 1
+#define CONF_TYPE_BOOL 2
+
+#include "android_surface_frame_types.h"
 
 typedef struct ANativeWindow { int refs, width, height; } ANativeWindow;
 typedef int EGLint;
@@ -43,13 +57,21 @@ struct mp_vo_opts {
     int64_t WinID, android_osd_wid;
     struct mpv_node android_surface_frame;
     struct { int w, h; } android_surface_size;
+    bool android_video_surface_transform;
 };
 struct vo_android_state;
-struct vo_internal { int lock; bool hasframe_rendered; };
+struct vo_internal {
+    int lock;
+    bool hasframe_rendered, android_video_surface_transform;
+    struct vo_android_surface_frame android_surface_frame;
+};
+struct vo;
+struct vo_driver { int (*control)(struct vo *, int, void *); };
 struct vo {
     struct mp_vo_opts *opts;
     struct vo_android_state *android;
     struct vo_internal *in;
+    struct vo_driver *driver;
     void *priv;
     int dwidth, dheight;
     bool want_redraw;
@@ -79,9 +101,35 @@ struct priv {
 };
 struct android_priv { int egl_display, egl_surface, buffer_width, buffer_height; };
 struct MPOpts { struct mp_vo_opts *vo; };
-struct MPContext { struct MPOpts *opts; struct mp_vo_opts *mconfig; };
+struct MPContext { struct MPOpts *opts; struct mp_vo_opts *mconfig; struct vo *video_out; };
+typedef struct MPContext MPContext;
 struct mp_cmd_arg { union { int64_t i64; int i; } v; };
 struct mp_cmd_ctx { struct MPContext *mpctx; struct mp_cmd_arg args[3]; bool success; };
+struct m_property { int unused; };
+struct m_option { int type; };
+
+static int m_property_bool_ro(int action, void *arg, bool value)
+{
+    if (action == M_PROPERTY_GET_TYPE)
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_BOOL};
+    else if (action == M_PROPERTY_GET)
+        *(bool *)arg = value;
+    else
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    return M_PROPERTY_OK;
+}
+
+static char *talloc_asprintf(void *ctx, const char *format, ...)
+{
+    (void)ctx;
+    char *out = malloc(128);
+    assert(out);
+    va_list args;
+    va_start(args, format);
+    vsnprintf(out, 128, format, args);
+    va_end(args);
+    return out;
+}
 
 static int events;
 static bool submit_ok = true;
@@ -89,9 +137,26 @@ static int swaps;
 static int codec_releases, backend_errors, osd_surface_updates;
 static bool codec_release_ok = true, egl_swap_ok = true, egl_size_known = true;
 static int drawable_w, drawable_h, next_drawable_w, next_drawable_h;
+static int transform_queries;
+static int synchronous_queries;
+static bool transform_query_supported = true;
 void vo_android_surface_frame_presented(struct vo *vo, int w, int h);
 static void mp_mutex_lock(int *lock) { assert(!*lock); *lock = 1; }
 static void mp_mutex_unlock(int *lock) { assert(*lock); *lock = 0; }
+static int transform_control(struct vo *vo, int request, void *out)
+{
+    assert(!vo->in->lock);
+    assert(request == VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM);
+    transform_queries++;
+    *(bool *)out = vo->opts->android_video_surface_transform;
+    return transform_query_supported ? VO_TRUE : VO_NOTIMPL;
+}
+int vo_control(struct vo *vo, int request, void *out)
+{
+    (void)vo; (void)request; (void)out;
+    synchronous_queries++;
+    return VO_NOTIMPL;
+}
 static pl_swapchain get_active_swapchain(struct priv *p) { return p; }
 static bool pl_swapchain_submit_frame(pl_swapchain sw) { (void)sw; return submit_ok; }
 static bool android_osd_overlay_present(void *overlay) { (void)overlay; return true; }
@@ -140,7 +205,7 @@ static void swap_buffers(struct ra_swapchain *sw)
     // Model a successful EGL swap; GPU-next submit failure must prevent its ack.
     vo_android_surface_frame_presented(sw->vo, sw->vo->dwidth, sw->vo->dheight);
 }
-static void vo_event(struct vo *vo, int event) { (void)vo; assert(event == 1); events++; }
+static void vo_event(struct vo *vo, int event) { assert(!vo->in->lock); assert(event == 1); events++; }
 static void ANativeWindow_release(ANativeWindow *window) { window->refs--; }
 static int ANativeWindow_getWidth(ANativeWindow *window) { return window->width; }
 static int ANativeWindow_getHeight(ANativeWindow *window) { return window->height; }
@@ -180,7 +245,7 @@ static void request_frame(struct vo *vo, int64_t token, int w, int h)
 static int64_t completed(struct vo *vo)
 {
     struct vo_android_surface_frame frame;
-    vo_android_get_surface_frame(vo, &frame);
+    vo_get_android_surface_frame(vo, vo->opts, &frame);
     return frame.token;
 }
 
@@ -195,7 +260,8 @@ int main(void)
     ANativeWindow window = {.refs = 1}, replacement = {.refs = 1};
     struct vo_android_state android = {0};
     struct vo_internal core = {0};
-    struct vo vo = {.opts = &opts, .android = &android, .in = &core};
+    struct vo_driver backend = {.control = transform_control};
+    struct vo vo = {.opts = &opts, .android = &android, .in = &core, .driver = &backend};
     vo_android_set_native_window(&vo, &window);
     request_frame(&vo, 1, 1920, 1080);
 
@@ -208,6 +274,59 @@ int main(void)
     assert(completed(&vo) == 0);
     vo_android_surface_frame_presented(&vo, 1920, 1080);
     assert(completed(&vo) == 1);
+
+    // Core reads only published state, even while the VO has not applied new options.
+    struct mp_vo_opts requested = opts;
+    struct MPOpts player_opts = {.vo = &requested};
+    struct MPContext player = {.opts = &player_opts, .video_out = &vo};
+    struct m_option type;
+    bool active;
+    char *frame;
+    assert(mp_property_android_video_surface_transform(&player, NULL,
+        M_PROPERTY_GET_TYPE, &type) == M_PROPERTY_OK);
+    assert(type.type == CONF_TYPE_BOOL && transform_queries == 0);
+    assert(synchronous_queries == 0);
+    opts.android_video_surface_transform = true;
+    mp_property_android_video_surface_transform(&player, NULL, M_PROPERTY_GET, &active);
+    assert(!active && transform_queries == 0);
+    update_android_video_surface_transform(&vo);
+    mp_property_android_video_surface_transform(&player, NULL, M_PROPERTY_GET, &active);
+    assert(active && transform_queries == 1);
+    mp_property_android_surface_frame(&player, NULL, M_PROPERTY_GET, &frame);
+    assert(strcmp(frame, "1:1920:1080") == 0);
+    free(frame);
+    assert(mp_property_android_surface_frame(&player, NULL,
+        M_PROPERTY_GET_TYPE, &type) == M_PROPERTY_OK);
+    assert(type.type == CONF_TYPE_STRING);
+    assert(synchronous_queries == 0);
+
+    // A core-side window change cannot acknowledge the old VO cache's frame.
+    requested.WinID = 11;
+    mp_property_android_surface_frame(&player, NULL, M_PROPERTY_GET, &frame);
+    assert(strcmp(frame, "0:0:0") == 0);
+    free(frame);
+    requested.WinID = opts.WinID;
+    struct mpv_node core_values[4];
+    memcpy(core_values, values, sizeof(core_values));
+    struct mpv_node_list core_list = {.num = 4, .values = core_values};
+    requested.android_surface_frame.u.list = &core_list;
+    for (int n = 0; n < 4; n++) {
+        core_values[n].u.int64++;
+        mp_property_android_surface_frame(&player, NULL, M_PROPERTY_GET, &frame);
+        assert(strcmp(frame, "0:0:0") == 0);
+        free(frame);
+        core_values[n].u.int64--;
+    }
+    core_list.num = 3;
+    mp_property_android_surface_frame(&player, NULL, M_PROPERTY_GET, &frame);
+    assert(strcmp(frame, "0:0:0") == 0);
+    free(frame);
+    assert(synchronous_queries == 0);
+    transform_query_supported = false;
+    update_android_video_surface_transform(&vo);
+    assert(!vo_get_android_video_surface_transform(&vo));
+    transform_query_supported = true;
+    set_android_video_surface_transform(&vo, false);
 
     // A new same-size token requires another real submit (including paused redraw).
     request_frame(&vo, 2, 1920, 1080);
@@ -258,7 +377,7 @@ int main(void)
     values[3].format = 0;
     vo_android_surface_frame_drawn(&vo, 1920, 1080);
     assert(completed(&vo) == 0);
-    assert(events == 7);
+    assert(events == 9); // Includes both published transform mode changes.
 
     // Production GPU-next flip: failed submit cannot complete through a later EGL swap.
     values[3].format = MPV_FORMAT_INT64;
@@ -357,7 +476,8 @@ int main(void)
     vo_android_surface_frame_drawn(&vo, 1440, 1080);
     android_swap_buffers(&ctx);
     assert(completed(&vo) == 12);
-    vo_android_set_native_window(&vo, NULL);
+    vo_android_uninit(&vo);
+    assert(!vo.android && completed(&vo) == 0);
     puts("Android Surface frame synchronization contracts passed.");
     return 0;
 }

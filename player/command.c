@@ -3130,11 +3130,14 @@ static int mp_property_vo_configured(void *ctx, struct m_property *prop,
 static int mp_property_android_video_surface_transform(void *ctx,
     struct m_property *prop, int action, void *arg)
 {
-    MPContext *mpctx = ctx;
+    if (action != M_PROPERTY_GET)
+        return m_property_bool_ro(action, arg, false);
     bool active = false;
+#if HAVE_ANDROID
+    MPContext *mpctx = ctx;
     if (mpctx->video_out)
-        vo_control(mpctx->video_out,
-                   VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM, &active);
+        active = vo_get_android_video_surface_transform(mpctx->video_out);
+#endif
     return m_property_bool_ro(action, arg, active);
 }
 
@@ -3151,7 +3154,7 @@ static int mp_property_android_surface_frame(void *ctx, struct m_property *prop,
         return M_PROPERTY_NOT_IMPLEMENTED;
     struct vo_android_surface_frame frame = {0};
     if (mpctx->video_out)
-        vo_control(mpctx->video_out, VOCTRL_GET_ANDROID_SURFACE_FRAME, &frame);
+        vo_get_android_surface_frame(mpctx->video_out, mpctx->opts->vo, &frame);
     *(char **)arg = talloc_asprintf(NULL, "%"PRId64":%d:%d",
                                    frame.token, frame.width, frame.height);
     return M_PROPERTY_OK;
