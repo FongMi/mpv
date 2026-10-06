@@ -26,6 +26,7 @@
 #define VOCTRL_UPDATE_OSD_SURFACE 6
 #define MP_NOPTS_VALUE -1
 #define MP_ERR(vo, ...) ((void)(vo))
+#define MP_VERBOSE(vo, ...) ((void)(vo))
 #define MAX_OSD_FAILURES 3
 #define EGL_NO_SURFACE 0
 #define EGL_WIDTH 1
@@ -79,7 +80,10 @@ struct vo {
 struct mp_image_params { int unused; };
 struct ra_ctx_fns { const char *type; };
 struct ra_swapchain;
-struct ra_swapchain_fns { void (*swap_buffers)(struct ra_swapchain *); };
+struct ra_swapchain_fns {
+    void (*swap_buffers)(struct ra_swapchain *);
+    int (*color_depth)(struct ra_swapchain *);
+};
 struct ra_swapchain { struct vo *vo; const struct ra_swapchain_fns *fns; };
 struct ra_ctx {
     struct ra_swapchain *swapchain;
@@ -88,6 +92,8 @@ struct ra_ctx {
     void *priv;
 };
 typedef void *pl_swapchain;
+struct mp_rect { int x0, y0, x1, y1; };
+struct mp_osd_res { int w, h; };
 struct priv {
     struct ra_ctx *ra_ctx;
     bool frame_pending;
@@ -98,6 +104,14 @@ struct priv {
     double last_pts;
     bool osd_render_ok;
     int osd_failures;
+    void *context;
+    struct mp_rect src, dst;
+    struct mp_osd_res osd_res;
+    int osd_sync;
+};
+struct gpu_priv {
+    struct ra_ctx *ctx;
+    void *renderer, *osd_overlay;
 };
 struct android_priv { int egl_display, egl_surface, buffer_width, buffer_height; };
 struct MPOpts { struct mp_vo_opts *vo; };
@@ -161,6 +175,42 @@ static pl_swapchain get_active_swapchain(struct priv *p) { return p; }
 static bool pl_swapchain_submit_frame(pl_swapchain sw) { (void)sw; return submit_ok; }
 static bool android_osd_overlay_present(void *overlay) { (void)overlay; return true; }
 static void android_osd_overlay_invalidate_geometry(void *overlay) { (void)overlay; }
+static struct mp_rect video_rect;
+static int geometry_updates, renderer_resizes, framebuffer_depth;
+static void android_osd_overlay_get_video_rects(void *overlay, struct mp_rect *src,
+    struct mp_rect *dst, struct mp_osd_res *osd)
+{
+    (void)overlay;
+    *src = (struct mp_rect){0, 0, 1920, 1080};
+    *dst = video_rect;
+    *osd = (struct mp_osd_res){2400, 1080};
+    geometry_updates++;
+}
+static void gl_video_resize(void *renderer, struct mp_rect *src,
+    struct mp_rect *dst, struct mp_osd_res *osd)
+{
+    (void)renderer;
+    assert(src->x1 == 1920 && dst->x1 == video_rect.x1 && osd->w == 2400);
+    renderer_resizes++;
+}
+static void gl_video_set_fb_depth(void *renderer, int depth)
+{
+    (void)renderer;
+    framebuffer_depth = depth;
+}
+static void gpu_ctx_resize(void *context, int w, int h)
+{
+    (void)context;
+    assert(w == 2400 && h == 1080);
+}
+static bool mp_rect_equals(struct mp_rect *a, struct mp_rect *b)
+{
+    return a->x0 == b->x0 && a->y0 == b->y0 && a->x1 == b->x1 && a->y1 == b->y1;
+}
+static bool osd_res_equals(struct mp_osd_res a, struct mp_osd_res b)
+{
+    return a.w == b.w && a.h == b.h;
+}
 static bool android_osd_overlay_set_surface(void *overlay, int64_t wid)
 {
     (void)overlay; (void)wid;
@@ -249,6 +299,37 @@ static int64_t completed(struct vo *vo)
     return frame.token;
 }
 
+static void test_geometry_resize(struct vo *vo)
+{
+    int state_events = events;
+    void *previous_priv = vo->priv;
+    struct ra_swapchain_fns fns = {0};
+    struct ra_swapchain swapchain = {.fns = &fns};
+    struct ra_ctx ctx = {.swapchain = &swapchain};
+    struct gpu_priv gpu = {.ctx = &ctx};
+    struct priv gpu_next = {0};
+    vo->dwidth = 2400;
+    vo->dheight = 1080;
+    // Scaling or panning inside a fixed Surface must not invalidate display metadata.
+    for (int n = 0; n < 3; n++) {
+        video_rect = (struct mp_rect){-n * 100, 0, 2400 + n * 100, 1080};
+        vo->priv = &gpu;
+        vo->want_redraw = false;
+        gpu_resize(vo);
+        assert(vo->want_redraw && framebuffer_depth == 0);
+        vo->priv = &gpu_next;
+        vo->want_redraw = false;
+        gpu_next_resize(vo);
+        assert(vo->want_redraw && gpu_next.osd_sync == n + 1);
+        assert(gpu_next.dst.x0 == video_rect.x0 && gpu_next.osd_res.w == 2400);
+        assert(events == state_events);
+    }
+    gpu_next_resize(vo);
+    assert(gpu_next.osd_sync == 3 && events == state_events);
+    assert(renderer_resizes == 3 && geometry_updates == 7);
+    vo->priv = previous_priv;
+}
+
 int main(void)
 {
     struct mpv_node values[4];
@@ -299,6 +380,18 @@ int main(void)
         M_PROPERTY_GET_TYPE, &type) == M_PROPERTY_OK);
     assert(type.type == CONF_TYPE_STRING);
     assert(synchronous_queries == 0);
+
+    test_geometry_resize(&vo);
+    // Geometry notifications are redundant; real ownership transitions still notify.
+    int state_events = events;
+    update_android_video_surface_transform(&vo);
+    assert(events == state_events);
+    opts.android_video_surface_transform = false;
+    update_android_video_surface_transform(&vo);
+    assert(events == state_events + 1);
+    opts.android_video_surface_transform = true;
+    update_android_video_surface_transform(&vo);
+    assert(events == state_events + 2);
 
     // A core-side window change cannot acknowledge the old VO cache's frame.
     requested.WinID = 11;
@@ -377,7 +470,7 @@ int main(void)
     values[3].format = 0;
     vo_android_surface_frame_drawn(&vo, 1920, 1080);
     assert(completed(&vo) == 0);
-    assert(events == 9); // Includes both published transform mode changes.
+    assert(events == 11); // Includes four published transform mode changes.
 
     // Production GPU-next flip: failed submit cannot complete through a later EGL swap.
     values[3].format = MPV_FORMAT_INT64;

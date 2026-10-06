@@ -112,7 +112,6 @@ static void resize(struct vo *vo)
 #if HAVE_ANDROID
     android_osd_overlay_invalidate_geometry(p->osd_overlay);
     android_osd_overlay_get_video_rects(p->osd_overlay, &src, &dst, &osd);
-    vo_event(vo, VO_EVENT_WIN_STATE);
 #else
     vo_get_src_dst_rects(vo, &src, &dst, &osd);
 #endif
