@@ -212,13 +212,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
         vo->want_redraw = true;
         return VO_TRUE;
     }
-    if (request != VOCTRL_UPDATE_WINDOW)
+    if (request != VOCTRL_UPDATE_WINDOW && request != VOCTRL_UPDATE_OSD_SURFACE)
         return VO_NOTIMPL;
 
     // MediaCodec cannot detach or replace its configured output Surface.
     // The player tears this VO down when the video Surface changes and restores
     // it once the required Android Surfaces are available again.
-    if (vo->opts->WinID != p->video_wid)
+    if (request == VOCTRL_UPDATE_WINDOW && vo->opts->WinID != p->video_wid)
         return VO_NOTIMPL;
 
     if (!android_osd_overlay_set_surface(

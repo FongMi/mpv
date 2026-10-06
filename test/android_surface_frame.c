@@ -20,6 +20,7 @@
 #define VOCTRL_UPDATE_RENDER_OPTS 3
 #define VOCTRL_UPDATE_OSD_SIZE 4
 #define VOCTRL_UPDATE_WINDOW 5
+#define VOCTRL_UPDATE_OSD_SURFACE 6
 #define MP_NOPTS_VALUE -1
 #define MP_ERR(vo, ...) ((void)(vo))
 #define MAX_OSD_FAILURES 3
@@ -85,7 +86,7 @@ struct mp_cmd_ctx { struct MPContext *mpctx; struct mp_cmd_arg args[3]; bool suc
 static int events;
 static bool submit_ok = true;
 static int swaps;
-static int codec_releases, backend_errors;
+static int codec_releases, backend_errors, osd_surface_updates;
 static bool codec_release_ok = true, egl_swap_ok = true, egl_size_known = true;
 static int drawable_w, drawable_h, next_drawable_w, next_drawable_h;
 void vo_android_surface_frame_presented(struct vo *vo, int w, int h);
@@ -97,7 +98,9 @@ static bool android_osd_overlay_present(void *overlay) { (void)overlay; return t
 static void android_osd_overlay_invalidate_geometry(void *overlay) { (void)overlay; }
 static bool android_osd_overlay_set_surface(void *overlay, int64_t wid)
 {
-    (void)overlay; (void)wid; return true;
+    (void)overlay; (void)wid;
+    osd_surface_updates++;
+    return true;
 }
 static bool android_osd_overlay_get_size(void *overlay, int *w, int *h)
 {
@@ -308,6 +311,12 @@ int main(void)
     driver.video_wid = 12;
     direct_control(&vo, VOCTRL_EXTERNAL_RESIZE, NULL);
     assert(completed(&vo) == 0);
+
+    // OSD replacement is independent of a video Surface awaiting replacement.
+    assert(direct_control(&vo, VOCTRL_UPDATE_OSD_SURFACE, NULL) == VO_TRUE);
+    assert(osd_surface_updates == 1);
+    assert(direct_control(&vo, VOCTRL_UPDATE_WINDOW, NULL) == VO_NOTIMPL);
+    assert(osd_surface_updates == 1);
 
     // The production codec release hook, including failure, resumes pending resize.
     driver.video_wid = 11;

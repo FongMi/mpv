@@ -125,6 +125,8 @@ enum mp_voctrl {
 
     // The Android embedding application changed the secondary OSD size.
     VOCTRL_UPDATE_OSD_SIZE,
+    // Replace or detach the independent Android OSD Surface.
+    VOCTRL_UPDATE_OSD_SURFACE,
 
     // Whether the Android host owns video scale and pan on a separate Surface.
     VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM, // bool*

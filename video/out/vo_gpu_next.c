@@ -2519,11 +2519,14 @@ static int control(struct vo *vo, uint32_t request, void *data)
         android_osd_overlay_invalidate_geometry(p->osd_overlay);
         vo->want_redraw = true;
         return VO_TRUE;
+    case VOCTRL_UPDATE_OSD_SURFACE:
     case VOCTRL_UPDATE_WINDOW:
         if (!android_osd_overlay_set_surface(p->osd_overlay,
                                              vo->opts->android_osd_wid))
             return VO_FALSE;
         resize(vo);
+        if (request == VOCTRL_UPDATE_OSD_SURFACE)
+            return VO_TRUE;
         break;
 #endif
     case VOCTRL_SET_PANSCAN:

@@ -8639,7 +8639,10 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
         (!hwdec_changed &&
          !dovi_output_unchanged &&
          (!update_vo_in_place ||
-          vo_control(mpctx->video_out, VOCTRL_UPDATE_WINDOW, NULL) <= 0));
+          vo_control(mpctx->video_out,
+                     update_android_osd ? VOCTRL_UPDATE_OSD_SURFACE
+                                        : VOCTRL_UPDATE_WINDOW,
+                     NULL) <= 0));
 
     if (rebuild_video_out) {
         bool wait_for_dovi_surfaces =
