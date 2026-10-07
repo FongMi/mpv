@@ -7313,11 +7313,14 @@ them.
     Android only.
 
 ``--android-video-surface-transform=<yes|no>``
-    Allow the embedding application to apply ``video-scale-x/y`` and
-    ``video-pan-x/y`` to its Android video Surface (default: no). ``gpu`` and
-    ``gpu-next`` keep these properties for scripts and separate OSD geometry
-    but omit them from the GPU video rectangle. This delegation remains active
-    while the independent OSD Surface is absent or being recreated. Without an
+    Allow the embedding application to own the complete video Surface layout
+    and transform (default: no). Publish ``android-video-geometry`` first.
+    ``gpu`` and ``gpu-next`` then fill the video Surface with the source image;
+    they do not apply aspect fitting, viewport clipping, scaling or panning again.
+    Logical video properties remain available to scripts. The embedding
+    application must reflect their changes in its View and geometry snapshot.
+    This delegation remains active while the independent OSD Surface is absent
+    or being recreated. Without an
     independent OSD Surface, subtitles and OSD are composited into the video
     Surface and follow its transform.
     The application must observe ``android-video-surface-transform-active``

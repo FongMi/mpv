@@ -24,6 +24,10 @@ struct android_osd_overlay;
 struct vo;
 struct mp_rect;
 struct mp_osd_res;
+struct mpv_node;
+
+bool android_osd_geometry_from_node(const struct mpv_node *node,
+                                    struct mp_osd_res *res);
 
 struct android_osd_overlay *android_osd_overlay_create(struct vo *vo);
 bool android_osd_overlay_set_surface(struct android_osd_overlay *ctx,

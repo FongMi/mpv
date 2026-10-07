@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define HAVE_ANDROID 1
 #define STREAM_VIDEO 0
@@ -14,7 +15,12 @@
 #define MPSEEK_EXACT 1
 #define MP_VERBOSE(ctx, ...) ((void)(ctx))
 
-struct mp_vo_opts { int64_t WinID, android_osd_wid; int android_dolby_vision_output; };
+struct m_obj_settings { char *name; };
+struct mp_vo_opts {
+    int64_t WinID, android_osd_wid;
+    int android_dolby_vision_output;
+    struct m_obj_settings *video_driver_list;
+};
 struct MPOpts { struct mp_vo_opts *vo; };
 struct vo { int unused; };
 struct mp_decoder_wrapper { int unused; };
@@ -28,14 +34,9 @@ struct MPContext {
     double video_pts;
 };
 static struct vo output;
-static bool direct_active, direct_selected, direct_wanted;
+static bool simulated_direct_active, direct_wanted;
 static int last_control, control_result = 1, destroyed, initialized, seeks, wakeups;
 
-static bool should_use_android_dolby_vision_direct_output(struct MPContext *ctx,
-                                                          struct track *track)
-{
-    return direct_selected;
-}
 static bool wants_android_dolby_vision_direct_output(struct MPContext *ctx,
                                                     struct track *track)
 {
@@ -43,7 +44,7 @@ static bool wants_android_dolby_vision_direct_output(struct MPContext *ctx,
 }
 static bool is_android_dolby_vision_direct_output_active(struct MPContext *ctx)
 {
-    return direct_active;
+    return simulated_direct_active;
 }
 static void uninit_video_out(struct MPContext *ctx)
 {
@@ -115,13 +116,12 @@ int main(void)
     assert(update_video_output(&ctx, &vo_opts.WinID, false));
     assert(destroyed == 1 && initialized == 1);
     control_result = 1;
-    direct_selected = true;
     direct_wanted = true;
     assert(update_video_output(&ctx, &vo_opts.android_osd_wid, false));
     assert(destroyed == 2 && initialized == 2);
 
     // Direct MediaCodec releases its output on detach and restores on attach.
-    direct_active = true;
+    simulated_direct_active = true;
     vo_opts.WinID = 0;
     assert(!update_video_output(&ctx, &vo_opts.WinID, false));
     assert(destroyed == 3 && initialized == 2);
@@ -131,6 +131,46 @@ int main(void)
     assert(update_video_output(&ctx, &vo_opts.WinID, false));
     assert(initialized == 3 && ctx.vo_chain);
     assert(wakeups == 10);
+    // Explicit H.264 direct output must wait when video attaches before OSD.
+    direct_wanted = simulated_direct_active = false;
+    struct m_obj_settings forced[] = {{"mediacodec_embed"}, {NULL}};
+    vo_opts.video_driver_list = forced;
+    ctx.video_out = NULL;
+    ctx.vo_chain = NULL;
+    vo_opts.WinID = 13;
+    vo_opts.android_osd_wid = 0;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == 3 && ctx.current_track[0][STREAM_VIDEO] == &track);
+    vo_opts.android_osd_wid = 21;
+    assert(update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(initialized == 4 && ctx.vo_chain);
+
+    // OSD may detach while a direct VO lives without restarting its codec.
+    simulated_direct_active = true;
+    int old_destroyed = destroyed;
+    vo_opts.android_osd_wid = 0;
+    assert(!update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(destroyed == old_destroyed && initialized == 4);
+    vo_opts.WinID = -1;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(!ctx.video_out && !ctx.vo_chain);
+    simulated_direct_active = false;
+
+    // The reverse attachment order also waits, including the -1 sentinel.
+    vo_opts.android_osd_wid = 22;
+    assert(!update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(initialized == 4);
+    vo_opts.WinID = 14;
+    assert(update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == 5);
+    assert(!direct_wanted); // Explicit output did not enable automatic Dovi selection.
+
+    // An ordered fallback list is not a forced direct-output policy.
+    struct m_obj_settings fallback[] = {{"mediacodec_embed"}, {"gpu-next"}, {NULL}};
+    vo_opts.video_driver_list = fallback;
+    assert(!wants_android_direct_output(&ctx, &track));
+    vo_opts.video_driver_list = NULL;
+    assert(!wants_android_direct_output(&ctx, &track));
     puts("Android OSD routing, Surface detach/restore and output policy contracts passed");
     return 0;
 }

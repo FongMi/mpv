@@ -205,7 +205,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
         update_surface_frame(vo);
         return VO_TRUE;
     }
-    if (request == VOCTRL_UPDATE_RENDER_OPTS ||
+    if (request == VOCTRL_SET_PANSCAN ||
+        request == VOCTRL_UPDATE_RENDER_OPTS ||
         request == VOCTRL_UPDATE_OSD_SIZE)
     {
         android_osd_overlay_invalidate_geometry(p->osd_overlay);

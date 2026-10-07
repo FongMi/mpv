@@ -11,8 +11,13 @@ from vo_android_frame import function
 
 
 def generate(root, output):
+    video = (root / "player/video.c").read_text(encoding="utf-8")
+    source = ""
+    for name in ("android_direct_output_surfaces_ready", "is_android_direct_output_forced",
+                 "wants_android_direct_output", "should_use_android_direct_output"):
+        source += function(video, name)
     command = (root / "player/command.c").read_text(encoding="utf-8")
-    output.write_text(function(command, "update_video_output"), encoding="utf-8")
+    output.write_text(source + function(command, "update_video_output"), encoding="utf-8")
 
 
 def main():

@@ -148,11 +148,22 @@ const struct m_sub_options osd_bar_style_conf = {
     .change_flags = UPDATE_OSD,
 };
 
+double osd_get_video_par(struct mp_osd_res res, const struct mp_image_params *params)
+{
+    if (res.video_aspect > 0 && params->w > 0 && params->h > 0) {
+        double aspect = res.video_aspect;
+        if (params->rotate == 90 || params->rotate == 270)
+            aspect = 1.0 / aspect;
+        return aspect * params->h / params->w;
+    }
+    return params->p_w / (double)params->p_h;
+}
+
 bool osd_res_equals(struct mp_osd_res a, struct mp_osd_res b)
 {
     return a.w == b.w && a.h == b.h && a.ml == b.ml && a.mt == b.mt
         && a.mr == b.mr && a.mb == b.mb
-        && a.display_par == b.display_par;
+        && a.display_par == b.display_par && a.video_aspect == b.video_aspect;
 }
 
 struct osd_state *osd_create(struct mpv_global *global)

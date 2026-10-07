@@ -141,7 +141,10 @@ gpu_next_mapping = executable('gpu-next-mapping',
 test('gpu-next-mapping', gpu_next_mapping)
 
 android_osd_source = custom_target('android-osd-contracts-source',
-    input: files('../video/out/android_osd_overlay.c', '../video/out/aspect.c'),
+    input: files('../video/out/android_osd_overlay.c', '../video/out/aspect.c',
+                 '../player/command.c', '../sub/osd.c', '../sub/sd_ass.c',
+                 '../sub/sd_lavc.c'),
+    depend_files: files('vo_android_frame.py'),
     output: 'android_osd_contracts.c',
     command: [python, files('android_osd_overlay.py'), '--generate', '@OUTPUT@'])
 android_osd = executable('android-osd-contracts', android_osd_source,

@@ -830,7 +830,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
         // Let's factor in video PAR for vsfilter compatibility:
         double par = opts->ass_video_aspect > 0 ?
                 opts->ass_video_aspect :
-                ctx->video_params.p_w / (double)ctx->video_params.p_h;
+                osd_get_video_par(dim, &ctx->video_params);
         if (isnormal(par))
             scale *= par;
     }

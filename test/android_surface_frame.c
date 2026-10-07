@@ -24,6 +24,7 @@
 #define VOCTRL_UPDATE_OSD_SIZE 4
 #define VOCTRL_UPDATE_WINDOW 5
 #define VOCTRL_UPDATE_OSD_SURFACE 6
+#define VOCTRL_SET_PANSCAN 9
 #define MP_NOPTS_VALUE -1
 #define MP_ERR(vo, ...) ((void)(vo))
 #define MP_VERBOSE(vo, ...) ((void)(vo))
@@ -93,7 +94,7 @@ struct ra_ctx {
 };
 typedef void *pl_swapchain;
 struct mp_rect { int x0, y0, x1, y1; };
-struct mp_osd_res { int w, h, ml, mr, mt, mb; double display_par; };
+struct mp_osd_res { int w, h, ml, mr, mt, mb; double display_par, video_aspect; };
 struct osd_object { struct mp_osd_res vo_res; bool osd_changed; };
 struct mpv_global { void *client_api; };
 struct osd_state { struct mpv_global *global; };
@@ -177,7 +178,12 @@ int vo_control(struct vo *vo, int request, void *out)
 static pl_swapchain get_active_swapchain(struct priv *p) { return p; }
 static bool pl_swapchain_submit_frame(pl_swapchain sw) { (void)sw; return submit_ok; }
 static bool android_osd_overlay_present(void *overlay) { (void)overlay; return true; }
-static void android_osd_overlay_invalidate_geometry(void *overlay) { (void)overlay; }
+static int osd_geometry_invalidations;
+static void android_osd_overlay_invalidate_geometry(void *overlay)
+{
+    (void)overlay;
+    osd_geometry_invalidations++;
+}
 static struct mp_rect video_rect;
 static int geometry_updates, renderer_resizes, framebuffer_depth;
 static void android_osd_overlay_get_video_rects(void *overlay, struct mp_rect *src,
@@ -583,6 +589,13 @@ int main(void)
     assert(direct_control(&vo, VOCTRL_UPDATE_OSD_SURFACE, NULL) == VO_TRUE);
     assert(osd_surface_updates == 1);
     assert(direct_control(&vo, VOCTRL_UPDATE_WINDOW, NULL) == VO_NOTIMPL);
+    assert(osd_surface_updates == 1);
+
+    // A geometry snapshot changes only OSD layout, without rebuilding the VO.
+    int invalidations = osd_geometry_invalidations;
+    vo.want_redraw = false;
+    assert(direct_control(&vo, VOCTRL_SET_PANSCAN, NULL) == VO_TRUE);
+    assert(osd_geometry_invalidations == invalidations + 1 && vo.want_redraw);
     assert(osd_surface_updates == 1);
 
     // The production codec release hook, including failure, resumes pending resize.

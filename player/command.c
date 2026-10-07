@@ -86,6 +86,10 @@
 
 #include "core.h"
 
+#if HAVE_ANDROID
+#include "video/out/android_osd_overlay.h"
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -7604,6 +7608,39 @@ static void cmd_dump_cache_ab(void *p)
 }
 
 #if HAVE_ANDROID
+static void cmd_android_video_geometry(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct MPContext *mpctx = cmd->mpctx;
+    struct mpv_node values[7];
+    for (int n = 0; n < 6; n++) {
+        values[n] = (struct mpv_node) {
+            .format = MPV_FORMAT_INT64, .u.int64 = cmd->args[n].v.i,
+        };
+    }
+    values[6] = (struct mpv_node) {
+        .format = MPV_FORMAT_DOUBLE, .u.double_ = cmd->args[6].v.d,
+    };
+    struct mpv_node_list list = {.num = 7, .values = values};
+    struct mpv_node request = {.format = MPV_FORMAT_NODE_ARRAY, .u.list = &list};
+    struct mp_osd_res res;
+    if (!android_osd_geometry_from_node(&request, &res)) {
+        cmd->success = false;
+        return;
+    }
+    // The VO consumes coordinates and subtitle aspect in one options-cache snapshot.
+    cmd->success = m_config_set_option_node(mpctx->mconfig,
+        bstr0("android-video-geometry"), &request, 0) >= 0;
+}
+
+static void cmd_android_video_geometry_clear(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct mpv_node empty = {.format = MPV_FORMAT_NONE};
+    cmd->success = m_config_set_option_node(cmd->mpctx->mconfig,
+        bstr0("android-video-geometry"), &empty, 0) >= 0;
+}
+
 static void cmd_android_surface_frame(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -8298,6 +8335,12 @@ const struct mp_cmd_def mp_cmds[] = {
 
     { "notify-property", cmd_notify_property, { {"property", OPT_STRING(v.s)} } },
 #if HAVE_ANDROID
+    { "android-video-geometry", cmd_android_video_geometry,
+        { {"viewport-width", OPT_INT(v.i)}, {"viewport-height", OPT_INT(v.i)},
+          {"left", OPT_INT(v.i)}, {"top", OPT_INT(v.i)},
+          {"right", OPT_INT(v.i)}, {"bottom", OPT_INT(v.i)},
+          {"subtitle-aspect", OPT_DOUBLE(v.d), OPTDEF_DOUBLE(0)} } },
+    { "android-video-geometry-clear", cmd_android_video_geometry_clear },
     { "android-surface-frame", cmd_android_surface_frame,
         { {"token", OPT_INT64(v.i64)}, {"width", OPT_INT(v.i)},
           {"height", OPT_INT(v.i)} } },
@@ -8579,12 +8622,12 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
         mpctx->android_dolby_vision_direct_failed_track = NULL;
 
     struct track *video_track = mpctx->current_track[0][STREAM_VIDEO];
-    bool should_use_dovi_direct =
-        should_use_android_dolby_vision_direct_output(mpctx, video_track);
-    bool wants_dovi_direct =
-        should_use_dovi_direct ||
-        wants_android_dolby_vision_direct_output(mpctx, video_track);
-    bool dovi_direct_active =
+    bool should_use_direct =
+        should_use_android_direct_output(mpctx, video_track);
+    bool wants_direct =
+        should_use_direct ||
+        wants_android_direct_output(mpctx, video_track);
+    bool direct_active =
         is_android_dolby_vision_direct_output_active(mpctx);
     bool video_surface_ready =
         opts->vo->WinID != 0 && opts->vo->WinID != -1;
@@ -8596,14 +8639,14 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
     bool restore_video =
         video_track &&
         (update_window || update_dovi_output || hwdec_changed ||
-         (update_android_osd && wants_dovi_direct));
+         (update_android_osd && wants_direct));
 
     // The VO can outlive a failed decoder. Restore its selected track when
     // applying a new decoding or output policy, once its Surfaces are ready.
     if (!mpctx->video_out || (!mpctx->vo_chain && restore_video)) {
-        bool wait_for_dovi_surfaces =
-            wants_dovi_direct && !should_use_dovi_direct;
-        if (video_surface_ready && !wait_for_dovi_surfaces) {
+        bool wait_for_surfaces =
+            wants_direct && !should_use_direct;
+        if (video_surface_ready && !wait_for_surfaces) {
             if (restore_video) {
                 double resume_pts = get_current_time(mpctx);
                 reinit_video_chain(mpctx);
@@ -8621,8 +8664,8 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
         return video_chain_reinitialized;
     }
 
-    if (update_window && dovi_direct_active && !video_surface_ready) {
-        MP_VERBOSE(mpctx, "Direct Dolby Vision video Surface detached; "
+    if (update_window && direct_active && !video_surface_ready) {
+        MP_VERBOSE(mpctx, "Direct MediaCodec video Surface detached; "
                            "stopping MediaCodec output.\n");
         uninit_video_out(mpctx);
         mp_wakeup_core(mpctx);
@@ -8631,17 +8674,17 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
 
     bool update_vo_in_place =
         update_window || update_android_osd;
-    bool reselect_dovi_output =
+    bool reselect_direct_output =
         (update_window || update_android_osd || update_dovi_output ||
          hwdec_changed) &&
-        dovi_direct_active != should_use_dovi_direct;
-    bool dovi_output_unchanged =
+        direct_active != should_use_direct;
+    bool direct_output_unchanged =
         update_dovi_output &&
-        dovi_direct_active == should_use_dovi_direct;
+        direct_active == should_use_direct;
     bool rebuild_video_out =
-        reselect_dovi_output ||
+        reselect_direct_output ||
         (!hwdec_changed &&
-         !dovi_output_unchanged &&
+         !direct_output_unchanged &&
          (!update_vo_in_place ||
           vo_control(mpctx->video_out,
                      update_android_osd ? VOCTRL_UPDATE_OSD_SURFACE
@@ -8649,10 +8692,10 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
                      NULL) <= 0));
 
     if (rebuild_video_out) {
-        bool wait_for_dovi_surfaces =
-            wants_dovi_direct &&
+        bool wait_for_surfaces =
+            wants_direct &&
             (!video_surface_ready || !osd_surface_ready);
-        if (!wait_for_dovi_surfaces) {
+        if (!wait_for_surfaces) {
             double last_pts = mpctx->video_pts;
             struct mp_decoder_wrapper *dec =
                 video_track ? video_track->dec : NULL;
@@ -8664,7 +8707,7 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
             }
         }
         uninit_video_out(mpctx);
-        if (!wait_for_dovi_surfaces) {
+        if (!wait_for_surfaces) {
             if (video_track)
                 reinit_video_chain(mpctx);
             else
