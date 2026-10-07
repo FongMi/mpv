@@ -1802,6 +1802,7 @@ void vo_x11_config_vo_window(struct vo *vo)
 {
     struct vo_x11_state *x11 = vo->x11;
     struct mp_vo_opts *opts = x11->opts;
+    double old_monitor_par = vo->monitor_par;
 
     mp_assert(x11->window);
 
@@ -1844,6 +1845,9 @@ void vo_x11_config_vo_window(struct vo *vo)
     vo_x11_update_geometry(vo);
     update_vo_size(vo);
     x11->pending_vo_events &= ~VO_EVENT_RESIZE; // implicitly done by the VO
+    // A new monitor PAR changes window properties even without a window resize.
+    if (vo->monitor_par != old_monitor_par)
+        vo_event(vo, VO_EVENT_RESIZE);
 
     if (opts->focus_on == 2) {
         long data[5] = {
