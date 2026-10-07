@@ -27,6 +27,7 @@
 #include <libavutil/common.h>
 
 #include "mpv_talloc.h"
+#include "config.h"
 #include "common/common.h"
 #include "misc/bstr.h"
 #include "common/msg.h"
@@ -41,7 +42,9 @@
 
 #if HAVE_ANDROID
 #include "android_common.h"
+#include "android_osd_overlay.h"
 #endif
+
 struct gpu_priv {
     struct mp_log *log;
     struct ra_ctx *ctx;
@@ -52,6 +55,9 @@ struct gpu_priv {
     struct gl_video *renderer;
 
     int events;
+#if HAVE_ANDROID
+    struct android_osd_overlay *osd_overlay;
+#endif
 };
 
 static enum ra_color_hint_result set_target_hint(
@@ -103,7 +109,12 @@ static void resize(struct vo *vo)
 
     struct mp_rect src, dst;
     struct mp_osd_res osd;
+#if HAVE_ANDROID
+    android_osd_overlay_invalidate_geometry(p->osd_overlay);
+    android_osd_overlay_get_video_rects(p->osd_overlay, &src, &dst, &osd);
+#else
     vo_get_src_dst_rects(vo, &src, &dst, &osd);
+#endif
 
     gl_video_resize(p->renderer, &src, &dst, &osd);
 
@@ -123,6 +134,19 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     vo_android_surface_frame_drawn(vo, 0, 0);
 #endif
 
+    int flags = RENDER_FRAME_DEF;
+#if HAVE_ANDROID
+    if (android_osd_overlay_active(p->osd_overlay)) {
+        flags &= ~(RENDER_FRAME_SUBS | RENDER_FRAME_OSD);
+        double pts = frame->current ? frame->current->pts : MP_NOPTS_VALUE;
+        if (!android_osd_overlay_render(p->osd_overlay, pts)) {
+            vo_event(vo, VO_EVENT_WIN_STATE);
+            vo_report_backend_error(vo);
+            return VO_FALSE;
+        }
+    }
+#endif
+
     struct pl_color_space target = {0};
     bool strict = false;
     enum ra_color_hint_result target_hint =
@@ -136,7 +160,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     if (target_hint != RA_COLOR_HINT_NONE)
         fbo.color_space_strict = strict;
 
-    gl_video_render_frame(p->renderer, frame, &fbo, RENDER_FRAME_DEF);
+    gl_video_render_frame(p->renderer, frame, &fbo, flags);
     if (!sw->fns->submit_frame(sw, frame)) {
         MP_ERR(vo, "Failed presenting frame!\n");
         return VO_FALSE;
@@ -162,6 +186,10 @@ static void flip_page(struct vo *vo)
 #if HAVE_ANDROID
     if (strcmp(p->ctx->fns->type, "vulkan") == 0)
         vo_android_surface_frame_presented(vo, vo->dwidth, vo->dheight);
+    if (!android_osd_overlay_present(p->osd_overlay)) {
+        vo_event(vo, VO_EVENT_WIN_STATE);
+        vo_report_backend_error(vo);
+    }
 #endif
 }
 
@@ -255,6 +283,26 @@ static int control(struct vo *vo, uint32_t request, void *data)
     struct gpu_priv *p = vo->priv;
 
     switch (request) {
+#if HAVE_ANDROID
+    case VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM:
+        *(bool *)data = android_osd_overlay_transforms_video(p->osd_overlay);
+        return VO_TRUE;
+    case VOCTRL_UPDATE_OSD_SIZE:
+        android_osd_overlay_invalidate_geometry(p->osd_overlay);
+        vo->want_redraw = true;
+        return VO_TRUE;
+    case VOCTRL_UPDATE_OSD_SURFACE:
+    case VOCTRL_UPDATE_WINDOW:
+        if (!android_osd_overlay_set_surface(p->osd_overlay,
+                                             vo->opts->android_osd_wid))
+            return VO_FALSE;
+        // Drop frames cached with subtitles blended into the video texture.
+        gl_video_reset(p->renderer);
+        resize(vo);
+        if (request == VOCTRL_UPDATE_OSD_SURFACE)
+            return VO_TRUE;
+        break;
+#endif
     case VOCTRL_SET_PANSCAN:
         resize(vo);
         return VO_TRUE;
@@ -345,6 +393,10 @@ static void uninit(struct vo *vo)
 {
     struct gpu_priv *p = vo->priv;
 
+#if HAVE_ANDROID
+    android_osd_overlay_destroy(p->osd_overlay);
+#endif
+
     gl_video_uninit(p->renderer);
     mp_mutex_lock(&vo->params_mutex);
     vo->target_params = NULL;
@@ -374,6 +426,13 @@ static int preinit(struct vo *vo)
 
     p->renderer = gl_video_init(p->ctx->ra, vo->log, vo->global);
     gl_video_set_osd_source(p->renderer, vo->osd);
+#if HAVE_ANDROID
+    p->osd_overlay = android_osd_overlay_create(vo);
+    if (!p->osd_overlay ||
+        !android_osd_overlay_set_surface(p->osd_overlay,
+                                         vo->opts->android_osd_wid))
+        goto err_out;
+#endif
     gl_video_configure_queue(p->renderer, vo);
 
     get_and_update_icc_profile(p);

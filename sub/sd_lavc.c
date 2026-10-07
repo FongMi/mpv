@@ -515,7 +515,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
         opts->stretch_dvd_subs)
     {
         // For DVD subs, try to keep the subtitle PAR at display PAR.
-        double par = priv->video_params.p_w / (double)priv->video_params.p_h;
+        double par = osd_get_video_par(d, &priv->video_params);
         if (isnormal(par))
             video_par = par;
     }
@@ -526,7 +526,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
             (priv->video_params.h == 480 ||
              priv->video_params.h == 576))
         {
-            double par = priv->video_params.p_w / (double)priv->video_params.p_h;
+            double par = osd_get_video_par(d, &priv->video_params);
             if (isnormal(par))
                 video_par = par * -1;
             else
