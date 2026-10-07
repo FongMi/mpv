@@ -1,0 +1,713 @@
+/* Host fixture for the production Android output option callback. */
+#undef NDEBUG
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#ifndef HAVE_ANDROID
+#define HAVE_ANDROID 1
+#endif
+#define STREAM_VIDEO 0
+#define STREAM_AUDIO 1
+#define STREAM_SUB 2
+#define STATUS_SYNCING 0
+#define STATUS_READY 1
+#define STATUS_PLAYING 2
+#define STATUS_EOF 4
+#define mp_assert assert
+#define VOCTRL_UPDATE_WINDOW 1
+#define VOCTRL_UPDATE_OSD_SURFACE 2
+#define MP_NOPTS_VALUE -1
+#define MPSEEK_ABSOLUTE 1
+#define MPSEEK_RELATIVE 2
+#define MPSEEK_EXACT 1
+#define MPSEEK_FLAG_DELAY 1
+#define AT_END_OF_FILE 1
+#define MP_VERBOSE(ctx, ...) ((void)(ctx))
+#define MP_DBG(ctx, ...) ((void)(ctx))
+#define MPV_EVENT_VIDEO_RECONFIG 1
+#define MPV_EVENT_PLAYBACK_RESTART 2
+#define MPCLAMP(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
+
+enum { PL_COLOR_TRC_UNKNOWN, PL_COLOR_TRC_SRGB, PL_COLOR_TRC_PQ, PL_COLOR_TRC_HLG };
+enum { GL_TARGET_HINT_AUTO = -1, GL_TARGET_HINT_OFF, GL_TARGET_HINT_ON };
+enum { AVCOL_TRC_UNSPECIFIED, AVCOL_TRC_BT709,
+       AVCOL_TRC_SMPTE2084, AVCOL_TRC_ARIB_STD_B67 };
+struct gl_video_opts { int target_trc, target_hint; };
+typedef struct { int color_trc; } AVCodecParameters;
+struct mp_codec_params {
+    void *dovi;
+    struct { int transfer; } color;
+    AVCodecParameters *lav_codecpar;
+};
+struct sh_stream { struct mp_codec_params *codec; };
+struct m_obj_settings { char *name; };
+struct mp_vo_opts {
+    int64_t WinID, android_osd_wid;
+    int android_dolby_vision_output;
+    struct m_obj_settings *video_driver_list;
+};
+struct ra_ctx_opts { struct m_obj_settings *context_list; };
+struct MPOpts {
+    struct mp_vo_opts *vo;
+    struct ra_ctx_opts *ra_ctx_opts;
+    struct gl_video_opts *gl_video_opts;
+    bool stream_auto_sel;
+    int force_vo;
+    const char *playing_msg, *osd_playing_msg;
+    int osd_duration;
+    int osd_playing_msg_duration;
+};
+struct vo { bool config_ok; };
+struct mp_decoder_wrapper { int unused; };
+struct track {
+    struct sh_stream *stream;
+    struct mp_decoder_wrapper *dec;
+    bool attached_picture;
+    bool selected;
+};
+struct vo_chain { struct track *track; bool is_coverart; };
+struct ao_chain { struct track *track; };
+struct demux_reader_state { bool eof; };
+struct mp_image { int unused; };
+struct mp_log { int unused; };
+struct seek_params { int type, flags; double amount; };
+struct MPContext {
+    struct MPOpts *opts;
+    struct track *current_track[1][2];
+    struct track *android_dolby_vision_direct_failed_track;
+    struct vo *video_out;
+    struct vo_chain *vo_chain;
+    struct ao_chain *ao_chain;
+    void *demuxer;
+    int stop_play, play_dir, video_status, audio_status;
+    struct seek_params seek, current_seek;
+    int num_next_frames, num_past_frames;
+    struct mp_image *next_frames[1], *saved_frame;
+    double video_pts, delay, time_frame, last_frame_duration;
+    double total_avsync_change, last_av_difference, audio_drift_compensation;
+    double avd_filtered, display_sync_error;
+    int mistimed_frames_total, drop_message_shown;
+    bool display_sync_active;
+    bool playback_initialized, restart_complete, paused;
+    bool hrseek_active, playing_msg_shown;
+    double last_seek_pts;
+    struct mp_log *log;
+    void *global;
+};
+static struct vo output;
+static struct ao_chain audio_output;
+static struct vo_chain chain;
+static struct track *last_initialized_track;
+static bool simulated_direct_active, direct_wanted;
+static int last_control, control_result = 1, destroyed, initialized, seeks, wakeups;
+static int last_seek_type, last_seek_exact;
+static double last_seek_pts;
+static int audio_starts;
+static int executed_seeks, restart_events;
+
+#if HAVE_ANDROID
+static bool pl_color_transfer_is_hdr(int transfer)
+{
+    return transfer == PL_COLOR_TRC_PQ || transfer == PL_COLOR_TRC_HLG;
+}
+#endif
+
+static bool wants_android_dolby_vision_direct_output(struct MPContext *ctx,
+                                                    struct track *track)
+{
+    return direct_wanted;
+}
+static bool is_android_dolby_vision_direct_output_active(struct MPContext *ctx)
+{
+    return simulated_direct_active;
+}
+void reinit_video_chain_src(struct MPContext *ctx, struct track *track);
+static void test_video_output_init(struct MPContext *ctx, struct track *track)
+{
+    initialized++;
+    last_initialized_track = track;
+    chain.track = track;
+    ctx->video_out = &output;
+    ctx->vo_chain = &chain;
+}
+static void reinit_video_chain(struct MPContext *ctx)
+{
+    if (ctx->current_track[0][STREAM_VIDEO])
+        reinit_video_chain_src(ctx, ctx->current_track[0][STREAM_VIDEO]);
+}
+static void reinit_audio_chain(struct MPContext *ctx)
+{
+    if (ctx->current_track[0][STREAM_AUDIO])
+        ctx->ao_chain = &audio_output;
+}
+static void reinit_sub_all(struct MPContext *ctx) {}
+static void reinit_sub(struct MPContext *ctx, struct track *track) {}
+static void reselect_demux_stream(struct MPContext *ctx, struct track *track,
+                                  bool refresh_only) {}
+static void vo_chain_reset_state(struct vo_chain *vo_c) {}
+static void vo_chain_uninit(struct vo_chain *vo_c) {}
+static void mp_notify(struct MPContext *ctx, int event, void *data)
+{
+    if (event == MPV_EVENT_PLAYBACK_RESTART)
+        restart_events++;
+}
+static void vo_destroy(struct vo *vo) { destroyed++; }
+static void mp_decoder_wrapper_set_play_dir(struct mp_decoder_wrapper *dec, int dir) {}
+static void mp_image_unrefp(struct mp_image **image) { *image = NULL; }
+static int vo_control(struct vo *vo, int request, void *data)
+{
+    last_control = request;
+    return control_result;
+}
+static void test_force_window_init(struct MPContext *ctx)
+{
+    initialized++;
+    assert(ctx->opts->vo->WinID > 0);
+    ctx->video_out = &output;
+}
+static double get_current_time(struct MPContext *ctx) { return 10; }
+static void queue_seek(struct MPContext *ctx, int type, double pts, int exact, int flags)
+{
+    seeks++;
+    last_seek_type = type;
+    last_seek_pts = pts;
+    last_seek_exact = exact;
+}
+static void execute_queued_seek(struct MPContext *ctx)
+{
+    if (!ctx->seek.type)
+        return;
+    executed_seeks++;
+    ctx->seek = (struct seek_params){0};
+    ctx->restart_complete = false;
+    if (ctx->audio_status != STATUS_EOF)
+        ctx->audio_status = STATUS_SYNCING;
+    if (ctx->video_status != STATUS_EOF)
+        ctx->video_status = STATUS_SYNCING;
+}
+static void mp_decoder_wrapper_suspend(struct mp_decoder_wrapper *dec) {}
+static void mp_wakeup_core(struct MPContext *ctx) { wakeups++; }
+static void handle_update_cache(struct MPContext *ctx) {}
+static void handle_playback_time(struct MPContext *ctx) {}
+static void get_relative_time(struct MPContext *ctx) {}
+static void audio_start_ao(struct MPContext *ctx) { audio_starts++; }
+static void update_core_idle_state(struct MPContext *ctx) {}
+static void update_ab_loop_clip(struct MPContext *ctx) {}
+static double get_time_length(struct MPContext *ctx) { return -1; }
+static char *mp_property_expand_escaped_string(struct MPContext *ctx,
+                                              const char *text) { return NULL; }
+static struct mp_log *mp_log_new(void *parent, struct mp_log *log,
+                                  const char *name) { return log; }
+static void mp_info(struct mp_log *log, const char *format, ...) {}
+static void talloc_free(void *ptr) {}
+static void set_osd_msg(struct MPContext *ctx, int level, int duration,
+                        const char *format, ...) {}
+static bool vo_has_frame(struct vo *vo) { return true; }
+static bool disc_nav_prevents_eof(struct MPContext *ctx) { return false; }
+static bool demux_eof = true;
+static void demux_get_reader_state(void *demuxer, struct demux_reader_state *state)
+{
+    state->eof = demux_eof;
+}
+
+#include "android_video_output_functions.h"
+
+static void test_initial_surface(void)
+{
+    struct m_obj_settings gpu[] = {{"gpu"}, {NULL}};
+    struct m_obj_settings android[] = {{"android"}, {NULL}};
+    struct mp_vo_opts vo_opts = {.video_driver_list = gpu};
+    struct ra_ctx_opts ra_opts = {.context_list = android};
+    struct MPOpts opts = {
+        .vo = &vo_opts, .ra_ctx_opts = &ra_opts, .stream_auto_sel = true,
+    };
+    struct track video = {0};
+    struct MPContext ctx = {.opts = &opts, .current_track = {{&video}}};
+    int before = initialized;
+
+    reinit_video_chain_src(&ctx, &video);
+    assert(initialized == before && !ctx.video_out && !ctx.vo_chain);
+    assert(ctx.current_track[0][STREAM_VIDEO] == &video);
+    assert(test_has_playable_stream(&ctx));
+    assert(ctx.video_status == STATUS_SYNCING);
+    reset_video_state(&ctx); // A seek must preserve the Surface prerequisite.
+    assert(ctx.video_status == STATUS_SYNCING);
+
+    // A preceding file may leave an output whose window now needs cleanup.
+    ctx.video_out = &output;
+    int old_destroyed = destroyed;
+    assert(handle_force_window(&ctx, true) == 0);
+    assert(destroyed == old_destroyed + 1 && !ctx.video_out);
+    assert(ctx.video_status == STATUS_SYNCING);
+
+    vo_opts.WinID = 90;
+    assert(update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == before + 1 && last_initialized_track == &video);
+}
+
+static void check_initial_output(struct m_obj_settings *drivers,
+                                 struct m_obj_settings *contexts, bool waiting)
+{
+    struct mp_vo_opts vo_opts = {.video_driver_list = drivers};
+    struct ra_ctx_opts ra_opts = {.context_list = contexts};
+    struct MPOpts opts = {.vo = &vo_opts, .ra_ctx_opts = &ra_opts};
+    struct track video = {0};
+    struct MPContext ctx = {.opts = &opts, .current_track = {{&video}}};
+    for (int n = 0; n < 2; n++) {
+        vo_opts.WinID = n ? -1 : 0;
+        ctx.video_out = NULL;
+        ctx.vo_chain = NULL;
+        int before = initialized;
+        reinit_video_chain_src(&ctx, &video);
+        assert(initialized == before + !waiting);
+        assert(is_android_video_output_waiting_for_surface(&ctx) == waiting);
+    }
+}
+
+static void test_surface_output_policy(void)
+{
+    struct m_obj_settings gpu[] = {{"gpu"}, {NULL}};
+    struct m_obj_settings gpu_next[] = {{"gpu-next"}, {NULL}};
+    struct m_obj_settings android[] = {{"android"}, {NULL}};
+    struct m_obj_settings android_vk[] = {{"androidvk"}, {NULL}};
+    struct m_obj_settings automatic[] = {{"auto"}, {NULL}};
+    struct m_obj_settings render[] = {{"libmpv"}, {NULL}};
+    struct m_obj_settings null_vo[] = {{"null"}, {NULL}};
+    struct m_obj_settings offscreen[] = {{"displayvk"}, {NULL}};
+    struct m_obj_settings fallback[] = {{"gpu"}, {"null"}, {NULL}};
+    struct m_obj_settings autoprobe[] = {{"gpu"}, {""}, {NULL}};
+    struct m_obj_settings context_fallback[] = {{"android"}, {"displayvk"}, {NULL}};
+    struct m_obj_settings empty_context[] = {{"android"}, {""}, {NULL}};
+    check_initial_output(gpu, android, true);
+    check_initial_output(gpu_next, android_vk, true);
+    check_initial_output(gpu, automatic, true);
+    check_initial_output(NULL, NULL, true);
+    check_initial_output(autoprobe, android, true);
+    check_initial_output(render, android, false);
+    check_initial_output(null_vo, android, false);
+    check_initial_output(gpu, offscreen, false);
+    check_initial_output(fallback, android, false);
+    check_initial_output(gpu, context_fallback, false);
+    check_initial_output(gpu, empty_context, false);
+}
+
+static void test_audio_and_pending_lifecycle(void)
+{
+    struct m_obj_settings gpu[] = {{"gpu"}, {NULL}};
+    struct mp_vo_opts vo_opts = {.video_driver_list = gpu};
+    struct MPOpts opts = {.vo = &vo_opts, .stream_auto_sel = true};
+    struct track video = {0}, audio = {0}, replacement = {0};
+    struct MPContext ctx = {.opts = &opts, .video_status = STATUS_EOF};
+    int before = initialized;
+
+    // No selected video is audio-only, regardless of output/Surface metadata.
+    ctx.current_track[0][STREAM_AUDIO] = &audio;
+    test_prepare_outputs(&ctx);
+    assert(ctx.ao_chain && !ctx.vo_chain && initialized == before);
+    assert(!is_android_video_output_waiting_for_surface(&ctx));
+    assert(ctx.video_status == STATUS_EOF && test_has_playable_stream(&ctx));
+
+    // Selected video without a Surface must not hold prepared audio or its EOF.
+    ctx.current_track[0][STREAM_VIDEO] = &video;
+    test_prepare_outputs(&ctx);
+    assert(ctx.ao_chain && !ctx.vo_chain && initialized == before);
+    assert(ctx.video_status == STATUS_EOF && test_has_playable_stream(&ctx));
+    reset_video_state(&ctx);
+    assert(ctx.video_status == STATUS_EOF);
+    assert(ctx.current_track[0][STREAM_VIDEO] == &video);
+    assert(is_android_video_output_waiting_for_surface(&ctx));
+
+    // A late Surface restores the selected video at the current audio position.
+    int previous_seeks = seeks;
+    vo_opts.WinID = 90;
+    assert(update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(ctx.vo_chain && last_initialized_track == &video);
+    assert(seeks == previous_seeks + 1);
+    assert(last_seek_type == MPSEEK_ABSOLUTE && last_seek_exact == MPSEEK_EXACT);
+    assert(last_seek_pts == get_current_time(&ctx));
+    uninit_video_out(&ctx);
+    before = initialized;
+    vo_opts.WinID = 0;
+
+    // Cover art can wait independently while the audio starts normally.
+    video.attached_picture = true;
+    ctx.ao_chain = NULL;
+    test_prepare_outputs(&ctx);
+    assert(ctx.ao_chain && !ctx.vo_chain && initialized == before);
+    assert(ctx.video_status == STATUS_EOF && test_has_playable_stream(&ctx));
+    ctx.current_track[0][STREAM_AUDIO] = NULL;
+    ctx.ao_chain = NULL;
+    test_finish_track_switch(&ctx, 0, STREAM_AUDIO, NULL);
+    assert(ctx.video_status == STATUS_SYNCING); // An image without audio still waits.
+    test_finish_track_switch(&ctx, 0, STREAM_AUDIO, &audio);
+    assert(ctx.ao_chain && ctx.video_status == STATUS_EOF);
+    ctx.ao_chain = NULL;
+    test_finish_track_switch(&ctx, 0, STREAM_AUDIO, NULL);
+    assert(ctx.video_status == STATUS_SYNCING);
+
+    // Disabling pending video releases audio without a late Surface restoring it.
+    video.attached_picture = false;
+    test_finish_track_switch(&ctx, 0, STREAM_AUDIO, &audio);
+    assert(ctx.ao_chain && ctx.video_status == STATUS_EOF);
+    uninit_video_chain(&ctx);
+    test_finish_track_switch(&ctx, 0, STREAM_VIDEO, NULL);
+    assert(ctx.ao_chain && ctx.video_status == STATUS_EOF);
+    vo_opts.WinID = 91;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == before && !ctx.vo_chain);
+    vo_opts.WinID = 0;
+    test_finish_track_switch(&ctx, 0, STREAM_VIDEO, &video);
+    assert(ctx.video_status == STATUS_EOF);
+
+    // A stop cancels deferred playback even before the selected track is freed.
+    ctx.stop_play = 1;
+    vo_opts.WinID = 92;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == before && !ctx.vo_chain);
+    assert(!is_android_video_output_waiting_for_surface(&ctx));
+
+    // A track switch can retain its old VO before the stop/Surface command batch.
+    ctx.video_out = &output;
+    control_result = -1;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == before && !ctx.vo_chain && ctx.video_out == &output);
+    control_result = 1;
+    direct_wanted = true;
+    vo_opts.android_osd_wid = 95;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == before && !ctx.vo_chain && ctx.video_out == &output);
+    direct_wanted = false;
+    uninit_video_out(&ctx);
+    ctx.current_track[0][STREAM_VIDEO] = NULL;
+    ctx.current_track[0][STREAM_AUDIO] = NULL;
+    ctx.ao_chain = NULL;
+    ctx.stop_play = 0;
+    reset_video_state(&ctx);
+    assert(ctx.video_status == STATUS_EOF && !test_has_playable_stream(&ctx));
+
+    // A new load while waiting owns the later Surface callback, not the old track.
+    vo_opts.WinID = 0;
+    ctx.current_track[0][STREAM_VIDEO] = &replacement;
+    test_prepare_outputs(&ctx);
+    assert(initialized == before && ctx.video_status == STATUS_SYNCING);
+    vo_opts.WinID = 93;
+    vo_opts.android_osd_wid = 0; // GPU video does not require the OSD Surface.
+    assert(update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == before + 1 && last_initialized_track == &replacement);
+
+    // Forced direct video-only playback remains selected until both Surfaces exist.
+    struct m_obj_settings direct[] = {{"mediacodec_embed"}, {NULL}};
+    vo_opts.video_driver_list = direct;
+    ctx.video_out = NULL;
+    ctx.vo_chain = NULL;
+    test_prepare_outputs(&ctx);
+    assert(initialized == before + 1 && ctx.video_status == STATUS_SYNCING);
+    assert(test_has_playable_stream(&ctx));
+    vo_opts.android_osd_wid = 94;
+    assert(update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(initialized == before + 2 && last_initialized_track == &replacement);
+}
+
+static void test_headless_audio_start_and_eof(void)
+{
+    struct m_obj_settings gpu[] = {{"gpu"}, {NULL}};
+    struct mp_vo_opts vo_opts = {.video_driver_list = gpu};
+    struct MPOpts opts = {.vo = &vo_opts, .stream_auto_sel = true};
+    struct track video = {0}, audio = {0};
+    struct MPContext ctx = {
+        .opts = &opts,
+        .current_track = {{&video, &audio}},
+    };
+    int before = audio_starts;
+
+    test_prepare_outputs(&ctx);
+    handle_playback_restart(&ctx);
+    assert(audio_starts == before); // Audio buffers are not ready yet.
+    ctx.audio_status = STATUS_READY;
+    handle_playback_restart(&ctx);
+    assert(audio_starts == before + 1);
+    assert(ctx.current_track[0][STREAM_VIDEO] == &video && !ctx.vo_chain);
+
+    handle_eof(&ctx);
+    assert(!ctx.stop_play); // Pending video must not end active audio.
+    ctx.audio_status = STATUS_EOF;
+    handle_eof(&ctx);
+    assert(ctx.stop_play == AT_END_OF_FILE);
+    vo_opts.WinID = 101;
+    before = initialized;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == before && !ctx.vo_chain);
+
+    // With no audio, keep the selected video pending instead of ending the file.
+    ctx.stop_play = 0;
+    ctx.ao_chain = NULL;
+    ctx.current_track[0][STREAM_AUDIO] = NULL;
+    vo_opts.WinID = 0;
+    reset_video_state(&ctx);
+    before = audio_starts;
+    handle_playback_restart(&ctx);
+    handle_eof(&ctx);
+    assert(!ctx.stop_play && audio_starts == before);
+    assert(ctx.video_status == STATUS_SYNCING);
+}
+
+static void test_blank_output_contract(void)
+{
+    struct m_obj_settings gpu[] = {{"gpu"}, {NULL}};
+    struct m_obj_settings direct[] = {{"mediacodec_embed"}, {NULL}};
+    struct mp_vo_opts vo_opts = {.video_driver_list = gpu};
+    struct MPOpts opts = {.vo = &vo_opts};
+    struct MPContext ctx = {.opts = &opts};
+    int before = initialized;
+
+    // A lavfi output has no selected track to restore through the wid callback.
+    reinit_video_chain_src(&ctx, NULL);
+    assert(initialized == before + 1);
+    assert(!is_android_video_output_waiting_for_surface(&ctx));
+    ctx.video_out = NULL;
+    ctx.vo_chain = NULL;
+    vo_opts.video_driver_list = direct;
+    reinit_video_chain_src(&ctx, NULL);
+    assert(initialized == before + 1); // Retain the original forced-direct gate.
+}
+
+static void test_queued_seek_before_restart(void)
+{
+    struct MPOpts opts = {0};
+    for (int streams = 1; streams <= 3; streams++) {
+        struct MPContext ctx = {
+            .opts = &opts,
+            .audio_status = streams & 1 ? STATUS_READY : STATUS_EOF,
+            .video_status = streams & 2 ? STATUS_READY : STATUS_EOF,
+            .seek = {.type = MPSEEK_ABSOLUTE, .flags = MPSEEK_FLAG_DELAY},
+            .paused = streams == 2,
+        };
+        int before = executed_seeks, events = restart_events, started = audio_starts;
+        handle_playback_restart(&ctx);
+        if (ctx.restart_complete || restart_events != events)
+            fprintf(stderr, "Queued seek completed before execution: streams=%d, seeks=%d, restarts=%d\n",
+                    streams, executed_seeks - before, restart_events - events);
+        assert(!ctx.restart_complete && restart_events == events);
+        assert(executed_seeks == before + 1);
+        assert(!ctx.seek.type);
+        assert(audio_starts == started);
+
+        ctx.audio_status = streams & 1 ? STATUS_READY : STATUS_EOF;
+        ctx.video_status = streams & 2 ? STATUS_READY : STATUS_EOF;
+        handle_playback_restart(&ctx);
+        assert(ctx.restart_complete && restart_events == events + 1);
+    }
+
+    struct MPContext eof = {
+        .opts = &opts,
+        .audio_status = STATUS_EOF,
+        .video_status = STATUS_EOF,
+        .seek = {.type = MPSEEK_RELATIVE, .amount = 1},
+    };
+    int before = executed_seeks;
+    handle_playback_restart(&eof);
+    assert(eof.restart_complete && !eof.seek.type && executed_seeks == before);
+}
+
+static void test_hdr_output_policy(void)
+{
+#if HAVE_ANDROID
+    struct gl_video_opts opts = {.target_hint = GL_TARGET_HINT_AUTO};
+    struct MPOpts mp_opts = {.gl_video_opts = &opts};
+    struct MPContext ctx = {.opts = &mp_opts};
+    struct mp_codec_params codec = {0};
+    struct sh_stream stream = {.codec = &codec};
+    struct track track = {.stream = &stream};
+    AVCodecParameters avp = {.color_trc = AVCOL_TRC_UNSPECIFIED};
+
+    // An unknown transfer may become PQ/HLG only after decoding starts.
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+    codec.lav_codecpar = &avp;
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+    opts.target_hint = GL_TARGET_HINT_ON;
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+    opts.target_hint = GL_TARGET_HINT_OFF;
+    assert(!should_prefer_android_hdr_output(&ctx, &track));
+    opts.target_hint = GL_TARGET_HINT_AUTO;
+
+    codec.color.transfer = PL_COLOR_TRC_PQ;
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+    codec.color.transfer = PL_COLOR_TRC_HLG;
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+    codec.color.transfer = PL_COLOR_TRC_SRGB;
+    assert(!should_prefer_android_hdr_output(&ctx, &track));
+    codec.color.transfer = PL_COLOR_TRC_UNKNOWN;
+    avp.color_trc = AVCOL_TRC_SMPTE2084;
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+    avp.color_trc = AVCOL_TRC_ARIB_STD_B67;
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+    avp.color_trc = AVCOL_TRC_BT709;
+    assert(!should_prefer_android_hdr_output(&ctx, &track));
+    codec.dovi = &codec;
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+
+    // Explicit targets select precision before source inference or hint policy.
+    opts.target_hint = GL_TARGET_HINT_OFF;
+    assert(!should_prefer_android_hdr_output(&ctx, &track));
+    opts.target_trc = PL_COLOR_TRC_PQ;
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+    opts.target_trc = PL_COLOR_TRC_HLG;
+    assert(should_prefer_android_hdr_output(&ctx, &track));
+    opts.target_trc = PL_COLOR_TRC_SRGB;
+    assert(!should_prefer_android_hdr_output(&ctx, &track));
+    opts.target_hint = GL_TARGET_HINT_ON;
+    assert(!should_prefer_android_hdr_output(&ctx, &track));
+
+    opts.target_trc = PL_COLOR_TRC_UNKNOWN;
+    opts.target_hint = GL_TARGET_HINT_AUTO;
+    assert(!should_prefer_android_hdr_output(&ctx, NULL));
+    stream.codec = NULL;
+    assert(!should_prefer_android_hdr_output(&ctx, &track));
+    track.stream = NULL;
+    assert(!should_prefer_android_hdr_output(&ctx, &track));
+    puts("Android HDR output precision policy passed");
+#endif
+}
+
+static void test_lazy_stream_eof(void)
+{
+    struct mp_decoder_wrapper decoder = {0};
+    struct track track = {0};
+    struct vo_chain video = {.track = &track};
+    struct ao_chain audio = {.track = &track};
+    for (int chains = 1; chains < 4; chains++) {
+        struct MPContext ctx = {
+            .vo_chain = chains & 1 ? &video : NULL,
+            .ao_chain = chains & 2 ? &audio : NULL,
+            .audio_status = STATUS_EOF,
+            .video_status = STATUS_EOF,
+        };
+        demux_eof = false;
+        handle_eof(&ctx);
+        assert(!ctx.stop_play);
+        demux_eof = true;
+        handle_eof(&ctx);
+        assert(ctx.stop_play == AT_END_OF_FILE);
+        ctx.stop_play = 0;
+        track.dec = &decoder;
+        demux_eof = false;
+        handle_eof(&ctx);
+        assert(ctx.stop_play == AT_END_OF_FILE);
+        track.dec = NULL;
+    }
+    demux_eof = true;
+}
+
+int main(void)
+{
+    test_lazy_stream_eof();
+    if (!HAVE_ANDROID) {
+        struct m_obj_settings gpu[] = {{"gpu"}, {NULL}};
+        struct m_obj_settings android[] = {{"android"}, {NULL}};
+        check_initial_output(gpu, android, false);
+        check_initial_output(NULL, NULL, false);
+        puts("Non-Android output initialization remains independent of wid");
+        return 0;
+    }
+
+    struct mp_vo_opts vo_opts = {.WinID = 10, .android_osd_wid = 20};
+    struct MPOpts opts = {.vo = &vo_opts};
+    struct mp_decoder_wrapper decoder = {0};
+    struct track track = {.dec = &decoder};
+    struct MPContext ctx = {
+        .opts = &opts, .current_track = {{&track}},
+        .video_out = &output, .vo_chain = &chain, .video_pts = 9,
+    };
+
+    // Changing only OSD must not send a video window rebind to the platform.
+    assert(!update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(last_control == VOCTRL_UPDATE_OSD_SURFACE && !destroyed && !initialized);
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(last_control == VOCTRL_UPDATE_WINDOW && !destroyed);
+
+    // GPU suspension keeps its chain; OSD changes do not rebind that video window.
+    vo_opts.WinID = 0;
+    last_control = 0;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(destroyed == 0 && initialized == 0 && last_control == VOCTRL_UPDATE_WINDOW);
+    assert(ctx.current_track[0][STREAM_VIDEO] == &track);
+    assert(!update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(last_control == VOCTRL_UPDATE_OSD_SURFACE && initialized == 0);
+
+    vo_opts.WinID = 11;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == 0 && seeks == 0 && ctx.vo_chain);
+
+    // Genuine video backend failures still rebuild; OSD policy can reselect Dovi.
+    control_result = -1;
+    assert(update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(destroyed == 1 && initialized == 1);
+    control_result = 1;
+    direct_wanted = true;
+    assert(update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(destroyed == 2 && initialized == 2);
+
+    // Direct MediaCodec releases its output on detach and restores on attach.
+    simulated_direct_active = true;
+    vo_opts.WinID = 0;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(destroyed == 3 && initialized == 2);
+    assert(!update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(initialized == 2);
+    vo_opts.WinID = 12;
+    assert(update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == 3 && ctx.vo_chain);
+    assert(wakeups == 10);
+    // Explicit H.264 direct output must wait when video attaches before OSD.
+    direct_wanted = simulated_direct_active = false;
+    struct m_obj_settings forced[] = {{"mediacodec_embed"}, {NULL}};
+    vo_opts.video_driver_list = forced;
+    ctx.video_out = NULL;
+    ctx.vo_chain = NULL;
+    vo_opts.WinID = 13;
+    vo_opts.android_osd_wid = 0;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == 3 && ctx.current_track[0][STREAM_VIDEO] == &track);
+    vo_opts.android_osd_wid = 21;
+    assert(update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(initialized == 4 && ctx.vo_chain);
+
+    // OSD may detach while a direct VO lives without restarting its codec.
+    simulated_direct_active = true;
+    int old_destroyed = destroyed;
+    vo_opts.android_osd_wid = 0;
+    assert(!update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(destroyed == old_destroyed && initialized == 4);
+    vo_opts.WinID = -1;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(!ctx.video_out && !ctx.vo_chain);
+    simulated_direct_active = false;
+
+    // The reverse attachment order also waits, including the -1 sentinel.
+    vo_opts.android_osd_wid = 22;
+    assert(!update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(initialized == 4);
+    vo_opts.WinID = 14;
+    assert(update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(initialized == 5);
+    assert(!direct_wanted); // Explicit output did not enable automatic Dovi selection.
+
+    // An ordered fallback list is not a forced direct-output policy.
+    struct m_obj_settings fallback[] = {{"mediacodec_embed"}, {"gpu-next"}, {NULL}};
+    vo_opts.video_driver_list = fallback;
+    assert(!wants_android_direct_output(&ctx, &track));
+    vo_opts.video_driver_list = NULL;
+    assert(!wants_android_direct_output(&ctx, &track));
+    test_initial_surface();
+    test_surface_output_policy();
+    test_headless_audio_start_and_eof();
+    test_audio_and_pending_lifecycle();
+    test_blank_output_contract();
+    test_queued_seek_before_restart();
+    test_hdr_output_policy();
+    puts("Android OSD routing, Surface detach/restore and output policy contracts passed");
+    return 0;
+}

@@ -1052,6 +1052,11 @@ int handle_force_window(struct MPContext *mpctx, bool force)
             uninit_video_out(mpctx);
         return 0;
     }
+    // With no track, only an explicitly configured direct VO is selected.
+    // Its idle window needs the OSD Surface too; wait for its option callback.
+    if (!mpctx->video_out && wants_android_direct_output(mpctx, NULL) &&
+        !should_use_android_direct_output(mpctx, NULL))
+        return 0;
 #endif
 
     if (!mpctx->opts->force_vo) {
@@ -1182,6 +1187,16 @@ static void handle_playback_restart(struct MPContext *mpctx)
 
     handle_update_cache(mpctx);
 
+    // Finish a queued seek before publishing the preceding restart, including
+    // audio-only and video-only playback.
+    if (mpctx->seek.type && (mpctx->audio_status == STATUS_READY ||
+                            mpctx->video_status == STATUS_READY)) {
+        handle_playback_time(mpctx);
+        mpctx->seek.flags &= ~MPSEEK_FLAG_DELAY;
+        execute_queued_seek(mpctx);
+        return;
+    }
+
     if (mpctx->video_status == STATUS_READY) {
         mpctx->video_status = STATUS_PLAYING;
         get_relative_time(mpctx);
@@ -1190,15 +1205,6 @@ static void handle_playback_restart(struct MPContext *mpctx)
     }
 
     if (mpctx->audio_status == STATUS_READY) {
-        // If a new seek is queued while the current one finishes, don't
-        // actually play the audio, but resume seeking immediately.
-        if (mpctx->seek.type && mpctx->video_status == STATUS_PLAYING) {
-            handle_playback_time(mpctx);
-            mpctx->seek.flags &= ~MPSEEK_FLAG_DELAY; // immediately
-            execute_queued_seek(mpctx);
-            return;
-        }
-
         audio_start_ao(mpctx);
     }
 
