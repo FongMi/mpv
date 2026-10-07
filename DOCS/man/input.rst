@@ -1760,6 +1760,14 @@ Miscellaneous Commands
     This command has an even more uncertain future than ``ab-loop-dump-cache``
     and might disappear without replacement if the author decides it's useless.
 
+``android-surface-frame <token> <width> <height>``
+    Request an Android video frame for the attached Surface and its new size.
+    Use a positive, increasing token for each Surface attachment or size change.
+    The request atomically binds the token and dimensions to the current ``wid``.
+    It also applies to a video output created later. Observe
+    ``android-video-surface-frame`` for completion; command acceptance alone is
+    insufficient. Keep this runtime request out of per-file options.
+
 ``begin-vo-dragging``
     Begin window dragging if supported by the current VO. This command should
     only be called while a mouse button is being pressed, otherwise it will
@@ -3920,6 +3928,16 @@ Property list
     the video window is visible. If the ``--force-window`` option is used, this
     usually always returns ``yes``/true.
 
+``android-video-surface-frame``
+    The completed Android video Surface request as ``token:width:height``, or
+    ``0:0:0`` when no frame matches the current request and attached Surface.
+    GPU outputs require a video draw at the requested framebuffer extent and a
+    successful Vulkan submission or EGL swap. Empty and failed draws do not
+    complete a request. This acknowledges output submission, not compositor
+    presentation. Replacing or detaching the Surface invalidates completion.
+    Direct MediaCodec output requires a successful codec buffer release to the
+    same Surface. A layout resize can reuse that submission until video reset or
+    reconfiguration; codec source dimensions are independent of View dimensions.
 ``vo-passes``
     Contains introspection about the VO's active render passes and their
     execution times. Not implemented by all VOs.
