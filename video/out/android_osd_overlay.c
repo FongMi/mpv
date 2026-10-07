@@ -19,12 +19,16 @@
 #include <GLES2/gl2.h>
 #include <android/native_window_jni.h>
 #include <libavcodec/jni.h>
+#include <limits.h>
+#include <math.h>
 #include <string.h>
 
 #include "android_osd_overlay.h"
+#include "aspect.h"
 #include "common/common.h"
 #include "common/msg.h"
 #include "misc/jni.h"
+#include "mpv/client.h"
 #include "sub/osd.h"
 #include "video/mp_image.h"
 #include "vo.h"
@@ -80,6 +84,38 @@ static const char fragment_shader_source[] =
     "}\n";
 
 static void destroy_egl(struct android_osd_overlay *ctx);
+
+struct egl_state {
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface draw;
+    EGLSurface read;
+    EGLenum api;
+};
+
+static struct egl_state save_egl(void)
+{
+    return (struct egl_state) {
+        .display = eglGetCurrentDisplay(),
+        .context = eglGetCurrentContext(),
+        .draw = eglGetCurrentSurface(EGL_DRAW),
+        .read = eglGetCurrentSurface(EGL_READ),
+        .api = eglQueryAPI(),
+    };
+}
+
+static bool restore_egl(struct android_osd_overlay *ctx, struct egl_state state)
+{
+    EGLDisplay display = state.display;
+    if (display == EGL_NO_DISPLAY)
+        display = eglGetCurrentDisplay();
+    bool ok = eglBindAPI(state.api);
+    if (display != EGL_NO_DISPLAY)
+        ok = eglMakeCurrent(display, state.draw, state.read, state.context) && ok;
+    if (!ok)
+        MP_ERR(ctx, "Failed to restore video EGL context: 0x%x\n", eglGetError());
+    return ok;
+}
 
 static bool check_shader(struct android_osd_overlay *ctx, GLuint shader,
                          const char *name)
@@ -229,6 +265,8 @@ static bool create_egl(struct android_osd_overlay *ctx)
         EGL_CONTEXT_CLIENT_VERSION, 2,
         EGL_NONE,
     };
+    if (!eglBindAPI(EGL_OPENGL_ES_API))
+        goto fail;
     ctx->context = eglCreateContext(ctx->display, ctx->config, EGL_NO_CONTEXT,
                                     context_attrs);
     if (ctx->context == EGL_NO_CONTEXT) {
@@ -265,7 +303,11 @@ static bool create_egl(struct android_osd_overlay *ctx)
     glDisable(GL_DEPTH_TEST);
     glClearColor(0.0, 0.0, 0.0, 0.0);
     glClear(GL_COLOR_BUFFER_BIT);
-    eglSwapBuffers(ctx->display, ctx->surface);
+    if (!eglSwapBuffers(ctx->display, ctx->surface)) {
+        MP_ERR(ctx, "Failed to initialize OSD surface contents: 0x%x\n",
+               eglGetError());
+        goto fail;
+    }
     MP_VERBOSE(ctx, "Initialized %dx%d transparent OSD surface.\n",
                ctx->width, ctx->height);
     return true;
@@ -388,6 +430,49 @@ static bool upload_texture(struct android_osd_overlay *ctx,
     return true;
 }
 
+bool android_osd_geometry_from_node(const struct mpv_node *node,
+                                    struct mp_osd_res *res)
+{
+    if (node->format != MPV_FORMAT_NODE_ARRAY || !node->u.list ||
+        (node->u.list->num != 6 && node->u.list->num != 7) ||
+        !node->u.list->values)
+        return false;
+
+    int64_t v[6];
+    for (int n = 0; n < 6; n++) {
+        const struct mpv_node *value = &node->u.list->values[n];
+        if (value->format != MPV_FORMAT_INT64 ||
+            value->u.int64 < INT_MIN || value->u.int64 > INT_MAX)
+            return false;
+        v[n] = value->u.int64;
+    }
+    if (v[0] <= 0 || v[1] <= 0 || v[4] <= v[2] || v[5] <= v[3])
+        return false;
+    // libass and the OSD layout use integer dimensions and margins.
+    const int64_t sizes[] = {
+        v[4] - v[2], v[5] - v[3], v[0] - v[2], v[1] - v[3],
+        v[0] - v[4], v[1] - v[5],
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(sizes); n++) {
+        if (sizes[n] < INT_MIN || sizes[n] > INT_MAX)
+            return false;
+    }
+    double video_aspect = 0;
+    if (node->u.list->num == 7) {
+        const struct mpv_node *value = &node->u.list->values[6];
+        if (value->format != MPV_FORMAT_DOUBLE || !isfinite(value->u.double_) ||
+            value->u.double_ < 0)
+            return false;
+        video_aspect = value->u.double_;
+    }
+    *res = (struct mp_osd_res) {
+        .w = (int)v[0], .h = (int)v[1], .ml = (int)v[2], .mt = (int)v[3],
+        .mr = (int)(v[0] - v[4]), .mb = (int)(v[1] - v[5]), .display_par = 1,
+        .video_aspect = video_aspect,
+    };
+    return true;
+}
+
 static void draw_part(struct android_osd_overlay *ctx,
                       const struct overlay_texture *texture,
                       const struct sub_bitmap *part)
@@ -395,10 +480,10 @@ static void draw_part(struct android_osd_overlay *ctx,
     if (part->w <= 0 || part->h <= 0 || part->dw == 0 || part->dh == 0)
         return;
 
-    float left = 2.0f * part->x / ctx->width - 1.0f;
-    float right = 2.0f * (part->x + part->dw) / ctx->width - 1.0f;
-    float top = 1.0f - 2.0f * part->y / ctx->height;
-    float bottom = 1.0f - 2.0f * (part->y + part->dh) / ctx->height;
+    float left = 2.0f * part->x / ctx->osd_res.w - 1.0f;
+    float right = 2.0f * (part->x + part->dw) / ctx->osd_res.w - 1.0f;
+    float top = 1.0f - 2.0f * part->y / ctx->osd_res.h;
+    float bottom = 1.0f - 2.0f * (part->y + part->dh) / ctx->osd_res.h;
     float u0 = (float)part->src_x / texture->width;
     float u1 = (float)(part->src_x + part->w) / texture->width;
     float v0 = (float)part->src_y / texture->height;
@@ -437,8 +522,7 @@ struct android_osd_overlay *android_osd_overlay_create(struct vo *vo)
     return ctx;
 }
 
-bool android_osd_overlay_set_surface(struct android_osd_overlay *ctx,
-                                     int64_t wid)
+static bool set_surface(struct android_osd_overlay *ctx, int64_t wid)
 {
     if (ctx->wid == wid && ctx->window)
         return true;
@@ -453,7 +537,31 @@ void android_osd_overlay_invalidate_geometry(struct android_osd_overlay *ctx)
     ctx->geometry_dirty = true;
 }
 
-bool android_osd_overlay_render(struct android_osd_overlay *ctx, double pts)
+static void update_geometry(struct android_osd_overlay *ctx)
+{
+    struct mp_rect src, dst;
+    struct mp_osd_res host_res;
+    if (ctx->vo->opts->android_video_surface_transform &&
+        android_osd_geometry_from_node(
+            &ctx->vo->opts->android_video_geometry, &host_res))
+    {
+        ctx->osd_res = host_res;
+    } else if (ctx->vo->params) {
+        mp_get_src_dst_rects(ctx->vo->log, ctx->vo->opts,
+                            ctx->vo->driver->caps, ctx->vo->params,
+                            ctx->width, ctx->height, ctx->vo->monitor_par,
+                            &src, &dst, &ctx->osd_res);
+    } else {
+        ctx->osd_res = (struct mp_osd_res) {
+            .w = ctx->width,
+            .h = ctx->height,
+            .display_par = ctx->vo->monitor_par,
+        };
+    }
+    ctx->geometry_dirty = false;
+}
+
+static bool render(struct android_osd_overlay *ctx, double pts)
 {
     if (!ctx->wid || ctx->wid == -1)
         return true;
@@ -464,13 +572,8 @@ bool android_osd_overlay_render(struct android_osd_overlay *ctx, double pts)
         return false;
     }
 
-    if (ctx->geometry_dirty) {
-        ctx->vo->dwidth = ctx->width;
-        ctx->vo->dheight = ctx->height;
-        struct mp_rect src, dst;
-        vo_get_src_dst_rects(ctx->vo, &src, &dst, &ctx->osd_res);
-        ctx->geometry_dirty = false;
-    }
+    if (ctx->geometry_dirty)
+        update_geometry(ctx);
 
     const bool formats[SUBBITMAP_COUNT] = {
         [SUBBITMAP_BGRA] = true,
@@ -554,11 +657,12 @@ bool android_osd_overlay_render(struct android_osd_overlay *ctx, double pts)
     return ok;
 }
 
-bool android_osd_overlay_present(struct android_osd_overlay *ctx)
+static bool present(struct android_osd_overlay *ctx)
 {
     if (!ctx->pending)
         return true;
-    if (!eglSwapBuffers(ctx->display, ctx->surface)) {
+    if (!eglMakeCurrent(ctx->display, ctx->surface, ctx->surface, ctx->context) ||
+        !eglSwapBuffers(ctx->display, ctx->surface)) {
         MP_ERR(ctx, "Failed to present OSD surface: 0x%x\n",
                eglGetError());
         destroy_egl(ctx);
@@ -568,8 +672,7 @@ bool android_osd_overlay_present(struct android_osd_overlay *ctx)
     return true;
 }
 
-bool android_osd_overlay_get_size(struct android_osd_overlay *ctx,
-                                  int *w, int *h)
+static bool get_size(struct android_osd_overlay *ctx, int *w, int *h)
 {
     if (!ensure_surface(ctx) || !update_size(ctx))
         return false;
@@ -582,6 +685,73 @@ void android_osd_overlay_destroy(struct android_osd_overlay *ctx)
 {
     if (!ctx)
         return;
+    struct egl_state state = save_egl();
     destroy_egl(ctx);
+    restore_egl(ctx, state);
     talloc_free(ctx);
+}
+
+bool android_osd_overlay_set_surface(struct android_osd_overlay *ctx, int64_t wid)
+{
+    struct egl_state state = save_egl();
+    bool ok = set_surface(ctx, wid);
+    return restore_egl(ctx, state) && ok;
+}
+
+bool android_osd_overlay_render(struct android_osd_overlay *ctx, double pts)
+{
+    struct egl_state state = save_egl();
+    bool ok = render(ctx, pts);
+    if (!ok)
+        destroy_egl(ctx);
+    return restore_egl(ctx, state) && ok;
+}
+
+bool android_osd_overlay_present(struct android_osd_overlay *ctx)
+{
+    struct egl_state state = save_egl();
+    bool ok = present(ctx);
+    return restore_egl(ctx, state) && ok;
+}
+
+bool android_osd_overlay_get_size(struct android_osd_overlay *ctx, int *w, int *h)
+{
+    struct egl_state state = save_egl();
+    bool ok = get_size(ctx, w, h);
+    return restore_egl(ctx, state) && ok;
+}
+
+bool android_osd_overlay_active(struct android_osd_overlay *ctx)
+{
+    // Keep subtitles off the host-transformed video Surface while its separate
+    // OSD window is detached or being recreated.
+    return ctx && (ctx->window || android_osd_overlay_transforms_video(ctx));
+}
+
+bool android_osd_overlay_transforms_video(struct android_osd_overlay *ctx)
+{
+    // OSD window recreation must not transfer video geometry ownership.
+    struct mp_osd_res res;
+    return ctx && ctx->vo->opts->android_video_surface_transform &&
+           android_osd_geometry_from_node(
+               &ctx->vo->opts->android_video_geometry, &res);
+}
+
+void android_osd_overlay_get_video_rects(struct android_osd_overlay *ctx,
+                                        struct mp_rect *src, struct mp_rect *dst,
+                                        struct mp_osd_res *osd)
+{
+    struct vo *vo = ctx->vo;
+    if (!android_osd_overlay_transforms_video(ctx) || !vo->params) {
+        vo_get_src_dst_rects(vo, src, dst, osd);
+        return;
+    }
+    // The host owns the complete layout and clips only after transforming the
+    // Surface. Never crop source pixels before it can shrink or pan the image.
+    struct mp_vo_opts opts = *vo->opts;
+    opts.keepaspect = false;
+    opts.scale_x = opts.scale_y = 1;
+    opts.pan_x = opts.pan_y = 0;
+    mp_get_src_dst_rects(vo->log, &opts, vo->driver->caps, vo->params,
+                        vo->dwidth, vo->dheight, vo->monitor_par, src, dst, osd);
 }

@@ -125,8 +125,12 @@ enum mp_voctrl {
 
     // The Android embedding application changed the secondary OSD size.
     VOCTRL_UPDATE_OSD_SIZE,
+    // Replace or detach the independent Android OSD Surface.
+    VOCTRL_UPDATE_OSD_SURFACE,
 
-    VOCTRL_GET_ANDROID_SURFACE_FRAME, // struct vo_android_surface_frame*
+    // Whether the Android host owns video scale and pan on a separate Surface.
+    VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM, // bool*
+
     // Replace or detach the platform window without recreating the VO.
     VOCTRL_UPDATE_WINDOW,
 
@@ -550,6 +554,14 @@ int vo_reconfig2(struct vo *vo, struct mp_image *img);
 
 int vo_control(struct vo *vo, int request, void *data);
 void vo_control_async(struct vo *vo, int request, void *data);
+#if HAVE_ANDROID
+// VO-thread publication and core-thread queries of the last applied Surface state.
+void vo_android_publish_surface_frame(struct vo *vo,
+    const struct vo_android_surface_frame *frame);
+void vo_get_android_surface_frame(struct vo *vo, const struct mp_vo_opts *opts,
+    struct vo_android_surface_frame *frame);
+bool vo_get_android_video_surface_transform(struct vo *vo);
+#endif
 bool vo_is_ready_for_frame(struct vo *vo, int64_t next_pts);
 bool vo_is_visible(struct vo *vo);
 void vo_queue_frame(struct vo *vo, struct vo_frame *frame);

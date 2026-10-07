@@ -7246,7 +7246,8 @@ them.
 
 ``--android-osd-wid=<ID>``
     Android embedding option that supplies a retained Java ``Surface`` global
-    reference for the transparent OSD plane used by direct MediaCodec output.
+    reference for the transparent OSD plane used by direct MediaCodec output
+    and the ``gpu`` and ``gpu-next`` video outputs.
     It carries subtitles, mpv OSD, and script-provided overlays. The embedding
     application owns the reference and must keep it valid until the option is
     replaced or reset to ``0``.
@@ -7254,8 +7255,8 @@ them.
     Android only.
 
 ``--android-osd-surface-size=<WxH>``
-    Set the dimensions of the transparent OSD surface used by direct
-    MediaCodec output. The embedding application should update this option
+    Set the dimensions of the transparent OSD surface. The embedding
+    application should update this option
     from the OSD surfaceChanged callback so subtitle and OSD geometry follows
     runtime layout changes without waiting for a later buffer swap.
 
@@ -7272,6 +7273,25 @@ them.
     ends retention. This does not acknowledge compositor presentation.
 
     Android only.
+
+``--android-video-surface-transform=<yes|no>``
+    Allow the embedding application to own the complete video Surface layout
+    and transform (default: no). Publish ``android-video-geometry`` first.
+    ``gpu`` and ``gpu-next`` then fill the video Surface with the source image;
+    they do not apply aspect fitting, viewport clipping, scaling or panning again.
+    Logical video properties remain available to scripts. The embedding
+    application must reflect their changes in its View and geometry snapshot.
+    This delegation remains active while the independent OSD Surface is absent
+    or being recreated. Subtitle and OSD rendering pauses until the independent
+    OSD Surface is available.
+    The application must observe ``android-video-surface-transform-active``
+    before applying the corresponding Surface transform. Size the video Surface
+    for the base aspect ratio and resize mode first, so subsequent shrinking or
+    panning can reveal the full video image. The OSD Surface must
+    remain at the full player size and must not receive the video transform.
+
+    Android only.
+
 ``--d3d11-composition-size=<WxH>``
     Set size of the output for d3d11 composition mode.
     When use composition mode, there is no window, must set the output size by

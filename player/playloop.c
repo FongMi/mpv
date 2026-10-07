@@ -1073,6 +1073,11 @@ int handle_force_window(struct MPContext *mpctx, bool force)
             uninit_video_out(mpctx);
         return 0;
     }
+    // With no track, only an explicitly configured direct VO is selected.
+    // Its idle window needs the OSD Surface too; wait for its option callback.
+    if (!mpctx->video_out && wants_android_direct_output(mpctx, NULL) &&
+        !should_use_android_direct_output(mpctx, NULL))
+        return 0;
 #endif
 
     if (!mpctx->opts->force_vo) {
