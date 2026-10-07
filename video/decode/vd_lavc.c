@@ -611,6 +611,22 @@ static AVBufferRef *hwdec_create_dev(struct mp_filter *vd,
     return NULL;
 }
 
+// Return whether only the software fallback policy changed. Drain every change
+// so a coalesced hwdec selection update still takes the full reinit path.
+static bool update_hwdec_options(vd_ffmpeg_ctx *ctx)
+{
+    bool fallback_changed = false;
+    bool other_changed = false;
+    void *opt;
+    while (m_config_cache_get_next_changed(ctx->hwdec_opts_cache, &opt)) {
+        if (opt == &ctx->hwdec_opts->software_fallback)
+            fallback_changed = true;
+        else
+            other_changed = true;
+    }
+    return fallback_changed && !other_changed;
+}
+
 // Select if and which hwdec to use. Also makes sure to get the decode device.
 static void select_and_set_hwdec(struct mp_filter *vd)
 {
@@ -619,7 +635,7 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     bool native_dovi_sink =
         ctx->vo && (ctx->vo->driver->caps & VO_CAP_NATIVE_DOVI);
 
-    m_config_cache_update(ctx->hwdec_opts_cache);
+    update_hwdec_options(ctx);
 
     struct hwdec_info *hwdecs = NULL;
     int num_hwdecs = 0;
@@ -1583,6 +1599,10 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
             return ctx->avctx ? CONTROL_OK : CONTROL_ERROR;
         }
         return CONTROL_FALSE;
+    case VDCTRL_UPDATE_HWDEC_POLICY:
+        return update_hwdec_options(ctx) && ctx->avctx && ctx->use_hwdec &&
+               !ctx->hwdec_failed && !ctx->hwdec_request_reinit && !ctx->force_eof
+            ? CONTROL_OK : CONTROL_FALSE;
     case VDCTRL_REINIT:
         reinit(vd);
         return CONTROL_TRUE;

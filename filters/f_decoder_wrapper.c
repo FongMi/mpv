@@ -401,13 +401,17 @@ int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
     int res = CONTROL_UNKNOWN;
     if (p->is_group) {
         mp_assert(p->num_children);
+        bool policy_updated = true;
         for (int i = 0; i < p->num_children; i++) {
-            // Forward control to all children, but get the result from the last
-            // one. Currently it is used only for same decoders, so we care only
-            // about the control, and the result for GET can be whatever.
+            // A policy update is safe only if every child handles it in place.
+            // Other controls keep returning the last child's result.
             res = mp_decoder_wrapper_control(p->children[i], cmd, arg);
-            if (i == p->num_children - 1)
+            policy_updated &= res == CONTROL_OK;
+            if (i == p->num_children - 1) {
+                if (cmd == VDCTRL_UPDATE_HWDEC_POLICY)
+                    return policy_updated ? CONTROL_OK : CONTROL_FALSE;
                 return res;
+            }
         }
         return res;
     }

@@ -132,6 +132,10 @@ struct vo_internal {
     mp_mutex lock;
     mp_cond wakeup;
 
+#if HAVE_ANDROID
+    struct vo_android_surface_frame android_surface_frame;
+    bool android_video_surface_transform;
+#endif
     bool need_wakeup;
     bool terminate;
 
@@ -246,6 +250,63 @@ static void read_opts(struct vo *vo)
     mp_mutex_unlock(&in->lock);
 }
 
+#if HAVE_ANDROID
+static void set_android_video_surface_transform(struct vo *vo, bool active)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    bool changed = in->android_video_surface_transform != active;
+    in->android_video_surface_transform = active;
+    mp_mutex_unlock(&in->lock);
+    if (changed)
+        vo_event(vo, VO_EVENT_WIN_STATE);
+}
+
+static void update_android_video_surface_transform(struct vo *vo)
+{
+    bool active = false;
+    if (vo->driver->control &&
+        vo->driver->control(vo, VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM,
+                            &active) <= 0)
+        active = false;
+    set_android_video_surface_transform(vo, active);
+}
+
+bool vo_get_android_video_surface_transform(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    bool active = in->android_video_surface_transform;
+    mp_mutex_unlock(&in->lock);
+    return active;
+}
+
+void vo_android_publish_surface_frame(struct vo *vo,
+    const struct vo_android_surface_frame *frame)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    in->android_surface_frame = *frame;
+    mp_mutex_unlock(&in->lock);
+}
+
+void vo_get_android_surface_frame(struct vo *vo, const struct mp_vo_opts *opts,
+    struct vo_android_surface_frame *out)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    struct vo_android_surface_frame frame = in->android_surface_frame;
+    mp_mutex_unlock(&in->lock);
+    // The core may already have requested a replacement that the VO has not applied.
+    struct vo_android_surface_frame request;
+    *out = (struct vo_android_surface_frame){0};
+    if (vo_android_parse_surface_frame_request(opts, &request) &&
+        frame.token == request.token && frame.wid == request.wid &&
+        frame.width == request.width && frame.height == request.height)
+        *out = frame;
+}
+#endif
+
 static void update_opts(void *p)
 {
     struct vo *vo = p;
@@ -258,6 +319,9 @@ static void update_opts(void *p)
             // Unlike VOCTRL_VO_OPTS_CHANGED, often not propagated to backends.
             vo->driver->control(vo, VOCTRL_SET_PANSCAN, NULL);
         }
+#if HAVE_ANDROID
+        update_android_video_surface_transform(vo);
+#endif
     }
 }
 
@@ -675,16 +739,7 @@ static void run_control(void *p)
     int request = (intptr_t)pp[1];
     void *data = pp[2];
     update_opts(vo);
-    int ret;
-#if HAVE_ANDROID
-    if (request == VOCTRL_GET_ANDROID_SURFACE_FRAME) {
-        vo_android_get_surface_frame(vo, data);
-        ret = VO_TRUE;
-    } else
-#endif
-    {
-        ret = vo->driver->control(vo, request, data);
-    }
+    int ret = vo->driver->control(vo, request, data);
     if (pp[3])
         *(int *)pp[3] = ret;
 }
@@ -1193,6 +1248,10 @@ static MP_THREAD_VOID vo_thread(void *ptr)
     }
 
     int r = vo->driver->preinit(vo) ? -1 : 0;
+#if HAVE_ANDROID
+    if (r >= 0)
+        update_android_video_surface_transform(vo);
+#endif
     mp_rendezvous(vo, r); // init barrier
     if (r < 0)
         goto done;
@@ -1282,6 +1341,10 @@ static MP_THREAD_VOID vo_thread(void *ptr)
     talloc_free(in->current_frame);
     in->current_frame = NULL;
     vo->driver->uninit(vo);
+#if HAVE_ANDROID
+    set_android_video_surface_transform(vo, false);
+    vo_android_publish_surface_frame(vo, &(struct vo_android_surface_frame){0});
+#endif
 done:
     TA_FREEP(&in->dr_helper);
     MP_THREAD_RETURN();
