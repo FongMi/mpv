@@ -1513,8 +1513,10 @@ void mppl_video_skip_frame(struct mppl_video *p, struct vo_frame *frame)
 bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
                              const struct pl_swapchain_frame *swframe, int fb_depth,
                              const struct pl_color_space *hint,
-                             struct mp_image_params *target_params)
+                             struct mp_image_params *target_params,
+                             bool *rendered_video)
 {
+    *rendered_video = false;
     p->fb_depth = fb_depth;
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
@@ -1712,6 +1714,7 @@ bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
 
     p->is_interpolated = pts_offset != 0 && mix.num_frames > 1;
     valid = true;
+    *rendered_video = mix.num_frames > 0;
     // fall through
 
 done:

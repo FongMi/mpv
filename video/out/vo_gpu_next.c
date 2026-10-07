@@ -32,6 +32,10 @@
 #include "gpu_next/context.h"
 #include "gpu_next/video.h"
 
+#if HAVE_ANDROID
+#include "android_common.h"
+#endif
+
 struct priv {
     struct mp_log *log;
     struct ra_ctx *ra_ctx;
@@ -75,6 +79,9 @@ static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
 
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
+#if HAVE_ANDROID
+    vo_android_surface_frame_drawn(vo, 0, 0);
+#endif
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
 
@@ -107,10 +114,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     int fb_depth = sw->fns->color_depth ? sw->fns->color_depth(sw) : 0;
 
     struct mp_image_params target_params;
+    bool rendered_video;
     bool ok = mppl_video_render_frame(p->renderer, frame, &swframe, fb_depth,
                                       hint_mode == MPPL_VIDEO_HINT_NONE ? NULL : &hint,
-                                      &target_params);
+                                      &target_params, &rendered_video);
     p->frame_pending = true;
+#if HAVE_ANDROID
+    if (rendered_video)
+        vo_android_surface_frame_drawn(vo, swframe.fbo->params.w,
+                                       swframe.fbo->params.h);
+#endif
     if (!ok)
         return VO_TRUE;
 
@@ -132,15 +145,25 @@ static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    pl_swapchain pl_sw = get_active_swapchain(p);
 
+    bool submitted = false;
     if (p->frame_pending) {
-        pl_swapchain pl_sw = get_active_swapchain(p);
-        if (pl_sw && !pl_swapchain_submit_frame(pl_sw))
+        submitted = pl_sw && pl_swapchain_submit_frame(pl_sw);
+        if (pl_sw && !submitted)
             MP_ERR(vo, "Failed presenting frame!\n");
         p->frame_pending = false;
     }
 
+#if HAVE_ANDROID
+    if (!submitted)
+        vo_android_surface_frame_drawn(vo, 0, 0);
+#endif
     sw->fns->swap_buffers(sw);
+#if HAVE_ANDROID
+    if (submitted && strcmp(p->ra_ctx->fns->type, "vulkan") == 0)
+        vo_android_surface_frame_presented(vo, vo->dwidth, vo->dheight);
+#endif
 }
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
