@@ -142,6 +142,19 @@ static void mp_image_params_get_dsize(struct mp_image_params *params, int *w, in
     *h = params->h;
 }
 static void mp_wakeup_core_cb(void *ctx) { (void)ctx; }
+static bool direct_requested, direct_ready;
+static bool wants_android_direct_output(struct MPContext *ctx, struct track *track)
+{
+    (void)ctx;
+    assert(!track);
+    return direct_requested;
+}
+static bool should_use_android_direct_output(struct MPContext *ctx, struct track *track)
+{
+    (void)ctx;
+    assert(!track);
+    return direct_ready;
+}
 static struct vo *init_best_video_out(void *global, struct vo_extra *extra)
 {
     (void)global; (void)extra;
@@ -357,6 +370,13 @@ int main(void)
     opts.WinID = -1;
     assert(handle_force_window(&ctx, true) == 0 && !ctx.video_out);
     assert(destroys == 2);
+    // A forced direct idle window must wait without disabling force-window.
+    opts.WinID = 11;
+    direct_requested = true;
+    assert(handle_force_window(&ctx, true) == 0 && !ctx.video_out);
+    assert(player_opts.force_vo == 1);
+    direct_ready = true;
+    assert(handle_force_window(&ctx, true) == 0 && ctx.video_out == &vo);
     free(vo.params);
     puts("Android VO frame-retention contracts passed.");
     return 0;

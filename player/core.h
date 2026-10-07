@@ -703,6 +703,10 @@ void uninit_video_decoder(struct MPContext *mpctx);
 void reinit_video_decoder(struct MPContext *mpctx);
 bool wants_android_dolby_vision_direct_output(struct MPContext *mpctx,
                                               struct track *track);
+bool is_android_video_output_waiting_for_surface(struct MPContext *mpctx);
+bool wants_android_direct_output(struct MPContext *mpctx, struct track *track);
+bool should_use_android_direct_output(struct MPContext *mpctx,
+                                     struct track *track);
 bool should_use_android_dolby_vision_direct_output(struct MPContext *mpctx,
                                                    struct track *track);
 bool is_android_dolby_vision_direct_output_active(struct MPContext *mpctx);
