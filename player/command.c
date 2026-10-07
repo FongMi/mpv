@@ -3123,6 +3123,25 @@ static int mp_property_vo_configured(void *ctx, struct m_property *prop,
                         mpctx->video_out && mpctx->video_out->config_ok);
 }
 
+#if HAVE_ANDROID
+static int mp_property_android_surface_frame(void *ctx, struct m_property *prop,
+                                             int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_STRING};
+        return M_PROPERTY_OK;
+    }
+    if (action != M_PROPERTY_GET)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    struct vo_android_surface_frame frame = {0};
+    if (mpctx->video_out)
+        vo_control(mpctx->video_out, VOCTRL_GET_ANDROID_SURFACE_FRAME, &frame);
+    *(char **)arg = talloc_asprintf(NULL, "%"PRId64":%d:%d",
+                                   frame.token, frame.width, frame.height);
+    return M_PROPERTY_OK;
+}
+#endif
 static void get_frame_perf(struct mpv_node *node, struct mp_frame_perf *perf)
 {
     for (int i = 0; i < perf->count; i++) {
@@ -4863,7 +4882,9 @@ static const struct m_property mp_properties_base[] = {
     M_PROPERTY_ALIAS("height", "video-params/h"),
     {"current-window-scale", mp_property_current_window_scale},
     {"vo-configured", mp_property_vo_configured},
-    {"vo-passes", mp_property_vo_passes},
+#if HAVE_ANDROID
+    {"android-video-surface-frame", mp_property_android_surface_frame},
+#endif    {"vo-passes", mp_property_vo_passes},
     {"perf-info", mp_property_perf_info},
     {"current-vo", mp_property_vo},
     {"current-gpu-context", mp_property_gpu_context},
@@ -5012,8 +5033,8 @@ static const char *const *const mp_event_property_change[] = {
       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
       "video-dec-params", "osd-dimensions", "hwdec", "hwdec-current", "hwdec-interop",
-      "window-id", "track-list", "current-tracks"),
-    E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
+      "window-id", "track-list", "current-tracks",
+      "android-video-surface-frame"),    E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
       "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",
       "audio-out-params", "audio-passthrough-failed", "volume-max", "volume-gain-min",
@@ -5029,8 +5050,7 @@ static const char *const *const mp_event_property_change[] = {
     E(MP_EVENT_WIN_RESIZE, "current-window-scale", "osd-width", "osd-height",
       "osd-par", "osd-dimensions"),
     E(MP_EVENT_WIN_STATE, "display-names", "display-fps", "display-width",
-      "display-height"),
-    E(MP_EVENT_WIN_STATE2, "display-hidpi-scale"),
+      "display-height", "android-video-surface-frame"),    E(MP_EVENT_WIN_STATE2, "display-hidpi-scale"),
     E(MP_EVENT_FOCUS, "focused"),
     E(MP_EVENT_AMBIENT_LIGHTING_CHANGED, "ambient-light"),
     E(MP_EVENT_CHANGE_PLAYLIST, "playlist", "playlist-pos", "playlist-pos-1",
@@ -7546,6 +7566,34 @@ static void cmd_dump_cache_ab(void *p)
                  cmd->args[0].v.s);
 }
 
+#if HAVE_ANDROID
+static void cmd_android_surface_frame(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct MPContext *mpctx = cmd->mpctx;
+    int64_t token = cmd->args[0].v.i64;
+    int w = cmd->args[1].v.i;
+    int h = cmd->args[2].v.i;
+    int64_t wid = mpctx->opts->vo->WinID;
+    if (token <= 0 || w <= 0 || h <= 0 || wid == 0 || wid == -1) {
+        cmd->success = false;
+        return;
+    }
+    // One cache update binds the resize to its token and the current Surface.
+    // A VO created later inherits the same request.
+    struct mpv_node values[] = {
+        {.format = MPV_FORMAT_INT64, .u.int64 = token},
+        {.format = MPV_FORMAT_INT64, .u.int64 = wid},
+        {.format = MPV_FORMAT_INT64, .u.int64 = w},
+        {.format = MPV_FORMAT_INT64, .u.int64 = h},
+    };
+    struct mpv_node_list list = {.num = 4, .values = values};
+    struct mpv_node request = {.format = MPV_FORMAT_NODE_ARRAY, .u.list = &list};
+    cmd->success = m_config_set_option_node(mpctx->mconfig,
+        bstr0("android-surface-frame"), &request, 0) >= 0;
+}
+#endif
+
 static void cmd_begin_vo_dragging(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -8211,6 +8259,11 @@ const struct mp_cmd_def mp_cmds[] = {
     { "flush-status-line", cmd_flush_status_line, { {"clear", OPT_BOOL(v.b)} } },
 
     { "notify-property", cmd_notify_property, { {"property", OPT_STRING(v.s)} } },
+#if HAVE_ANDROID
+    { "android-surface-frame", cmd_android_surface_frame,
+        { {"token", OPT_INT64(v.i64)}, {"width", OPT_INT(v.i)},
+          {"height", OPT_INT(v.i)} } },
+#endif
 
     {0}
 };
@@ -8717,10 +8770,14 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
     }
 
     if (opt_ptr == &opts->vo->android_surface_size ||
+        opt_ptr == &opts->vo->android_surface_frame ||
         opt_ptr == &opts->vo->d3d11_composition_size)
     {
-        if (mpctx->video_out)
+        if (mpctx->video_out) {
             vo_control(mpctx->video_out, VOCTRL_EXTERNAL_RESIZE, NULL);
+            if (opt_ptr == &opts->vo->android_surface_frame)
+                vo_redraw(mpctx->video_out);
+        }
     }
 
     if (opt_ptr == &opts->vo->android_osd_surface_size && mpctx->video_out)
