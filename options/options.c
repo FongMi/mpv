@@ -253,6 +253,10 @@ static const m_option_t mp_vo_opt_list[] = {
     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
 #endif
 #if HAVE_ANDROID
+    // Runtime embedding state: token, window identity, width, height.
+    {"android-surface-frame", OPT_TYPED_FIELD(m_option_type_node,
+        struct mpv_node, android_surface_frame),
+        .flags = M_OPT_NOCFG | M_OPT_NOPROP},
     {"android-dolby-vision-output", OPT_CHOICE(android_dolby_vision_output,
         {"configured", ANDROID_DOLBY_VISION_OUTPUT_CONFIGURED},
         {"direct", ANDROID_DOLBY_VISION_OUTPUT_DIRECT}), .flags = UPDATE_VO},

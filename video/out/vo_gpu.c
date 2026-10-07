@@ -39,6 +39,9 @@
 #include "gpu/hwdec.h"
 #include "gpu/video.h"
 
+#if HAVE_ANDROID
+#include "android_common.h"
+#endif
 struct gpu_priv {
     struct mp_log *log;
     struct ra_ctx *ctx;
@@ -116,6 +119,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct gpu_priv *p = vo->priv;
     struct ra_swapchain *sw = p->ctx->swapchain;
+#if HAVE_ANDROID
+    vo_android_surface_frame_drawn(vo, 0, 0);
+#endif
 
     struct pl_color_space target = {0};
     bool strict = false;
@@ -135,6 +141,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         MP_ERR(vo, "Failed presenting frame!\n");
         return VO_FALSE;
     }
+#if HAVE_ANDROID
+    if (frame->current)
+        vo_android_surface_frame_drawn(vo, fbo.tex->params.w, fbo.tex->params.h);
+#endif
 
     struct mp_image_params *params = gl_video_get_target_params_ptr(p->renderer);
     mp_mutex_lock(&vo->params_mutex);
@@ -149,6 +159,10 @@ static void flip_page(struct vo *vo)
     struct gpu_priv *p = vo->priv;
     struct ra_swapchain *sw = p->ctx->swapchain;
     sw->fns->swap_buffers(sw);
+#if HAVE_ANDROID
+    if (strcmp(p->ctx->fns->type, "vulkan") == 0)
+        vo_android_surface_frame_presented(vo, vo->dwidth, vo->dheight);
+#endif
 }
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
