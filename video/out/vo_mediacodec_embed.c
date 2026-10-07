@@ -20,6 +20,7 @@
 #include <libavutil/hwcontext_mediacodec.h>
 
 #include "common/common.h"
+#include "android_common.h"
 #include "android_osd_overlay.h"
 #include "vo.h"
 #include "video/mp_image.h"
@@ -34,6 +35,7 @@ struct priv {
     int osd_failures;
     bool osd_render_ok;
     bool backend_failed;
+    bool submitted_video;
 };
 
 #define MAX_OSD_FAILURES 3
@@ -84,6 +86,8 @@ static int preinit(struct vo *vo)
     }
 
     p->video_wid = vo->opts->WinID;
+    if (!vo_android_init(vo))
+        return -1;
     p->last_pts = MP_NOPTS_VALUE;
     p->osd_overlay = android_osd_overlay_create(vo);
     if (!p->osd_overlay ||
@@ -110,6 +114,7 @@ static int preinit(struct vo *vo)
     return 0;
 
 fail:
+    vo_android_uninit(vo);
     av_buffer_unref(&p->hwctx.av_device_ref);
     if (vo->hwdec_devs) {
         hwdec_devices_destroy(vo->hwdec_devs);
@@ -126,8 +131,16 @@ static void flip_page(struct vo *vo)
     if (p->next_image) {
         AVMediaCodecBuffer *buffer =
             (AVMediaCodecBuffer *)p->next_image->planes[3];
-        if (av_mediacodec_release_buffer(buffer, 1) < 0)
+        int w = 0, h = 0;
+        if (vo_android_surface_size(vo, &w, &h))
+            vo_android_surface_frame_drawn(vo, w, h);
+        if (av_mediacodec_release_buffer(buffer, 1) < 0) {
             report_backend_error(vo, "video surface");
+        } else {
+            p->submitted_video = true;
+            // Codec source dimensions do not describe the output Surface.
+            vo_android_surface_frame_presented(vo, w, h);
+        }
         mp_image_unrefp(&p->next_image);
     }
 
@@ -144,6 +157,7 @@ static void flip_page(struct vo *vo)
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
+    vo_android_surface_frame_drawn(vo, 0, 0);
 
     mp_image_t *mpi = NULL;
     if (frame->current)
@@ -164,12 +178,31 @@ static int query_format(struct vo *vo, int format)
     return format == IMGFMT_MEDIACODEC;
 }
 
+static void update_surface_frame(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    // View size does not change codec buffer geometry. Reuse a successful
+    // submission only while the same Surface and video configuration survive.
+    int w, h;
+    if (p->submitted_video && p->video_wid == vo->opts->WinID &&
+        vo_has_rendered_frame(vo) && vo_android_surface_size(vo, &w, &h))
+    {
+        vo_android_surface_frame_drawn(vo, w, h);
+        vo_android_surface_frame_presented(vo, w, h);
+    }
+}
+
 static int control(struct vo *vo, uint32_t request, void *data)
 {
     struct priv *p = vo->priv;
     if (request == VOCTRL_RESET) {
+        p->submitted_video = false;
         mp_image_unrefp(&p->next_image);
         p->last_pts = MP_NOPTS_VALUE;
+        return VO_TRUE;
+    }
+    if (request == VOCTRL_EXTERNAL_RESIZE) {
+        update_surface_frame(vo);
         return VO_TRUE;
     }
     if (request == VOCTRL_UPDATE_RENDER_OPTS ||
@@ -198,6 +231,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
 static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     struct priv *p = vo->priv;
+    p->submitted_video = false;
     android_osd_overlay_invalidate_geometry(p->osd_overlay);
     int width = 0;
     int height = 0;
@@ -211,6 +245,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
 static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    vo_android_uninit(vo);
     mp_image_unrefp(&p->next_image);
     android_osd_overlay_destroy(p->osd_overlay);
 

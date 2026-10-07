@@ -77,6 +77,18 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+android_surface_frame_header = custom_target('android-surface-frame-functions',
+    input: files('../video/out/android_common.c', '../video/out/vo.h',
+                 '../player/command.c', '../video/out/vo.c',
+                 '../video/out/vo_gpu_next.c', '../video/out/vo_mediacodec_embed.c',
+                 '../video/out/opengl/context_android.c'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'android_surface_frame_functions.h',
+    command: [python, files('android_surface_frame.py'), '--generate', '@OUTPUT@'])
+android_surface_frame = executable('android-surface-frame',
+    ['android_surface_frame.c', android_surface_frame_header])
+test('android-surface-frame', android_surface_frame)
+
 drm_modeset_functions = custom_target('drm-modeset-functions',
     input: files('../video/out/opengl/context_drm_egl.c'),
     output: 'drm_modeset_functions.h',

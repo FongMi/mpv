@@ -318,6 +318,10 @@ static void android_swap_buffers(struct ra_ctx *ctx)
     int w, h;
     if (!vo_android_surface_size(ctx->vo, &w, &h))
         return;
+    EGLint drawn_w = 0, drawn_h = 0;
+    bool size_known =
+        eglQuerySurface(p->egl_display, p->egl_surface, EGL_WIDTH, &drawn_w) &&
+        eglQuerySurface(p->egl_display, p->egl_surface, EGL_HEIGHT, &drawn_h);
     if (p->buffer_width != w || p->buffer_height != h) {
         ANativeWindow *window = vo_android_native_window(ctx->vo);
         int32_t format = ANativeWindow_getFormat(window);
@@ -330,7 +334,8 @@ static void android_swap_buffers(struct ra_ctx *ctx)
         p->buffer_height = h;
     }
 
-    eglSwapBuffers(p->egl_display, p->egl_surface);
+    if (eglSwapBuffers(p->egl_display, p->egl_surface) && size_known)
+        vo_android_surface_frame_presented(ctx->vo, drawn_w, drawn_h);
 }
 
 static void android_destroy_egl_surface(struct ra_ctx *ctx, EGLSurface surface)
