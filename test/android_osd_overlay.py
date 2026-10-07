@@ -27,8 +27,8 @@ def main():
     state_end = source.index("};", state_start) + 2
     helpers = source[state_start:state_end] + "\n"
     for name in ("save_egl", "restore_egl", "android_osd_geometry_from_node",
-                 "android_osd_overlay_active",
                  "android_osd_overlay_transforms_video",
+                 "android_osd_overlay_active",
                  "android_osd_overlay_get_video_rects",
                  "update_geometry", "draw_part",
                  "android_osd_overlay_render"):
@@ -314,7 +314,8 @@ int main(void) {
         opts.android_video_surface_transform = enabled;
         for (unsigned i = 0; i < sizeof(windows) / sizeof(windows[0]); i++) {
             overlay.window = windows[i];
-            assert(android_osd_overlay_active(&overlay) == windows[i]);
+            assert(android_osd_overlay_active(&overlay) ==
+                   (enabled || windows[i]));
             assert(android_osd_overlay_transforms_video(&overlay) == enabled);
             int previous_fallback_calls = fallback_calls;
             android_osd_overlay_get_video_rects(&overlay, &src, &dst, &osd);
@@ -354,6 +355,8 @@ int main(void) {
     assert(cmd.success && commits == previous_commits + 1);
     opts.android_video_geometry = committed;
     assert(!android_osd_overlay_transforms_video(&overlay));
+    overlay.window = false;
+    assert(!android_osd_overlay_active(&overlay));
     previous_fallback_calls = fallback_calls;
     android_osd_overlay_get_video_rects(&overlay, &src, &dst, &osd);
     assert(fallback_calls == previous_fallback_calls + 1);
@@ -365,11 +368,15 @@ int main(void) {
     assert(cmd.success && commits == previous_commits + 2);
     opts.android_video_geometry = committed;
     assert(android_osd_overlay_transforms_video(&overlay));
+    assert(android_osd_overlay_active(&overlay));
     update_geometry(&overlay);
     assert(overlay.osd_res.w == 800 && overlay.osd_res.h == 600);
     assert(overlay.osd_res.ml == -133 && overlay.osd_res.mr == -133);
     opts.android_video_geometry = empty;
     assert(!android_osd_overlay_transforms_video(&overlay));
+    assert(!android_osd_overlay_active(&overlay));
+    overlay.window = true;
+    assert(android_osd_overlay_active(&overlay));
     opts.android_video_geometry = committed;
 
     // Subtitle baseline aspect is atomic, independent of gesture margins and OSD PAR.
@@ -453,6 +460,7 @@ int main(void) {
     assert(!android_osd_overlay_render(&overlay, 0));
     assert(!overlay.window);
     assert(android_osd_overlay_transforms_video(&overlay));
+    assert(android_osd_overlay_active(&overlay));
     assert(display == 10 && context == 20 && draw == 30);
     assert(read_surface == 40 && api == 7);
     render_ok = true;

@@ -7320,9 +7320,8 @@ them.
     Logical video properties remain available to scripts. The embedding
     application must reflect their changes in its View and geometry snapshot.
     This delegation remains active while the independent OSD Surface is absent
-    or being recreated. Without an
-    independent OSD Surface, subtitles and OSD are composited into the video
-    Surface and follow its transform.
+    or being recreated. Subtitle and OSD rendering pauses until the independent
+    OSD Surface is available.
     The application must observe ``android-video-surface-transform-active``
     before applying the corresponding Surface transform. Size the video Surface
     for the base aspect ratio and resize mode first, so subsequent shrinking or

@@ -723,7 +723,9 @@ bool android_osd_overlay_get_size(struct android_osd_overlay *ctx, int *w, int *
 
 bool android_osd_overlay_active(struct android_osd_overlay *ctx)
 {
-    return ctx && ctx->window;
+    // Keep subtitles off the host-transformed video Surface while its separate
+    // OSD window is detached or being recreated.
+    return ctx && (ctx->window || android_osd_overlay_transforms_video(ctx));
 }
 
 bool android_osd_overlay_transforms_video(struct android_osd_overlay *ctx)
