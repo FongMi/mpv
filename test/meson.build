@@ -103,6 +103,18 @@ if features['lua']
     endif
 endif
 
+android_surface_frame_header = custom_target('android-surface-frame-functions',
+    input: files('../video/out/android_common.c', '../video/out/vo.h',
+                 '../player/command.c', '../video/out/vo.c',
+                 '../video/out/vo_gpu_next.c', '../video/out/vo_mediacodec_embed.c',
+                 '../video/out/opengl/context_android.c'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'android_surface_frame_functions.h',
+    command: [python, files('android_surface_frame.py'), '--generate', '@OUTPUT@'])
+android_surface_frame = executable('android-surface-frame',
+    ['android_surface_frame.c', android_surface_frame_header])
+test('android-surface-frame', android_surface_frame)
+
 target_hint_functions = custom_target('target-hint-functions',
     input: files('../video/out/gpu/video.c', '../video/out/gpu/video.h',
                  '../video/out/vo_gpu_next.c'),
