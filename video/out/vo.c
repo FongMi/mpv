@@ -46,6 +46,10 @@
 #include "osdep/io.h"
 #include "osdep/threads.h"
 
+#if HAVE_ANDROID
+#include "android_common.h"
+#endif
+
 extern const struct vo_driver video_out_mediacodec_embed;
 extern const struct vo_driver video_out_x11;
 extern const struct vo_driver video_out_vdpau;
@@ -671,7 +675,16 @@ static void run_control(void *p)
     int request = (intptr_t)pp[1];
     void *data = pp[2];
     update_opts(vo);
-    int ret = vo->driver->control(vo, request, data);
+    int ret;
+#if HAVE_ANDROID
+    if (request == VOCTRL_GET_ANDROID_SURFACE_FRAME) {
+        vo_android_get_surface_frame(vo, data);
+        ret = VO_TRUE;
+    } else
+#endif
+    {
+        ret = vo->driver->control(vo, request, data);
+    }
     if (pp[3])
         *(int *)pp[3] = ret;
 }
@@ -1342,6 +1355,16 @@ void vo_seek_reset(struct vo *vo)
 bool vo_has_frame(struct vo *vo)
 {
     return vo->in->hasframe;
+}
+
+// Whether a frame reached draw_frame since the last seek or reconfiguration.
+bool vo_has_rendered_frame(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    bool rendered = in->hasframe_rendered;
+    mp_mutex_unlock(&in->lock);
+    return rendered;
 }
 
 // Unlike vo_has_frame(), this survives seek/reset/reconfig on the same Surface.
