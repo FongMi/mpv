@@ -129,6 +129,18 @@ gl_video = executable('gl-video', 'gl_video.c', objects: gl_video_objects,
                       dependencies: [libavutil, libplacebo], include_directories: incdir,
                       link_with: [img_utils, test_utils])
 test('gl-video', gl_video)
+
+android_osd_source = custom_target('android-osd-contracts-source',
+    input: files('../video/out/android_osd_overlay.c', '../video/out/aspect.c',
+                 '../player/command.c', '../sub/osd.c', '../sub/sd_ass.c',
+                 '../sub/sd_lavc.c'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'android_osd_contracts.c',
+    command: [python, files('android_osd_overlay.py'), '--generate', '@OUTPUT@'])
+android_osd = executable('android-osd-contracts', android_osd_source,
+                         dependencies: libm)
+test('android-osd-contracts', android_osd)
+
 android_frame_functions = custom_target('android-frame-contracts-functions',
     input: files('../video/out/vo.c', '../player/playloop.c'),
     output: 'vo_android_frame_functions.h',

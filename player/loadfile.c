@@ -901,6 +901,10 @@ select:
         reinit_sub(mpctx, track);
     }
 
+    if (order == 0 && (type == STREAM_VIDEO || type == STREAM_AUDIO) &&
+        !mpctx->vo_chain)
+        reset_video_state(mpctx);
+
     mp_notify(mpctx, MP_EVENT_TRACK_SWITCHED, NULL);
     mp_wakeup_core(mpctx);
 
@@ -2064,6 +2068,9 @@ static void play_current_file(struct MPContext *mpctx)
     reinit_video_chain(mpctx);
     reinit_audio_chain(mpctx);
     reinit_sub_all(mpctx);
+    // A cover-art output must not hold prepared audio for an absent Surface.
+    if (is_android_video_output_waiting_for_surface(mpctx))
+        reset_video_state(mpctx);
     // For lavfi-complex mode reinit_video_chain skips chain setup, so set up
     // the enhancement-layer pairing here. No-op in non-lavfi-complex mode.
     update_vo_chain_el_state(mpctx);
@@ -2077,7 +2084,9 @@ static void play_current_file(struct MPContext *mpctx)
                                  mpctx->demuxer->metadata);
     }
 
-    if (!mpctx->vo_chain && !mpctx->ao_chain && opts->stream_auto_sel) {
+    if (!mpctx->vo_chain && !mpctx->ao_chain && opts->stream_auto_sel &&
+        !is_android_video_output_waiting_for_surface(mpctx))
+    {
         MP_FATAL(mpctx, "No video or audio streams selected.\n");
         mpctx->error_playing = MPV_ERROR_NOTHING_TO_PLAY;
         goto terminate_playback;

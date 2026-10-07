@@ -53,7 +53,9 @@
 
 #if HAVE_ANDROID
 #include "android_common.h"
+#include "android_osd_overlay.h"
 #endif
+
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
 #include <libplacebo/opengl.h>
 #include "video/out/opengl/ra_gl.h"
@@ -147,6 +149,9 @@ struct priv {
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
     struct osd_state osd_state;
+#if HAVE_ANDROID
+    struct android_osd_overlay *osd_overlay;
+#endif
 
     uint64_t last_id;
     uint64_t osd_sync;
@@ -1352,6 +1357,19 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     pl_gpu gpu = p->gpu;
     update_options(vo);
 
+    bool external_osd = false;
+#if HAVE_ANDROID
+    external_osd = android_osd_overlay_active(p->osd_overlay);
+    if (external_osd) {
+        double pts = frame->current ? frame->current->pts : MP_NOPTS_VALUE;
+        if (!android_osd_overlay_render(p->osd_overlay, pts)) {
+            vo_event(vo, VO_EVENT_WIN_STATE);
+            vo_report_backend_error(vo);
+            return VO_FALSE;
+        }
+    }
+#endif
+
     struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;
     bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
@@ -1575,12 +1593,14 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             target.color.transfer = PL_COLOR_TRC_SRGB;
 #endif
     }
-    stats_time_start(p->stats, "osd-update");
-    update_overlays(vo, p->osd_res,
-                    (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
-                    PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
-                    frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
-    stats_time_end(p->stats, "osd-update");
+    if (!external_osd) {
+        stats_time_start(p->stats, "osd-update");
+        update_overlays(vo, p->osd_res,
+                        (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
+                        PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
+                        frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
+        stats_time_end(p->stats, "osd-update");
+    }
     apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
 
@@ -1633,7 +1653,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             struct mp_image *mpi = image->user_data;
             struct frame_priv *fp = mpi->priv;
             apply_crop(image, p->src, vo->params->w, vo->params->h);
-            if (opts->blend_subs) {
+            if (opts->blend_subs && !external_osd) {
                 if (frame->redraw)
                     p->osd_sync++;
                 if (fp->osd_sync < p->osd_sync) {
@@ -1660,7 +1680,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                     fp->osd_sync = p->osd_sync;
                 }
             } else {
-                // Disable overlays when blend_subs is disabled
+                // Clear cached subtitles when they are rendered separately.
                 image->num_overlays = 0;
                 fp->osd_sync = 0;
             }
@@ -1750,6 +1770,10 @@ static void flip_page(struct vo *vo)
 #if HAVE_ANDROID
     if (submitted && strcmp(p->ra_ctx->fns->type, "vulkan") == 0)
         vo_android_surface_frame_presented(vo, vo->dwidth, vo->dheight);
+    if (!android_osd_overlay_present(p->osd_overlay)) {
+        vo_event(vo, VO_EVENT_WIN_STATE);
+        vo_report_backend_error(vo);
+    }
 #endif
 }
 
@@ -1779,7 +1803,12 @@ static void resize(struct vo *vo)
     struct priv *p = vo->priv;
     struct mp_rect src, dst;
     struct mp_osd_res osd;
+#if HAVE_ANDROID
+    android_osd_overlay_invalidate_geometry(p->osd_overlay);
+    android_osd_overlay_get_video_rects(p->osd_overlay, &src, &dst, &osd);
+#else
     vo_get_src_dst_rects(vo, &src, &dst, &osd);
+#endif
     if (vo->dwidth && vo->dheight) {
         gpu_ctx_resize(p->context, vo->dwidth, vo->dheight);
         vo->want_redraw = true;
@@ -2122,6 +2151,24 @@ static int control(struct vo *vo, uint32_t request, void *data)
     struct priv *p = vo->priv;
 
     switch (request) {
+#if HAVE_ANDROID
+    case VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM:
+        *(bool *)data = android_osd_overlay_transforms_video(p->osd_overlay);
+        return VO_TRUE;
+    case VOCTRL_UPDATE_OSD_SIZE:
+        android_osd_overlay_invalidate_geometry(p->osd_overlay);
+        vo->want_redraw = true;
+        return VO_TRUE;
+    case VOCTRL_UPDATE_OSD_SURFACE:
+    case VOCTRL_UPDATE_WINDOW:
+        if (!android_osd_overlay_set_surface(p->osd_overlay,
+                                             vo->opts->android_osd_wid))
+            return VO_FALSE;
+        resize(vo);
+        if (request == VOCTRL_UPDATE_OSD_SURFACE)
+            return VO_TRUE;
+        break;
+#endif
     case VOCTRL_SET_PANSCAN:
         resize(vo);
         return VO_TRUE;
@@ -2408,6 +2455,10 @@ static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
 
+#if HAVE_ANDROID
+    android_osd_overlay_destroy(p->osd_overlay);
+#endif
+
     // Drain any in-flight uploads.
     if (p->gpu)
         pl_gpu_finish(p->gpu);
@@ -2495,6 +2546,14 @@ static int preinit(struct vo *vo)
     hwdec_devices_set_loader(vo->hwdec_devs, load_hwdec_api, vo);
     ra_hwdec_ctx_init(&p->hwdec_ctx, vo->hwdec_devs, gl_opts->hwdec_interop, false);
     mp_mutex_init(&p->dr_lock);
+
+#if HAVE_ANDROID
+    p->osd_overlay = android_osd_overlay_create(vo);
+    if (!p->osd_overlay ||
+        !android_osd_overlay_set_surface(p->osd_overlay,
+                                         vo->opts->android_osd_wid))
+        goto err_out;
+#endif
 
     if (gl_opts->shader_cache)
         cache_init(vo, &p->shader_cache, 10 << 20, gl_opts->shader_cache_dir);

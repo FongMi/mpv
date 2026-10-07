@@ -46,6 +46,7 @@
 #include "filters/f_decoder_wrapper.h"
 #include "filters/f_enhancement_pair.h"
 #include "video/out/gpu/video.h"
+#include "video/out/gpu/context.h"
 #include "video/out/vo.h"
 
 #include "core.h"
@@ -130,7 +131,10 @@ void reset_video_state(struct MPContext *mpctx)
     mpctx->display_sync_error = 0;
     mpctx->display_sync_active = 0;
 
-    mpctx->video_status = mpctx->vo_chain ? STATUS_SYNCING : STATUS_EOF;
+    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    bool pending = is_android_video_output_waiting_for_surface(mpctx) &&
+                   (!track->attached_picture || !mpctx->ao_chain);
+    mpctx->video_status = mpctx->vo_chain || pending ? STATUS_SYNCING : STATUS_EOF;
 }
 
 void uninit_video_out(struct MPContext *mpctx)
@@ -289,8 +293,7 @@ bool wants_android_dolby_vision_direct_output(struct MPContext *mpctx,
 #endif
 }
 
-bool should_use_android_dolby_vision_direct_output(struct MPContext *mpctx,
-                                                   struct track *track)
+static bool android_direct_output_surfaces_ready(struct MPContext *mpctx)
 {
 #if HAVE_ANDROID
     bool video_surface_ready =
@@ -301,11 +304,75 @@ bool should_use_android_dolby_vision_direct_output(struct MPContext *mpctx,
         (mpctx->opts->vo->android_osd_wid != 0 &&
          mpctx->opts->vo->android_osd_wid != -1) ||
         is_android_dolby_vision_direct_output_active(mpctx);
-    return wants_android_dolby_vision_direct_output(mpctx, track) &&
-           video_surface_ready && osd_surface_ready;
+    return video_surface_ready && osd_surface_ready;
 #else
     return false;
 #endif
+}
+
+static bool is_android_direct_output_forced(struct MPContext *mpctx)
+{
+#if HAVE_ANDROID
+    struct m_obj_settings *drivers = mpctx->opts->vo->video_driver_list;
+    return drivers && drivers[0].name && !drivers[1].name &&
+           strcmp(drivers[0].name, "mediacodec_embed") == 0;
+#else
+    return false;
+#endif
+}
+
+static bool android_video_output_needs_surface(struct MPContext *mpctx)
+{
+#if HAVE_ANDROID
+    if (is_android_direct_output_forced(mpctx))
+        return !android_direct_output_surfaces_ready(mpctx);
+
+    struct m_obj_settings *drivers = mpctx->opts->vo->video_driver_list;
+    for (int n = 0; drivers && drivers[n].name; n++) {
+        const char *name = drivers[n].name;
+        if (name[0] && strcmp(name, "gpu") != 0 && strcmp(name, "gpu-next") != 0 &&
+            strcmp(name, "mediacodec_embed") != 0)
+            return false;
+    }
+    struct ra_ctx_opts *ra_opts = mpctx->opts->ra_ctx_opts;
+    struct m_obj_settings *contexts = ra_opts ? ra_opts->context_list : NULL;
+    for (int n = 0; contexts && contexts[n].name; n++) {
+        const char *name = contexts[n].name;
+        if (strcmp(name, "auto") != 0 && strcmp(name, "android") != 0 &&
+            strcmp(name, "androidvk") != 0)
+            return false;
+    }
+    return mpctx->opts->vo->WinID == 0 || mpctx->opts->vo->WinID == -1;
+#else
+    return false;
+#endif
+}
+
+bool is_android_video_output_waiting_for_surface(struct MPContext *mpctx)
+{
+    return !mpctx->stop_play && !mpctx->vo_chain &&
+           mpctx->current_track[0][STREAM_VIDEO] &&
+           android_video_output_needs_surface(mpctx);
+}
+
+bool wants_android_direct_output(struct MPContext *mpctx, struct track *track)
+{
+    return is_android_direct_output_forced(mpctx) ||
+           wants_android_dolby_vision_direct_output(mpctx, track);
+}
+
+bool should_use_android_direct_output(struct MPContext *mpctx,
+                                     struct track *track)
+{
+    return wants_android_direct_output(mpctx, track) &&
+           android_direct_output_surfaces_ready(mpctx);
+}
+
+bool should_use_android_dolby_vision_direct_output(struct MPContext *mpctx,
+                                                   struct track *track)
+{
+    return wants_android_dolby_vision_direct_output(mpctx, track) &&
+           android_direct_output_surfaces_ready(mpctx);
 }
 
 bool is_android_dolby_vision_direct_output_active(struct MPContext *mpctx)
@@ -327,11 +394,21 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
 {
     mp_assert(!mpctx->vo_chain);
 
+    // Keep the selected track until the embedding Surface callback can create
+    // its output. Blocking VO init would also block that callback in the core.
+    if ((track || is_android_direct_output_forced(mpctx)) &&
+        android_video_output_needs_surface(mpctx))
+    {
+        reset_video_state(mpctx);
+        return;
+    }
+
     bool use_dovi_direct =
         should_use_android_dolby_vision_direct_output(mpctx, track);
     bool replace_video_out =
         mpctx->video_out &&
-        is_android_dolby_vision_direct_output_active(mpctx) != use_dovi_direct;
+        is_android_dolby_vision_direct_output_active(mpctx) !=
+            should_use_android_direct_output(mpctx, track);
     bool prefer_hdr_output = false;
 #if HAVE_ANDROID
     prefer_hdr_output = should_prefer_android_hdr_output(mpctx, track);

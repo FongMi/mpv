@@ -119,6 +119,7 @@ struct mp_osd_res {
     int w, h; // screen dimensions, including black borders
     int mt, mb, ml, mr; // borders (top, bottom, left, right)
     double display_par;
+    double video_aspect; // subtitle aspect before gestures; 0 uses source PAR
 };
 
 bool osd_res_equals(struct mp_osd_res a, struct mp_osd_res b);
@@ -248,6 +249,7 @@ void osd_draw_on_image_p(struct osd_state *osd, struct mp_osd_res res,
 void osd_resize(struct osd_state *osd, struct mp_osd_res res);
 
 struct mp_image_params;
+double osd_get_video_par(struct mp_osd_res res, const struct mp_image_params *params);
 struct mp_osd_res osd_res_from_image_params(const struct mp_image_params *p);
 
 struct mp_osd_res osd_get_vo_res(struct osd_state *osd);

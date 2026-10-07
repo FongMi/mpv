@@ -264,6 +264,11 @@ static const m_option_t mp_vo_opt_list[] = {
         .flags = UPDATE_VO},
     {"android-osd-surface-size", OPT_SIZE_BOX(android_osd_surface_size)},
     {"android-keep-video-frame", OPT_BOOL(android_keep_video_frame)},
+    {"android-video-surface-transform", OPT_BOOL(android_video_surface_transform)},
+    // One embedding snapshot: viewport width/height and unclipped video bounds.
+    {"android-video-geometry", OPT_TYPED_FIELD(m_option_type_node,
+        struct mpv_node, android_video_geometry),
+        .flags = M_OPT_NOCFG | M_OPT_NOPROP},
 #endif
 #if HAVE_D3D11
     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},

@@ -22,6 +22,12 @@
 
 struct android_osd_overlay;
 struct vo;
+struct mp_rect;
+struct mp_osd_res;
+struct mpv_node;
+
+bool android_osd_geometry_from_node(const struct mpv_node *node,
+                                    struct mp_osd_res *res);
 
 struct android_osd_overlay *android_osd_overlay_create(struct vo *vo);
 bool android_osd_overlay_set_surface(struct android_osd_overlay *ctx,
@@ -32,3 +38,8 @@ bool android_osd_overlay_present(struct android_osd_overlay *ctx);
 bool android_osd_overlay_get_size(struct android_osd_overlay *ctx,
                                   int *w, int *h);
 void android_osd_overlay_destroy(struct android_osd_overlay *ctx);
+bool android_osd_overlay_active(struct android_osd_overlay *ctx);
+bool android_osd_overlay_transforms_video(struct android_osd_overlay *ctx);
+void android_osd_overlay_get_video_rects(struct android_osd_overlay *ctx,
+                                        struct mp_rect *src, struct mp_rect *dst,
+                                        struct mp_osd_res *osd);

@@ -1760,6 +1760,41 @@ Miscellaneous Commands
     This command has an even more uncertain future than ``ab-loop-dump-cache``
     and might disappear without replacement if the author decides it's useless.
 
+``android-video-geometry <viewport-width> <viewport-height> <left> <top> <right> <bottom> [<subtitle-aspect>]``
+    Publish the embedding application's complete video geometry in one runtime
+    snapshot. The first six arguments are integer pixels. The positive viewport
+    size is the independent OSD area; the video rectangle includes the host's resize
+    mode, scaling and panning, before clipping to that viewport. Bounds may be
+    negative or extend beyond the viewport, but must describe a positive size.
+    Dimensions and margin arithmetic must fit signed 32-bit integers.
+
+    The optional ``subtitle-aspect`` is the finite, nonnegative baseline video
+    display aspect before gesture scaling and panning. Its default, 0, preserves
+    the source video pixel aspect ratio used by subtitles. A positive value
+    supplies the display aspect of host-owned stretching without changing source
+    video metadata. Video rotation is accounted for before deriving subtitle
+    pixel aspect. Existing subtitle options, including explicit ASS video aspect,
+    retain their priority; plain text subtitles and fixed OSD are unaffected.
+
+    Publish a valid snapshot before enabling ``android-video-surface-transform``.
+    The GPU video output then fills its video Surface without first cropping
+    away pixels. The independent OSD uses the supplied margins for subtitle
+    placement while OSD and statistics keep the full viewport. A differently
+    sized OSD buffer scales this logical viewport as a whole. Surface recreation
+    preserves the snapshot; disabling host transforms ignores it.
+
+    An invalid snapshot fails without changing the preceding geometry. Command
+    completion acknowledges publication, not rendering or presentation. Do not
+    use per-file options to publish geometry. Android only.
+
+``android-video-geometry-clear``
+    Release the embedding application's video geometry snapshot. This leaves
+    ``android-video-surface-transform`` unchanged, but native video geometry
+    applies until another valid snapshot is published. Clear the snapshot when
+    the application releases geometry ownership, not when its Surfaces are
+    temporarily recreated. Command completion acknowledges publication, not
+    rendering or presentation. Android only.
+
 ``android-surface-frame <token> <width> <height>``
     Request an Android video frame for the attached Surface and its new size.
     Use a positive, increasing token for each Surface attachment or size change.
@@ -3928,6 +3963,15 @@ Property list
     the video window is visible. If the ``--force-window`` option is used, this
     usually always returns ``yes``/true.
 
+``android-video-surface-transform-active``
+    Whether an Android ``gpu`` or ``gpu-next`` output currently delegates video
+    layout and transform to the embedding application's Surface. This requires
+    ``--android-video-surface-transform=yes``, a valid ``android-video-geometry``
+    snapshot and a supporting video output.
+    Independent OSD Surface attachment and recreation do not change delegation.
+    Returns ``no`` when the option is disabled or there is no supporting video
+    output. Observe this property to follow output and option changes.
+
 ``android-video-surface-frame``
     The completed Android video Surface request as ``token:width:height``, or
     ``0:0:0`` when no frame matches the current request and attached Surface.
@@ -3938,6 +3982,7 @@ Property list
     Direct MediaCodec output requires a successful codec buffer release to the
     same Surface. A layout resize can reuse that submission until video reset or
     reconfiguration; codec source dimensions are independent of View dimensions.
+
 ``vo-passes``
     Contains introspection about the VO's active render passes and their
     execution times. Not implemented by all VOs.
