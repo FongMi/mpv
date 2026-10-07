@@ -73,7 +73,8 @@ void mppl_video_skip_frame(struct mppl_video *p, struct vo_frame *frame);
 bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
                              const struct pl_swapchain_frame *swframe, int fb_depth,
                              const struct pl_color_space *hint,
-                             struct mp_image_params *target_params);
+                             struct mp_image_params *target_params,
+                             bool *rendered_video);
 bool mppl_video_get_hdr_metadata(struct mppl_video *p, struct pl_hdr_metadata *out);
 enum pl_color_levels mppl_video_get_output_levels(struct mppl_video *p);
 void mppl_video_set_paused(struct mppl_video *p, bool paused);

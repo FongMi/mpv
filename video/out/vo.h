@@ -127,6 +127,7 @@ enum mp_voctrl {
     // The Android embedding application changed the secondary OSD size.
     VOCTRL_UPDATE_OSD_SIZE,
 
+    VOCTRL_GET_ANDROID_SURFACE_FRAME, // struct vo_android_surface_frame*
     // Replace or detach the platform window without recreating the VO.
     VOCTRL_UPDATE_WINDOW,
 
@@ -154,6 +155,13 @@ enum mp_content_type {
 #define VO_ERROR        -1
 #define VO_NOTAVAIL     -2
 #define VO_NOTIMPL      -3
+
+struct vo_android_surface_frame {
+    int64_t token;
+    int64_t wid;
+    int width;
+    int height;
+};
 
 // VOCTRL_UPDATE_PLAYBACK_STATE
 struct voctrl_playback_state {
@@ -569,6 +577,7 @@ void vo_request_wakeup_on_done(struct vo *vo);
 void vo_report_backend_error(struct vo *vo);
 bool vo_query_backend_error(struct vo *vo);
 bool vo_has_frame(struct vo *vo);
+bool vo_has_rendered_frame(struct vo *vo);
 bool vo_has_video_frame(struct vo *vo);
 void vo_redraw(struct vo *vo);
 bool vo_want_redraw(struct vo *vo);
