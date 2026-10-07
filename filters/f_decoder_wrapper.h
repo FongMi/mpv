@@ -87,6 +87,8 @@ enum dec_ctrl {
     VDCTRL_GET_HWDEC,
     // Return the selected hwdec before the first decoded frame is reported.
     VDCTRL_GET_SELECTED_HWDEC,
+    // Apply fallback-only changes without recreating an active hardware decoder.
+    VDCTRL_UPDATE_HWDEC_POLICY,
     VDCTRL_REINIT,
     VDCTRL_GET_BFRAMES,
     // framedrop mode: 0=none, 1=standard, 2=hrseek
