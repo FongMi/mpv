@@ -1513,6 +1513,7 @@ void mppl_video_skip_frame(struct mppl_video *p, struct vo_frame *frame)
 bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
                              const struct pl_swapchain_frame *swframe, int fb_depth,
                              const struct pl_color_space *hint,
+                             bool external_osd,
                              struct mp_image_params *target_params,
                              bool *rendered_video)
 {
@@ -1585,12 +1586,14 @@ bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
             target.color.transfer = PL_COLOR_TRC_SRGB;
 #endif
     }
-    stats_time_start(p->stats, "osd-update");
-    update_overlays(p, p->osd_res,
-                    (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
-                    PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
-                    frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
-    stats_time_end(p->stats, "osd-update");
+    if (!external_osd) {
+        stats_time_start(p->stats, "osd-update");
+        update_overlays(p, p->osd_res,
+                        (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
+                        PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
+                        frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
+        stats_time_end(p->stats, "osd-update");
+    }
     apply_crop(&target, p->dst, swframe->fbo->params.w, swframe->fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
 
@@ -1643,7 +1646,7 @@ bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
             struct mp_image *mpi = image->user_data;
             struct frame_priv *fp = mpi->priv;
             apply_crop(image, p->src, p->image_params.w, p->image_params.h);
-            if (opts->blend_subs) {
+            if (opts->blend_subs && !external_osd) {
                 if (frame->redraw)
                     p->osd_sync++;
                 if (fp->osd_sync < p->osd_sync) {

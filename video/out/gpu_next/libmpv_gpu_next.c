@@ -182,7 +182,7 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     mppl_video_begin_frame(p->renderer, frame, (struct pl_color_space){0}, 0);
     struct mp_image_params target_params;
     bool rendered_video;
-    mppl_video_render_frame(p->renderer, frame, &target, depth, NULL,
+    mppl_video_render_frame(p->renderer, frame, &target, depth, NULL, false,
                             &target_params, &rendered_video);
 
     gpu_ctx_unwrap_ra_tex(gpu, ra, &fbo);

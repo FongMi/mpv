@@ -96,6 +96,8 @@ typedef struct mp_vo_opts {
     int android_dolby_vision_output;
     int64_t android_osd_wid;
     bool android_keep_video_frame;
+    bool android_video_surface_transform;
+    struct mpv_node android_video_geometry;
     struct m_geometry android_osd_surface_size;
 
     struct m_geometry d3d11_composition_size;

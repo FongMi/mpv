@@ -34,6 +34,7 @@
 
 #if HAVE_ANDROID
 #include "android_common.h"
+#include "android_osd_overlay.h"
 #endif
 
 struct priv {
@@ -43,6 +44,9 @@ struct priv {
     pl_swapchain sw;
     struct mppl_video *renderer;
     bool frame_pending;
+#if HAVE_ANDROID
+    struct android_osd_overlay *osd_overlay;
+#endif
     struct mp_image_params target_params;
 };
 
@@ -85,6 +89,19 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
 
+    bool external_osd = false;
+#if HAVE_ANDROID
+    external_osd = android_osd_overlay_active(p->osd_overlay);
+    if (external_osd) {
+        double pts = frame->current ? frame->current->pts : MP_NOPTS_VALUE;
+        if (!android_osd_overlay_render(p->osd_overlay, pts)) {
+            vo_event(vo, VO_EVENT_WIN_STATE);
+            vo_report_backend_error(vo);
+            return VO_FALSE;
+        }
+    }
+#endif
+
     struct pl_color_space display_csp = {0};
     // TODO: Implement this for all backends
     if (sw->fns->target_csp)
@@ -117,7 +134,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     bool rendered_video;
     bool ok = mppl_video_render_frame(p->renderer, frame, &swframe, fb_depth,
                                       hint_mode == MPPL_VIDEO_HINT_NONE ? NULL : &hint,
-                                      &target_params, &rendered_video);
+                                      external_osd, &target_params, &rendered_video);
     p->frame_pending = true;
 #if HAVE_ANDROID
     if (rendered_video)
@@ -163,6 +180,10 @@ static void flip_page(struct vo *vo)
 #if HAVE_ANDROID
     if (submitted && strcmp(p->ra_ctx->fns->type, "vulkan") == 0)
         vo_android_surface_frame_presented(vo, vo->dwidth, vo->dheight);
+    if (!android_osd_overlay_present(p->osd_overlay)) {
+        vo_event(vo, VO_EVENT_WIN_STATE);
+        vo_report_backend_error(vo);
+    }
 #endif
 }
 
@@ -201,7 +222,12 @@ static void resize(struct vo *vo)
     struct priv *p = vo->priv;
     struct mp_rect src, dst;
     struct mp_osd_res osd;
+#if HAVE_ANDROID
+    android_osd_overlay_invalidate_geometry(p->osd_overlay);
+    android_osd_overlay_get_video_rects(p->osd_overlay, &src, &dst, &osd);
+#else
     vo_get_src_dst_rects(vo, &src, &dst, &osd);
+#endif
     if (vo->dwidth && vo->dheight) {
         gpu_ctx_resize(p->context, vo->dwidth, vo->dheight);
         vo->want_redraw = true;
@@ -254,6 +280,24 @@ static int control(struct vo *vo, uint32_t request, void *data)
     struct priv *p = vo->priv;
 
     switch (request) {
+#if HAVE_ANDROID
+    case VOCTRL_GET_ANDROID_VIDEO_SURFACE_TRANSFORM:
+        *(bool *)data = android_osd_overlay_transforms_video(p->osd_overlay);
+        return VO_TRUE;
+    case VOCTRL_UPDATE_OSD_SIZE:
+        android_osd_overlay_invalidate_geometry(p->osd_overlay);
+        vo->want_redraw = true;
+        return VO_TRUE;
+    case VOCTRL_UPDATE_OSD_SURFACE:
+    case VOCTRL_UPDATE_WINDOW:
+        if (!android_osd_overlay_set_surface(p->osd_overlay,
+                                             vo->opts->android_osd_wid))
+            return VO_FALSE;
+        resize(vo);
+        if (request == VOCTRL_UPDATE_OSD_SURFACE)
+            return VO_TRUE;
+        break;
+#endif
     case VOCTRL_SET_PANSCAN:
         resize(vo);
         return VO_TRUE;
@@ -341,6 +385,10 @@ static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
 
+#if HAVE_ANDROID
+    android_osd_overlay_destroy(p->osd_overlay);
+#endif
+
     mppl_video_uninit(p->renderer);
     hwdec_devices_set_loader(vo->hwdec_devs, NULL, NULL);
     hwdec_devices_destroy(vo->hwdec_devs);
@@ -365,13 +413,17 @@ static int preinit(struct vo *vo)
     if (!p->ra_ctx)
         return -1;
     p->context = gpu_ctx_create(vo->log, p->ra_ctx, vo->probing);
-    if (!p->context || !gpu_ctx_create_swapchain(p->context, vo->opts->swapchain_depth)) {
-        gpu_ctx_destroy(&p->context);
-        ra_ctx_destroy(&p->ra_ctx);
-        return -1;
-    }
+    if (!p->context || !gpu_ctx_create_swapchain(p->context, vo->opts->swapchain_depth))
+        goto fail;
     p->log = vo->log;
     p->sw = p->context->swapchain;
+
+#if HAVE_ANDROID
+    p->osd_overlay = android_osd_overlay_create(vo);
+    if (!p->osd_overlay ||
+        !android_osd_overlay_set_surface(p->osd_overlay, vo->opts->android_osd_wid))
+        goto fail;
+#endif
 
     p->renderer = mppl_video_init(vo->log, vo->global, p->context);
     mppl_video_set_osd_source(p->renderer, vo->osd);
@@ -381,6 +433,16 @@ static int preinit(struct vo *vo)
     hwdec_devices_set_loader(vo->hwdec_devs, load_hwdec_api, vo);
     mppl_video_init_hwdecs(p->renderer, vo->hwdec_devs, false);
     return 0;
+
+fail:
+#if HAVE_ANDROID
+    android_osd_overlay_destroy(p->osd_overlay);
+    p->osd_overlay = NULL;
+#endif
+    p->sw = NULL;
+    gpu_ctx_destroy(&p->context);
+    ra_ctx_destroy(&p->ra_ctx);
+    return -1;
 }
 
 const struct vo_driver video_out_gpu_next = {

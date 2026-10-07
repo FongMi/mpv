@@ -56,10 +56,12 @@ fail:
 
 void vo_android_uninit(struct vo *vo)
 {
+    vo_android_publish_surface_frame(vo, &(struct vo_android_surface_frame){0});
     struct vo_android_state *ctx = vo->android;
     if (!ctx)
         return;
 
+    vo_event(vo, VO_EVENT_WIN_STATE);
     if (ctx->native_window)
         ANativeWindow_release(ctx->native_window);
 
@@ -105,6 +107,7 @@ void vo_android_set_native_window(struct vo *vo, ANativeWindow *native_window)
     ctx->native_window = native_window;
     ctx->wid = native_window ? vo->opts->WinID : 0;
     ctx->drawn = ctx->presented = (struct vo_android_surface_frame){0};
+    vo_android_publish_surface_frame(vo, &ctx->presented);
     vo_event(vo, VO_EVENT_WIN_STATE);
 }
 
@@ -119,12 +122,11 @@ bool vo_android_has_native_window(struct vo *vo)
     return vo_android_native_window(vo) != NULL;
 }
 
-static bool get_surface_frame_request(struct vo *vo,
-                                     struct vo_android_surface_frame *out)
+bool vo_android_parse_surface_frame_request(const struct mp_vo_opts *opts,
+    struct vo_android_surface_frame *out)
 {
-    struct vo_android_state *ctx = vo->android;
-    struct mpv_node *node = &vo->opts->android_surface_frame;
-    if (!ctx || !ctx->native_window || ctx->wid != vo->opts->WinID ||
+    const struct mpv_node *node = &opts->android_surface_frame;
+    if (!opts->WinID || opts->WinID == -1 ||
         node->format != MPV_FORMAT_NODE_ARRAY || !node->u.list ||
         node->u.list->num != 4 || !node->u.list->values)
         return false;
@@ -138,11 +140,19 @@ static bool get_surface_frame_request(struct vo *vo,
     int64_t wid = values[1].u.int64;
     int64_t w = values[2].u.int64;
     int64_t h = values[3].u.int64;
-    if (token <= 0 || wid != ctx->wid ||
+    if (token <= 0 || wid != opts->WinID ||
         w <= 0 || w > INT_MAX || h <= 0 || h > INT_MAX)
         return false;
     *out = (struct vo_android_surface_frame){token, wid, (int)w, (int)h};
     return true;
+}
+
+static bool get_surface_frame_request(struct vo *vo,
+                                     struct vo_android_surface_frame *out)
+{
+    struct vo_android_state *ctx = vo->android;
+    return ctx && ctx->native_window && ctx->wid == vo->opts->WinID &&
+           vo_android_parse_surface_frame_request(vo->opts, out);
 }
 
 bool vo_android_surface_size(struct vo *vo, int *out_w, int *out_h)
@@ -203,18 +213,8 @@ void vo_android_surface_frame_presented(struct vo *vo, int w, int h)
         request.width == w && request.height == h)
     {
         ctx->presented = request;
+        vo_android_publish_surface_frame(vo, &ctx->presented);
         vo_event(vo, VO_EVENT_WIN_STATE);
     }
     ctx->drawn = (struct vo_android_surface_frame){0};
-}
-
-void vo_android_get_surface_frame(struct vo *vo,
-                                 struct vo_android_surface_frame *out)
-{
-    struct vo_android_state *ctx = vo->android;
-    struct vo_android_surface_frame request;
-    *out = (struct vo_android_surface_frame){0};
-    if (get_surface_frame_request(vo, &request) &&
-        surface_frames_equal(&request, &ctx->presented))
-        *out = ctx->presented;
 }

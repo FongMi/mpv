@@ -22,6 +22,7 @@
 #include "common/common.h"
 
 struct vo;
+struct mp_vo_opts;
 struct vo_android_surface_frame;
 
 bool vo_android_init(struct vo *vo);
@@ -31,7 +32,7 @@ void vo_android_set_native_window(struct vo *vo, ANativeWindow *native_window);
 ANativeWindow *vo_android_native_window(struct vo *vo);
 bool vo_android_has_native_window(struct vo *vo);
 bool vo_android_surface_size(struct vo *vo, int *w, int *h);
+bool vo_android_parse_surface_frame_request(const struct mp_vo_opts *opts,
+    struct vo_android_surface_frame *frame);
 void vo_android_surface_frame_drawn(struct vo *vo, int w, int h);
 void vo_android_surface_frame_presented(struct vo *vo, int w, int h);
-void vo_android_get_surface_frame(struct vo *vo,
-                                 struct vo_android_surface_frame *frame);
