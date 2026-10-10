@@ -268,10 +268,13 @@ static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
 // a single image, and make *out point to it. *out is completely overwritten.
 // If libass reported any change, image_lists_changed must be set (it then
 // repacks all images). preferred_osd_format can be set to a desired
-// sub_bitmap_format. Currently, only SUBBITMAP_LIBASS is supported.
+// sub_bitmap_format. process_colors runs before packing either format; callers
+// must also set image_lists_changed when its result changes.
 void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
-                        int num_image_lists, bool image_lists_changed, bool video_color_space,
-                        int preferred_osd_format, struct sub_bitmaps *out)
+                        int num_image_lists, bool image_lists_changed,
+                        bool video_color_space, int preferred_osd_format,
+                        void (*process_colors)(void *, struct sub_bitmaps *),
+                        void *process_ctx, struct sub_bitmaps *out)
 {
     int format = preferred_osd_format == SUBBITMAP_BGRA ? SUBBITMAP_BGRA
                                                         : SUBBITMAP_LIBASS;
@@ -310,6 +313,9 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
             res.num_parts++;
         }
     }
+
+    if (process_colors)
+        process_colors(process_ctx, &res);
 
     bool r = false;
     if (format == SUBBITMAP_BGRA) {
