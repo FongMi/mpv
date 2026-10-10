@@ -3035,6 +3035,31 @@ Subtitles
 
         Never applied to text subtitles.
 
+``--image-subs-brightness=<0.5-2.0>``
+    Multiply the RGB values of decoded image subtitles (default: 1.0). Values
+    above 1.0 brighten the subtitle; values below 1.0 darken it. Black remains
+    black, and transparency is preserved. Values are clipped to the 8-bit
+    subtitle palette range, so increasing this cannot brighten an already
+    white pixel beyond white. This is separate from HDR white-level mapping
+    controlled by ``--image-subs-hdr-peak``.
+
+``--image-subs-override=<yes|no>``
+    Recolor decoded image subtitles using ``--image-subs-color`` (default: no).
+    The original palette luminance is mapped to the selected color before
+    applying ``--image-subs-brightness``. Black outlines remain black, but any
+    colored artwork in the subtitle is recolored too. Image subtitles have no
+    separate text, outline, or background style information.
+
+``--image-subs-color=<color>``
+    Color used when ``--image-subs-override=yes`` (default: opaque white). See
+    ``--sub-color`` for color syntax. Its alpha multiplies the original palette
+    alpha, preserving transparent pixels and antialiased edges.
+
+    These image subtitle options apply to decoded PGS, DVD/VobSub, DVB, and
+    other image subtitle tracks, including secondary subtitles. They do not
+    affect text subtitles, OSD, DVD menus, or authored Blu-ray PG/IG overlays
+    supplied through the disc navigation path.
+
 ``--sub-file-paths=<path-list>``
     Specify extra directories to search for subtitles matching the video.
     Multiple directories can be separated by ":" (";" on Windows).
