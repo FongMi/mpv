@@ -247,6 +247,15 @@ android_osd = executable('android-osd-contracts', android_osd_source,
                          dependencies: libm)
 test('android-osd-contracts', android_osd)
 
+image_subs_functions = custom_target('image-subs-functions',
+    input: files('../sub/sd_lavc.c'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'image_subs_functions.h',
+    command: [python, files('image_subs.py'), '--generate', '@OUTPUT@'])
+image_subs = executable('image-subs', ['image_subs.c', image_subs_functions],
+                        dependencies: libm)
+test('image-subs', image_subs)
+
 subtitle_offset_functions = custom_target('subtitle-offset-functions',
     input: files('../sub/img_convert.c'),
     depend_files: files('vo_android_frame.py'),

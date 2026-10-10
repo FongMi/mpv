@@ -134,6 +134,9 @@ struct mp_subtitle_opts {
     bool sub_scale_signs;
     float sub_gauss;
     bool sub_gray;
+    double image_subs_brightness;
+    bool image_subs_override;
+    struct m_color image_subs_color;
     bool ass_enabled;
     float sub_line_spacing;
     bool ass_use_margins;
