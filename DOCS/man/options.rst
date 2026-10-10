@@ -2634,6 +2634,20 @@ Subtitles
     Specify the position of secondary subtitles on the screen. This is similar
     to ``--sub-pos`` but for secondary subtitles.
 
+``--sub-offset-y=<-100-100>``
+    Move the complete rendered subtitle track vertically by this percentage of
+    the output frame height. Positive values move up and negative values move
+    down. The default is 0, which preserves the original rendered position.
+
+    Unlike ``--sub-pos``, this moves the rendered bitmaps, including positioned
+    ASS events and image subtitles, without changing their styling or scale.
+    A track that fits within the output frame is kept within its vertical bounds.
+    Moving into black borders requires an output frame that includes those borders.
+    Disc menus are unaffected.
+
+``--secondary-sub-offset-y=<-100-100>``
+    Like ``--sub-offset-y``, but for the secondary subtitle track.
+
 ``--sub-speed=<0.1-10.0>``
     Multiply the subtitle event timestamps with the given value. Can be used
     to fix the playback speed for frame-based subtitle formats. Affects text
@@ -3006,6 +3020,31 @@ Subtitles
     .. note::
 
         Never applied to text subtitles.
+
+``--image-subs-brightness=<0.5-2.0>``
+    Multiply the RGB values of decoded image subtitles (default: 1.0). Values
+    above 1.0 brighten the subtitle; values below 1.0 darken it. Black remains
+    black, and transparency is preserved. Values are clipped to the 8-bit
+    subtitle palette range, so increasing this cannot brighten an already
+    white pixel beyond white. This is separate from HDR white-level mapping
+    controlled by ``--image-subs-hdr-peak``.
+
+``--image-subs-override=<yes|no>``
+    Recolor decoded image subtitles using ``--image-subs-color`` (default: no).
+    The original palette luminance is mapped to the selected color before
+    applying ``--image-subs-brightness``. Black outlines remain black, but any
+    colored artwork in the subtitle is recolored too. Image subtitles have no
+    separate text, outline, or background style information.
+
+``--image-subs-color=<color>``
+    Color used when ``--image-subs-override=yes`` (default: opaque white). See
+    ``--sub-color`` for color syntax. Its alpha multiplies the original palette
+    alpha, preserving transparent pixels and antialiased edges.
+
+    These image subtitle options apply to decoded PGS, DVD/VobSub, DVB, and
+    other image subtitle tracks, including secondary subtitles. They do not
+    affect text subtitles, OSD, DVD menus, or authored Blu-ray PG/IG overlays
+    supplied through the disc navigation path.
 
 ``--sub-file-paths=<path-list>``
     Specify extra directories to search for subtitles matching the video.

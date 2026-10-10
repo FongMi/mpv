@@ -179,16 +179,32 @@ static void alloc_sub(struct sd_lavc_priv *priv)
     priv->subs[0].id = priv->new_id++;
 }
 
-static void convert_pal(uint32_t *colors, size_t count, bool gray)
+static void convert_pal(uint32_t *colors, size_t count,
+                        const struct mp_subtitle_opts *opts, bool menu)
 {
-    for (int n = 0; n < count; n++) {
+    for (size_t n = 0; n < count; n++) {
         uint32_t c = colors[n];
         uint32_t b = c & 0xFF;
         uint32_t g = (c >> 8) & 0xFF;
         uint32_t r = (c >> 16) & 0xFF;
         uint32_t a = (c >> 24) & 0xFF;
-        if (gray)
+        if (opts->sub_gray)
             r = g = b = (r + g + b) / 3;
+        if (!menu && (opts->image_subs_override ||
+                      opts->image_subs_brightness != 1.0))
+        {
+            double red = r, green = g, blue = b;
+            if (opts->image_subs_override) {
+                double luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                red = luma * opts->image_subs_color.r / 255;
+                green = luma * opts->image_subs_color.g / 255;
+                blue = luma * opts->image_subs_color.b / 255;
+                a = a * opts->image_subs_color.a / 255;
+            }
+            r = MPMIN(255, lrint(red * opts->image_subs_brightness));
+            g = MPMIN(255, lrint(green * opts->image_subs_brightness));
+            b = MPMIN(255, lrint(blue * opts->image_subs_brightness));
+        }
         // from straight to pre-multiplied alpha
         b = b * a / 255;
         g = g * a / 255;
@@ -298,7 +314,7 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
         mp_assert(r->nb_colors <= 256);
         uint32_t pal[256] = {0};
         memcpy(pal, data[1], r->nb_colors * 4);
-        convert_pal(pal, 256, opts->sub_gray);
+        convert_pal(pal, 256, opts, priv->menu_active);
 
         // DVD navigation highlight
         struct mp_rect hlr = priv->hl.rect;
@@ -309,7 +325,7 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
         uint32_t hli_pal[4] = {0};
         if (hli_active) {
             memcpy(hli_pal, priv->hl.palette, sizeof(hli_pal));
-            convert_pal(hli_pal, 4, opts->sub_gray);
+            convert_pal(hli_pal, 4, opts, true);
         }
         int hli_x0 = hlr.x0 - r->x;
         int hli_y0 = hlr.y0 - r->y;
@@ -585,6 +601,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
         }
     }
 
+    if (!priv->menu_active)
+        mp_sub_bitmaps_shift_y(res, d.h, shared_opts->sub_offset_y[sd->order]);
+
     if (priv->prevret_num != res->num_parts)
         res->change_id++;
 
@@ -759,10 +778,19 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
     case SD_CTRL_SET_VIDEO_PARAMS:
         priv->video_params = *(struct mp_image_params *)arg;
         return CONTROL_OK;
+    case SD_CTRL_UPDATE_OPTS: {
+        uint64_t flags = *(uint64_t *)arg;
+        rerender_queued_subs(sd);
+        // This decoder does not reinitialize filters or hard options.
+        if (flags & (UPDATE_SUB_FILT | UPDATE_SUB_HARD))
+            return CONTROL_UNKNOWN;
+        return CONTROL_OK;
+    }
     case SD_CTRL_APPLY_DVDNAV: {
         const struct stream_nav_state *nav = arg;
         bool menu_closed = priv->menu_active && !nav->menu_active;
-        bool changed = priv->hli_change_id != nav->change_id;
+        bool changed = priv->hli_change_id != nav->change_id ||
+                       priv->menu_active != nav->menu_active;
         priv->menu_active = nav->menu_active;
         priv->hl = nav->hl;
         priv->hli_change_id = nav->change_id;

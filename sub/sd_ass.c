@@ -877,10 +877,12 @@ done:
         transform_subtitle_layout(res, dim,
                                   shared_opts->sub_pos[sd->order],
                                   layout_scale);
-        if (ctx->layout_change_pending) {
-            res->change_id++;
-            ctx->layout_change_pending = false;
-        }
+    }
+
+    mp_sub_bitmaps_shift_y(res, dim.h, shared_opts->sub_offset_y[sd->order]);
+    if (res && ctx->layout_change_pending) {
+        res->change_id++;
+        ctx->layout_change_pending = false;
     }
 
     return res;
