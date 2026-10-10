@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 
 static void test_failure(const char *condition, int line)
 {
@@ -19,6 +20,7 @@ static void test_failure(const char *condition, int line)
 #define MP_ARRAY_SIZE(a) ((int)(sizeof(a) / sizeof((a)[0])))
 #define MPMIN(a, b) ((a) < (b) ? (a) : (b))
 #define MPMAX(a, b) ((a) > (b) ? (a) : (b))
+#define MPCLAMP(v, lo, hi) MPMIN(MPMAX(v, lo), hi)
 #define mp_assert assert
 #define MP_ASSERT_UNREACHABLE() abort()
 #define MP_MSG(sd, level, ...) ((void)(sd), (void)(level))
@@ -119,7 +121,9 @@ struct mp_subtitle_opts {
     int ass_vsfilter_color_compat;
     bool sub_scale_signs;
 };
-struct mp_subtitle_shared_opts { float sub_scale[2], sub_pos[2]; };
+struct mp_subtitle_shared_opts {
+    float sub_scale[2], sub_pos[2], sub_offset_y[2];
+};
 struct sd_ass_priv {
     struct mp_sub_packer *packer;
     ASS_Track *ass_track;
@@ -550,12 +554,36 @@ static void test_color_updates_without_output(void)
     }
 }
 
+static void test_rendered_offset_preserves_cached_positions(void)
+{
+    struct fixture f;
+    fixture_init(&f);
+    f.images[0].dst_y = f.images[1].dst_y = 800;
+    struct sub_bitmaps *res = render_subtitles(&f.sd, SUBBITMAP_LIBASS, false);
+    assert(res->parts[0].y == 800);
+    f.renderer.changed = 0;
+    f.shared_opts.sub_offset_y[0] = -10;
+    f.ctx.layout_change_pending = true;
+    res = render_subtitles(&f.sd, SUBBITMAP_LIBASS, false);
+    assert(res->parts[0].y == 900 && res->change_id != 0);
+    assert(f.packer.cached_parts[0].y == 800);
+    res = render_subtitles(&f.sd, SUBBITMAP_LIBASS, false);
+    assert(res->parts[0].y == 900 && res->change_id == 0);
+
+    f.shared_opts.sub_offset_y[0] = 0;
+    f.ctx.layout_change_pending = true;
+    res = render_subtitles(&f.sd, SUBBITMAP_LIBASS, false);
+    assert(res->parts[0].y == 800 && res->change_id != 0);
+    fixture_destroy(&f);
+}
+
 int main(void)
 {
     test_format_parity();
     test_conversion_bypass();
     test_static_color_updates();
     test_color_updates_without_output();
+    test_rendered_offset_preserves_cached_positions();
     puts("ASS color packing contracts passed");
     return 0;
 }
