@@ -31,8 +31,10 @@ struct sub_bitmaps;
 struct mp_sub_packer;
 struct mp_sub_packer *mp_sub_packer_alloc(void *ta_parent);
 void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
-                            int num_image_lists, bool changed, bool video_color_space,
-                            int preferred_osd_format, struct sub_bitmaps *out);
+                            int num_image_lists, bool changed,
+                            bool video_color_space, int preferred_osd_format,
+                            void (*process_colors)(void *, struct sub_bitmaps *),
+                            void *process_ctx, struct sub_bitmaps *out);
 
 #if HAVE_SUBRANDR
 struct sbr_instanced_raster_pass;
