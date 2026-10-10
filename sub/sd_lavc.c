@@ -585,6 +585,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
         }
     }
 
+    if (!priv->menu_active)
+        mp_sub_bitmaps_shift_y(res, d.h, shared_opts->sub_offset_y[sd->order]);
+
     if (priv->prevret_num != res->num_parts)
         res->change_id++;
 

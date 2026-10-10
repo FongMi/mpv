@@ -12,6 +12,10 @@ void mp_blur_rgba_sub_bitmap(struct sub_bitmap *d, double gblur);
 
 bool mp_sub_bitmaps_bb(struct sub_bitmaps *imgs, struct mp_rect *out_bb);
 
+// Move the rendered track vertically by a percentage of the output frame height.
+// Positive offsets move up; keep tracks which fit within the frame visible.
+void mp_sub_bitmaps_shift_y(struct sub_bitmaps *imgs, int frame_h, float offset);
+
 // Intentionally limit the maximum number of bounding rects to something low.
 // This prevents the algorithm from degrading to O(N^2).
 // Most subtitles yield a very low number of bounding rects (<5).

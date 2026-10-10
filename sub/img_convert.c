@@ -18,6 +18,7 @@
 #include <string.h>
 #include <assert.h>
 #include <limits.h>
+#include <math.h>
 
 #include "mpv_talloc.h"
 
@@ -64,6 +65,20 @@ bool mp_sub_bitmaps_bb(struct sub_bitmaps *imgs, struct mp_rect *out_bb)
     *out_bb = bb;
 
     return bb.x0 < bb.x1 && bb.y0 < bb.y1;
+}
+
+void mp_sub_bitmaps_shift_y(struct sub_bitmaps *imgs, int frame_h, float offset)
+{
+    struct mp_rect bb;
+    if (!imgs || offset == 0 || frame_h <= 0 || !mp_sub_bitmaps_bb(imgs, &bb))
+        return;
+
+    double shift = -offset / 100.0 * frame_h;
+    if ((double)bb.y1 - bb.y0 <= frame_h)
+        shift = MPCLAMP(shift, -(double)bb.y0, (double)frame_h - bb.y1);
+    int dy = lrint(shift);
+    for (int n = 0; n < imgs->num_parts; n++)
+        imgs->parts[n].y += dy;
 }
 
 // Merge bounding rectangles if they're closer than the given amount of pixels.

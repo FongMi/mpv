@@ -161,6 +161,7 @@ struct mp_subtitle_opts {
 struct mp_subtitle_shared_opts {
     double sub_delay[2];
     float sub_pos[2];
+    float sub_offset_y[2];
     float sub_scale[2];
     bool sub_visibility[2];
     int ass_style_override[2];
