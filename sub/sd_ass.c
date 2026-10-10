@@ -48,6 +48,7 @@ struct sd_ass_priv {
     struct ass_track *ass_track;
     struct ass_track *shadow_track; // for --sub-ass=no rendering
     bool ass_configured;
+    bool color_mangle_changed;
     bool transform_layout;
     bool layout_change_pending;
     bool active_event_cache_valid;
@@ -104,7 +105,7 @@ const struct m_sub_options mp_sub_filter_opts = {
     .change_flags = UPDATE_SUB_FILT,
 };
 
-static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts);
+static void mangle_colors(void *arg, struct sub_bitmaps *parts);
 static void fill_plaintext(struct sd *sd, double pts);
 
 static const struct sd_filter_functions *const filters[] = {
@@ -861,10 +862,13 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
 
     int changed;
     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
-    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
+    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1,
+                          changed || ctx->color_mangle_changed, !converted,
+                          format, converted ? NULL : mangle_colors, sd, res);
+    ctx->color_mangle_changed = false;
 
 done:
-    // mangle_colors() modifies the color field, so copy the thing _before_.
+    // Layout overrides must not modify the packer's cached positions.
     res = sub_bitmaps_copy(&ctx->copy_cache, res);
 
     if (transform_layout && res) {
@@ -878,9 +882,6 @@ done:
             ctx->layout_change_pending = false;
         }
     }
-
-    if (!converted && res)
-        mangle_colors(sd, res);
 
     return res;
 }
@@ -1170,9 +1171,14 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
         ctx->clear_once = true;
         reset(sd);
         return CONTROL_OK;
-    case SD_CTRL_SET_VIDEO_PARAMS:
-        ctx->video_params = *(struct mp_image_params *)arg;
+    case SD_CTRL_SET_VIDEO_PARAMS: {
+        const struct mp_image_params *params = arg;
+        ctx->color_mangle_changed |=
+            ctx->video_params.repr.sys != params->repr.sys ||
+            ctx->video_params.repr.levels != params->repr.levels;
+        ctx->video_params = *params;
         return CONTROL_OK;
+    }
     case SD_CTRL_UPDATE_OPTS: {
         uint64_t flags = *(uint64_t *)arg;
         if (flags & UPDATE_SUB_FILT) {
@@ -1189,6 +1195,7 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
             assobjects_init(sd);
         }
         ctx->ass_configured = false; // ass always needs to be reconfigured
+        ctx->color_mangle_changed = true;
         ctx->layout_change_pending = true;
         return CONTROL_OK;
     }
@@ -1213,8 +1220,9 @@ const struct sd_functions sd_ass = {
 };
 
 // Disgusting hack for (xy-)vsfilter color compatibility.
-static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
+static void mangle_colors(void *arg, struct sub_bitmaps *parts)
 {
+    struct sd *sd = arg;
     struct mp_subtitle_opts *opts = sd->opts;
     struct sd_ass_priv *ctx = sd->priv;
     enum pl_color_system csp = 0;

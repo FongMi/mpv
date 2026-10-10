@@ -151,6 +151,16 @@ android_osd = executable('android-osd-contracts', android_osd_source,
                          dependencies: libm)
 test('android-osd-contracts', android_osd)
 
+ass_color_functions = custom_target('ass-color-functions',
+    input: files('../sub/osd.h', '../sub/packer.c', '../sub/sd_ass.c',
+                 '../video/csputils.c'),
+    depend_files: files('vo_android_frame.py'),
+    output: ['ass_color_functions.h', 'ass_color_types.h'],
+    command: [python, files('ass_color.py'), '--generate', '@OUTPUT0@'])
+ass_color = executable('ass-color', ['ass_color.c', ass_color_functions],
+                       dependencies: libm)
+test('ass-color', ass_color)
+
 android_frame_functions = custom_target('android-frame-contracts-functions',
     input: files('../video/out/vo.c', '../player/playloop.c'),
     output: 'vo_android_frame_functions.h',
