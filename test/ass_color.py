@@ -42,6 +42,9 @@ def generate(root, output):
                  "pack_libass", "pack_rgba", "mp_sub_packer_pack_ass"):
         source += function(packer, name)
     ass = (root / "sub/sd_ass.c").read_text(encoding="utf-8")
+    converter = (root / "sub/img_convert.c").read_text(encoding="utf-8")
+    source += function(converter, "mp_sub_bitmaps_bb")
+    source += function(converter, "mp_sub_bitmaps_shift_y")
     source += function(ass, "mangle_colors")
     source += function(ass, "control")
     render = function(ass, "get_bitmaps")
@@ -57,7 +60,7 @@ static struct sub_bitmaps *render_subtitles(struct sd *sd, int format,
     ASS_Track *track = ctx->ass_track;
     long long ts = 0;
     struct sub_bitmaps *res = &(struct sub_bitmaps){0};
-    struct mp_osd_res dim = {0};
+    struct mp_osd_res dim = {.h = 1000};
     bool transform_layout = false;
     if (!renderer)
         goto done;
