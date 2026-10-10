@@ -247,9 +247,18 @@ android_osd = executable('android-osd-contracts', android_osd_source,
                          dependencies: libm)
 test('android-osd-contracts', android_osd)
 
+subtitle_offset_functions = custom_target('subtitle-offset-functions',
+    input: files('../sub/img_convert.c'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'subtitle_offset_functions.h',
+    command: [python, files('subtitle_offset.py'), '--generate', '@OUTPUT@'])
+subtitle_offset = executable('subtitle-offset',
+    ['subtitle_offset.c', subtitle_offset_functions], dependencies: libm)
+test('subtitle-offset', subtitle_offset)
+
 ass_color_functions = custom_target('ass-color-functions',
     input: files('../sub/osd.h', '../sub/packer.c', '../sub/sd_ass.c',
-                 '../video/csputils.c'),
+                 '../sub/img_convert.c', '../video/csputils.c'),
     depend_files: files('vo_android_frame.py'),
     output: ['ass_color_functions.h', 'ass_color_types.h'],
     command: [python, files('ass_color.py'), '--generate', '@OUTPUT0@'])

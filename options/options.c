@@ -410,6 +410,8 @@ const struct m_sub_options mp_subtitle_shared_sub_opts = {
         {"secondary-sub-delay", OPT_DOUBLE(sub_delay[1])},
         {"sub-pos", OPT_FLOAT(sub_pos[0]), M_RANGE(0.0, 150.0)},
         {"secondary-sub-pos", OPT_FLOAT(sub_pos[1]), M_RANGE(0.0, 150.0)},
+        {"sub-offset-y", OPT_FLOAT(sub_offset_y[0]), M_RANGE(-100, 100)},
+        {"secondary-sub-offset-y", OPT_FLOAT(sub_offset_y[1]), M_RANGE(-100, 100)},
         {"sub-scale", OPT_FLOAT(sub_scale[0]), M_RANGE(0, 100)},
         {"secondary-sub-scale", OPT_FLOAT(sub_scale[1]), M_RANGE(0, 100)},
         {"sub-visibility", OPT_BOOL(sub_visibility[0])},

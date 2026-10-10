@@ -2648,6 +2648,20 @@ Subtitles
     Specify the position of secondary subtitles on the screen. This is similar
     to ``--sub-pos`` but for secondary subtitles.
 
+``--sub-offset-y=<-100-100>``
+    Move the complete rendered subtitle track vertically by this percentage of
+    the output frame height. Positive values move up and negative values move
+    down. The default is 0, which preserves the original rendered position.
+
+    Unlike ``--sub-pos``, this moves the rendered bitmaps, including positioned
+    ASS events and image subtitles, without changing their styling or scale.
+    A track that fits within the output frame is kept within its vertical bounds.
+    Moving into black borders requires an output frame that includes those borders.
+    Disc menus are unaffected.
+
+``--secondary-sub-offset-y=<-100-100>``
+    Like ``--sub-offset-y``, but for the secondary subtitle track.
+
 ``--sub-speed=<0.1-10.0>``
     Multiply the subtitle event timestamps with the given value. Can be used
     to fix the playback speed for frame-based subtitle formats. Affects text
