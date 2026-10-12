@@ -332,7 +332,8 @@ static void queue_flip(struct ra_ctx *ctx, struct gbm_frame *frame)
     if (ret)
         MP_WARN(ctx->vo, "Failed to commit atomic request: %s\n", mp_strerror(ret));
     drm->waiting_for_flip = !ret;
-    p->allow_modeset = !ret;
+    if (!ret)
+        p->allow_modeset = false;
 
     drmModeAtomicFree(atomic_ctx->request);
     atomic_ctx->request = drmModeAtomicAlloc();
