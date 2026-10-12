@@ -73,6 +73,13 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+drm_modeset_functions = custom_target('drm-modeset-functions',
+    input: files('../video/out/opengl/context_drm_egl.c'),
+    output: 'drm_modeset_functions.h',
+    command: [python, files('drm_modeset.py'), '--generate', '@OUTPUT@'])
+drm_modeset = executable('drm-modeset', ['drm_modeset.c', drm_modeset_functions])
+test('drm-modeset', drm_modeset)
+
 chmap_files = [
     'audio/chmap_avchannel.c',
     'audio/chmap_sel.c',
