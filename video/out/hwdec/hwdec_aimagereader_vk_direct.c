@@ -92,6 +92,8 @@ struct aimagereader_vk_direct {
     pl_vulkan vk;
     VkDevice device;
     PFN_vkGetAndroidHardwareBufferPropertiesANDROID GetAHBProperties;
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 GetImageFormatProperties2;
+    PFN_vkGetPhysicalDeviceFormatProperties2 GetFormatProperties2;
     PFN_vkImportSemaphoreFdKHR ImportSemaphoreFd;
     PFN_vkGetSemaphoreFdKHR GetSemaphoreFd;
     bool acquire_sync_fd;
@@ -485,7 +487,7 @@ static bool query_concrete_format(
         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
         .pNext = &external_props,
     };
-    VkResult result = vkGetPhysicalDeviceImageFormatProperties2(
+    VkResult result = p->GetImageFormatProperties2(
         p->vk->phys_device, &format_info, &image_props);
     VkExternalMemoryProperties *memory =
         &external_props.externalMemoryProperties;
@@ -501,8 +503,7 @@ static bool query_concrete_format(
     VkFormatProperties2 format_props = {
         .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
     };
-    vkGetPhysicalDeviceFormatProperties2(p->vk->phys_device, props->format,
-                                         &format_props);
+    p->GetFormatProperties2(p->vk->phys_device, props->format, &format_props);
     *features = format_props.formatProperties.optimalTilingFeatures;
     return (*features & required_sampling_features) == required_sampling_features &&
            supports_chroma_location(*features,
@@ -1187,6 +1188,12 @@ struct aimagereader_vk_direct *aimagereader_vk_direct_create(
         goto error;
 
     p->device = p->vk->device;
+    p->GetImageFormatProperties2 =
+        (PFN_vkGetPhysicalDeviceImageFormatProperties2)p->vk->get_proc_addr(
+            p->vk->instance, "vkGetPhysicalDeviceImageFormatProperties2");
+    p->GetFormatProperties2 =
+        (PFN_vkGetPhysicalDeviceFormatProperties2)p->vk->get_proc_addr(
+            p->vk->instance, "vkGetPhysicalDeviceFormatProperties2");
     PFN_vkGetDeviceProcAddr get_device_proc =
         (PFN_vkGetDeviceProcAddr)p->vk->get_proc_addr(
             p->vk->instance, "vkGetDeviceProcAddr");
@@ -1206,7 +1213,8 @@ struct aimagereader_vk_direct *aimagereader_vk_direct_create(
                     p->device, "vkGetSemaphoreFdKHR");
         }
     }
-    if (!p->GetAHBProperties)
+    if (!p->GetAHBProperties || !p->GetImageFormatProperties2 ||
+        !p->GetFormatProperties2)
         goto error;
 
     VkExternalSemaphoreFeatureFlags sync_fd_features =
