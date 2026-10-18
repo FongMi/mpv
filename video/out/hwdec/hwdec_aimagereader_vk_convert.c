@@ -121,6 +121,9 @@ struct aimagereader_vk_convert {
     uint32_t queue_family;
     PFN_vkGetAndroidHardwareBufferPropertiesANDROID GetAHBProperties;
     PFN_vkGetPhysicalDeviceImageFormatProperties2 GetImageFormatProperties2;
+    PFN_vkGetPhysicalDeviceProperties2 GetProperties2;
+    PFN_vkCreateSamplerYcbcrConversion CreateSamplerYcbcrConversion;
+    PFN_vkDestroySamplerYcbcrConversion DestroySamplerYcbcrConversion;
     PFN_vkImportSemaphoreFdKHR ImportSemaphoreFd;
     PFN_vkGetSemaphoreFdKHR GetSemaphoreFd;
     bool acquire_sync_fd;
@@ -452,7 +455,7 @@ static void destroy_conversion_resources(struct aimagereader_vk_convert *p)
     if (p->sampler)
         vkDestroySampler(p->device, p->sampler, NULL);
     if (p->conversion)
-        vkDestroySamplerYcbcrConversion(p->device, p->conversion, NULL);
+        p->DestroySamplerYcbcrConversion(p->device, p->conversion, NULL);
 
     p->pipeline = VK_NULL_HANDLE;
     p->render_pass = VK_NULL_HANDLE;
@@ -859,7 +862,7 @@ static uint32_t external_sampler_descriptor_count(
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
             .pNext = &maintenance6_props,
         };
-        vkGetPhysicalDeviceProperties2(p->vk->phys_device, &properties);
+        p->GetProperties2(p->vk->phys_device, &properties);
         if (maintenance6_props.maxCombinedImageSamplerDescriptorCount) {
             return maintenance6_props
                 .maxCombinedImageSamplerDescriptorCount;
@@ -1046,7 +1049,7 @@ static bool create_pipeline(
             .yChromaOffset = props->suggestedYChromaOffset,
             .chromaFilter = chroma_filter,
         };
-        if (!vk_success(p, vkCreateSamplerYcbcrConversion(
+        if (!vk_success(p, p->CreateSamplerYcbcrConversion(
                             p->device, &conversion_info, NULL, &p->conversion),
                         "creating Android YCbCr conversion"))
             return false;
@@ -1996,11 +1999,19 @@ struct aimagereader_vk_convert *aimagereader_vk_convert_create(
                 : conversion_backend_name(p->required_backend));
 
     p->GetImageFormatProperties2 = get_image_format_properties2(p->vk);
+    p->GetProperties2 = (PFN_vkGetPhysicalDeviceProperties2)p->vk->get_proc_addr(
+        p->vk->instance, "vkGetPhysicalDeviceProperties2");
 
     PFN_vkGetDeviceProcAddr get_device_proc =
         (PFN_vkGetDeviceProcAddr)p->vk->get_proc_addr(
             p->vk->instance, "vkGetDeviceProcAddr");
     if (get_device_proc) {
+        p->CreateSamplerYcbcrConversion =
+            (PFN_vkCreateSamplerYcbcrConversion)get_device_proc(
+                p->device, "vkCreateSamplerYcbcrConversion");
+        p->DestroySamplerYcbcrConversion =
+            (PFN_vkDestroySamplerYcbcrConversion)get_device_proc(
+                p->device, "vkDestroySamplerYcbcrConversion");
         p->GetAHBProperties =
             (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)
             get_device_proc(
@@ -2027,7 +2038,9 @@ struct aimagereader_vk_convert *aimagereader_vk_convert_create(
     mp_verbose(p->log, "Vulkan AImageReader sync-fd: acquire %s, release %s\n",
                p->acquire_sync_fd ? "enabled" : "disabled",
                p->release_sync_fd ? "enabled" : "disabled");
-    if (!p->GetAHBProperties || !p->GetImageFormatProperties2)
+    if (!p->GetAHBProperties || !p->GetImageFormatProperties2 ||
+        !p->GetProperties2 || !p->CreateSamplerYcbcrConversion ||
+        !p->DestroySamplerYcbcrConversion)
         goto error;
 
     return p;
