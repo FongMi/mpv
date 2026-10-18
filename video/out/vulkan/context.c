@@ -50,6 +50,14 @@ static inline OPT_STRING_VALIDATE_FUNC(vk_validate_dev)
         goto done;
     }
 
+    PFN_vkGetPhysicalDeviceProperties2 get_properties =
+        (PFN_vkGetPhysicalDeviceProperties2)inst->get_proc_addr(
+            inst->instance, "vkGetPhysicalDeviceProperties2");
+    if (!get_properties) {
+        mp_info(log, "Failed to load Vulkan device properties function\n");
+        goto done;
+    }
+
     uint32_t num = 0;
     VkResult res = vkEnumeratePhysicalDevices(inst->instance, &num, NULL);
     if (res != VK_SUCCESS) {
@@ -87,7 +95,7 @@ static inline OPT_STRING_VALIDATE_FUNC(vk_validate_dev)
         prop2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
         prop2.pNext = &id_prop;
 
-        vkGetPhysicalDeviceProperties2(devices[i], &prop2);
+        get_properties(devices[i], &prop2);
 
         const VkPhysicalDeviceProperties *prop = &prop2.properties;
 
