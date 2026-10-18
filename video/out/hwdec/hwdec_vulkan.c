@@ -78,7 +78,15 @@ static int vulkan_init(struct ra_hwdec *hw)
     uint32_t num_qf = 0;
     VkQueueFamilyProperties2 *qf = NULL;
     VkQueueFamilyVideoPropertiesKHR *qf_vid = NULL;
-    vkGetPhysicalDeviceQueueFamilyProperties2(vk->vulkan->phys_device, &num_qf, NULL);
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties2 get_queue_properties =
+        (PFN_vkGetPhysicalDeviceQueueFamilyProperties2)
+        vk->vkinst->get_proc_addr(vk->vkinst->instance,
+                                  "vkGetPhysicalDeviceQueueFamilyProperties2");
+    if (!get_queue_properties) {
+        MP_MSG(hw, level, "Failed to load Vulkan queue properties function\n");
+        goto error;
+    }
+    get_queue_properties(vk->vulkan->phys_device, &num_qf, NULL);
     if (!num_qf)
         goto error;
 
@@ -94,7 +102,7 @@ static int vulkan_init(struct ra_hwdec *hw)
         };
     }
 
-    vkGetPhysicalDeviceQueueFamilyProperties2(vk->vulkan->phys_device, &num_qf, qf);
+    get_queue_properties(vk->vulkan->phys_device, &num_qf, qf);
 
     hw_device_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VULKAN);
     if (!hw_device_ctx)
