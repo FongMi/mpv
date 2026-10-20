@@ -5888,6 +5888,9 @@ The backend honors the network options listed above (``--user-agent``,
 If libcurl is not available at build time, mpv uses FFmpeg's networking
 implementation instead.
 
+URL credentials are negotiated using HTTP Basic or Digest authentication.
+An explicit ``Authorization`` header takes precedence over URL credentials.
+
 To inspect libcurl's debug output (requests, response headers,
 TLS/connection diagnostics), set ``--msg-level=curl=trace``.
 

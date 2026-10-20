@@ -288,6 +288,15 @@ if features['libcurl']
 endif
 
 if get_option('libmpv')
+    if features['libcurl']
+        http_auth = executable('libmpv-test-http-auth', 'libmpv_http_auth.c',
+                              include_directories: incdir,
+                              dependencies: libmpv_dep)
+        test('libmpv-http-auth', python,
+             args: [files('http_auth.py'), http_auth],
+             suite: 'libmpv', timeout: 90)
+    endif
+
     file = join_paths(source_root, 'etc', 'mpv-icon-8bit-16x16.png')
 
     exe = executable('libmpv-test-file-loading', 'libmpv_test_file_loading.c',

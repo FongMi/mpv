@@ -424,12 +424,19 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
     struct priv *p = userdata;
     size_t bytes = size * nmemb;
 
+    if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
+        return CURL_WRITEFUNC_ERROR;
+
+    if (p->scheme->proto == MP_CURL_PROTO_HTTP) {
+        long resp = 0;
+        curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &resp);
+        if (resp == 401)
+            return bytes;
+    }
+
     // header_callback validated the response and logged any error status,
     // we don't care about error body.
     if (!p->stream_ok || p->reply_rejected)
-        return CURL_WRITEFUNC_ERROR;
-
-    if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
         return CURL_WRITEFUNC_ERROR;
 
     mp_mutex_lock(&p->mtx);
@@ -542,31 +549,8 @@ static void check_http_reply(struct priv *p, long resp, int64_t range_start,
     }
 }
 
-// Empty line is the end of the header. Skip intermediate 1xx and 3xx responses,
-// we care about the final one.
-static void on_http_header(struct priv *p, struct bstr line)
+static void on_http_reply(struct priv *p, long resp)
 {
-    if (line.len > 0) {
-        // ICY metadata is set up from the initial reply only. A new status line
-        // resets per-response state so that intermediate 1xx/3xx responses
-        // don't leak ICY metadata into the final one.
-        if (p->probed)
-            return;
-        mp_mutex_lock(&p->mtx);
-        if (bstr_startswith0(line, "HTTP/")) {
-            mp_icy_reset(p->icy);
-        } else {
-            mp_icy_add_header(p->icy, line);
-        }
-        mp_mutex_unlock(&p->mtx);
-        return;
-    }
-
-    long resp = 0;
-    curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &resp);
-    if (resp < 200 || (resp >= 300 && resp < 400))
-        return;
-
     int64_t range_start, range_end, range_total;
     parse_content_range(p->curl, &range_start, &range_end, &range_total);
     p->reply_end = resp == 206 ? range_end : -1;
@@ -621,6 +605,31 @@ static void on_http_header(struct priv *p, struct bstr line)
     p->stream_ok = true;
 done:
     finalize_probe(p);
+}
+
+static void on_http_header(struct priv *p, struct bstr line)
+{
+    if (line.len > 0) {
+        // ICY metadata is set up from the initial reply only. A new status line
+        // resets per-response state so that intermediate responses don't leak
+        // ICY metadata into the final one.
+        if (p->probed)
+            return;
+        mp_mutex_lock(&p->mtx);
+        if (bstr_startswith0(line, "HTTP/")) {
+            mp_icy_reset(p->icy);
+        } else {
+            mp_icy_add_header(p->icy, line);
+        }
+        mp_mutex_unlock(&p->mtx);
+        return;
+    }
+
+    // Authentication challenges are intermediate until libcurl completes.
+    long resp = 0;
+    curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &resp);
+    if (resp >= 200 && !(resp >= 300 && resp < 400) && resp != 401)
+        on_http_reply(p, resp);
 }
 
 static void probe_ftp(struct priv *p, struct bstr line)
@@ -822,6 +831,13 @@ static void on_done(struct priv *p, CURLcode code)
 {
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
 
+    if (!aborted && p->scheme->proto == MP_CURL_PROTO_HTTP) {
+        long resp = 0;
+        curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &resp);
+        if (resp == 401)
+            on_http_reply(p, resp);
+    }
+
     if (!p->probed) {
         // Connection died before any headers arrived.
         if (code != CURLE_OK && !aborted)
@@ -941,6 +957,16 @@ static struct curl_slist *build_header_list(struct priv *p)
     return list;
 }
 
+static long http_auth_methods(struct priv *p)
+{
+    char **headers = p->net_opts->http_header_fields;
+    for (int i = 0; headers && headers[i]; i++) {
+        if (strncasecmp(headers[i], "Authorization:", 14) == 0)
+            return CURLAUTH_NONE;
+    }
+    return CURLAUTH_BASIC | CURLAUTH_DIGEST;
+}
+
 #define SETOPT(opt, val)                                                    \
     do {                                                                    \
         if (!check_setopt(p, #opt, curl_easy_setopt(c, opt, val)))          \
@@ -953,6 +979,8 @@ static bool setup_curl(struct priv *p)
     CURL *c = p->curl;
 
     SETOPT(CURLOPT_URL, p->url);
+    if (p->scheme->proto == MP_CURL_PROTO_HTTP)
+        SETOPT(CURLOPT_HTTPAUTH, http_auth_methods(p));
     SETOPT(CURLOPT_NOSIGNAL, 1L);
     SETOPT(CURLOPT_PRIVATE, p);
 
