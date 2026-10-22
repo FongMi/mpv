@@ -748,10 +748,8 @@ static int handle_nav_cmd(stream_t *stream, struct stream_nav_cmd *cmd)
     return STREAM_OK;
 }
 
-
-
 static bool dvd_logical_track_info(struct priv *priv,
-                                    struct stream_track_req *req, int n)
+                                   struct stream_track_req *req, int n)
 {
     uint16_t lang = 0xffff;
 
@@ -1623,21 +1621,21 @@ static int control_locked(stream_t *stream, int cmd, void *arg)
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_NUM_ANGLES: {
-        uint32_t curr, angles;
+        int32_t curr, angles;
         if (dvdnav_get_angle_info(dvdnav, &curr, &angles) != DVDNAV_STATUS_OK)
             break;
         *(int *)arg = angles;
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_ANGLE: {
-        uint32_t curr, angles;
+        int32_t curr, angles;
         if (dvdnav_get_angle_info(dvdnav, &curr, &angles) != DVDNAV_STATUS_OK)
             break;
         *(int *)arg = curr;
         return STREAM_OK;
     }
     case STREAM_CTRL_SET_ANGLE: {
-        uint32_t curr, angles;
+        int32_t curr, angles;
         int new_angle = *(int *)arg;
         if (dvdnav_get_angle_info(dvdnav, &curr, &angles) != DVDNAV_STATUS_OK)
             break;

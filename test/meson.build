@@ -458,6 +458,13 @@ if features['dvdnav']
     test('dvdnav', dvdnav_test)
 endif
 
+bluray_rate_header = custom_target('bluray-rate-functions',
+    input: files('../stream/stream_bluray.c'),
+    output: 'bluray_rate_functions.h',
+    command: [python, files('bluray_rate.py'), '--generate', '@OUTPUT@'])
+bluray_rate = executable('bluray-rate', ['bluray_rate.c', bluray_rate_header])
+test('bluray-rate', bluray_rate)
+
 disc_segment_headers = custom_target('disc-segment-functions',
     input: files('../demux/demux_disc.c', '../stream/stream.h'),
     output: ['disc_segments_functions.h', 'disc_segment_types.h'],
