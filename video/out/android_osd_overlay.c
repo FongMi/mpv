@@ -185,6 +185,30 @@ static bool create_program(struct android_osd_overlay *ctx)
     return ctx->position >= 0 && ctx->texcoord >= 0 && ctx->sampler >= 0;
 }
 
+static bool recreate_surface(struct android_osd_overlay *ctx)
+{
+    if (!eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        EGL_NO_CONTEXT) ||
+        !eglDestroySurface(ctx->display, ctx->surface))
+        goto fail;
+
+    ctx->pending = false;
+    ctx->rendered_width = ctx->rendered_height = 0;
+    ctx->surface =
+        eglCreateWindowSurface(ctx->display, ctx->config,
+                               (EGLNativeWindowType)ctx->window, NULL);
+    if (ctx->surface == EGL_NO_SURFACE ||
+        !eglMakeCurrent(ctx->display, ctx->surface, ctx->surface, ctx->context))
+        goto fail;
+
+    eglSwapInterval(ctx->display, 0);
+    return true;
+
+fail:
+    MP_ERR(ctx, "Failed to resize OSD EGL surface: 0x%x\n", eglGetError());
+    return false;
+}
+
 static bool update_size(struct android_osd_overlay *ctx)
 {
     int width = ctx->vo->opts->android_osd_surface_size.w;
@@ -206,6 +230,10 @@ static bool update_size(struct android_osd_overlay *ctx)
     }
 
     if (ctx->width != width || ctx->height != height) {
+        // A resized TextureView can retain its previous EGL buffer while paused.
+        // Keep the context and textures, but acquire a drawable at the new size.
+        if (ctx->width > 0 && ctx->height > 0 && !recreate_surface(ctx))
+            return false;
         ctx->width = width;
         ctx->height = height;
         ctx->geometry_dirty = true;
@@ -674,8 +702,12 @@ static bool present(struct android_osd_overlay *ctx)
 
 static bool get_size(struct android_osd_overlay *ctx, int *w, int *h)
 {
-    if (!ensure_surface(ctx) || !update_size(ctx))
+    if (!ensure_surface(ctx))
         return false;
+    if (!update_size(ctx)) {
+        destroy_egl(ctx);
+        return false;
+    }
     *w = ctx->width;
     *h = ctx->height;
     return true;
