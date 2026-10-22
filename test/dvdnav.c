@@ -29,6 +29,9 @@ static struct {
     uint64_t seek_time;
     bool seek_succeeds;
     int active_audio, wait_reads;
+    int still_releases;
+    bool activation_succeeds, activation_jumps;
+    uint8_t audio_extension, sub_extension;
 } fixture;
 
 static int test_mutex_lock(mp_mutex *mutex)
@@ -216,7 +219,45 @@ dvdnav_status_t dvdnav_go_up(dvdnav_t *nav) { return DVDNAV_STATUS_ERR; }
 dvdnav_status_t dvdnav_button_select(dvdnav_t *nav, pci_t *pci, int32_t n)
 { return DVDNAV_STATUS_ERR; }
 dvdnav_status_t dvdnav_button_activate(dvdnav_t *nav, pci_t *pci)
-{ return DVDNAV_STATUS_ERR; }
+{
+    dvd_boundary();
+    if (fixture.activation_jumps)
+        fixture.position_valid = false;
+    return fixture.activation_succeeds ? DVDNAV_STATUS_OK : DVDNAV_STATUS_ERR;
+}
+
+dvdnav_status_t dvdnav_button_activate_cmd(dvdnav_t *nav, int32_t button, vm_cmd_t *cmd)
+{
+    dvd_boundary();
+    fixture.still_releases++;
+    return DVDNAV_STATUS_OK;
+}
+
+user_ops_t dvdnav_get_restrictions(dvdnav_t *nav)
+{
+    dvd_boundary();
+    return (user_ops_t){0};
+}
+
+dvdnav_status_t dvdnav_get_audio_attr(dvdnav_t *nav, uint8_t logical, audio_attr_t *attr)
+{
+    dvd_boundary();
+    *attr = (audio_attr_t){.code_extension = fixture.audio_extension};
+    return DVDNAV_STATUS_OK;
+}
+
+dvdnav_status_t dvdnav_get_spu_attr(dvdnav_t *nav, uint8_t logical, subp_attr_t *attr)
+{
+    dvd_boundary();
+    *attr = (subp_attr_t){.code_extension = fixture.sub_extension};
+    return DVDNAV_STATUS_OK;
+}
+
+char *dvdnav_get_volid_string(dvdnav_t *nav)
+{
+    dvd_boundary();
+    return NULL;
+}
 dvdnav_status_t dvdnav_mouse_select(dvdnav_t *nav, pci_t *pci, int32_t x, int32_t y)
 { return DVDNAV_STATUS_ERR; }
 dvdnav_status_t dvdnav_mouse_activate(dvdnav_t *nav, pci_t *pci, int32_t x, int32_t y)
@@ -562,8 +603,74 @@ static void test_selection_at_timeline_boundary(void)
     uninit_fixture();
 }
 
+static void test_still_activation(bool jumps)
+{
+    init_fixture();
+    fixture.menu = true;
+    fixture.activation_succeeds = true;
+    fixture.activation_jumps = jumps;
+    fixture.priv.pci_valid = true;
+    fixture.priv.pci.hli.hl_gi.hli_ss = 1;
+    fixture.priv.pci.hli.hl_gi.btn_ns = 1;
+    fixture.priv.still_active = true;
+    fixture.priv.still_duration = 5;
+    fixture.priv.still_id = 7;
+    fixture.priv.drain_enabled = true;
+    struct stream_nav_cmd cmd = {.action = STREAM_NAV_SELECT};
+    assert_int_equal(control(&fixture.stream, STREAM_CTRL_NAV_CMD, &cmd), STREAM_OK);
+    assert_int_equal(fixture.still_releases, 0);
+    assert_int_equal(fixture.priv.still_active, !jumps);
+    assert_int_equal(fixture.priv.still_duration, jumps ? 0 : 5);
+    assert_int_equal(fixture.priv.discontinuity_id, jumps ? 1 : 0);
+    assert_int_equal(fixture.priv.pending_drain, jumps);
+    uninit_fixture();
+}
+
+static void test_highlight_palette(void)
+{
+    init_fixture();
+    fixture.priv.spu_clut_valid = true;
+    fixture.priv.spu_clut[1] = 0x123456;
+    fixture.priv.spu_clut[2] = 0xabcdef;
+    pci_t pci = {0};
+    pci.hli.hl_gi.btn_ns = 1;
+    pci.hli.btnit[0].btn_coln = 1;
+    pci.hli.btn_colit.btn_coli[0][0] = 0x21210f8f;
+    compute_highlight_palette(&fixture.priv, &pci, 1);
+    assert_int_equal(fixture.priv.hl.palette[0], 0xff123456);
+    assert_int_equal(fixture.priv.hl.palette[1], 0x88abcdef);
+    assert_int_equal(fixture.priv.hl.palette[2], 0xff123456);
+    assert_int_equal(fixture.priv.hl.palette[3], 0x00abcdef);
+    uninit_fixture();
+}
+
+static void test_logical_track_flags(void)
+{
+    init_fixture();
+    fixture.audio_extension = 3;
+    fixture.sub_extension = 9;
+    fixture.priv.dvd_catalog_dirty = true;
+    struct stream_track_req req = {.type = STREAM_AUDIO, .id = 0x80};
+    assert_true(dvd_logical_track_info(&fixture.priv, &req, 6));
+    assert_true(req.flags & TRACK_COMMENTARY);
+    req = (struct stream_track_req){.type = STREAM_SUB, .id = 0};
+    assert_true(dvd_logical_track_info(&fixture.priv, &req, 0));
+    assert_true(req.flags & TRACK_FORCED);
+    mp_mutex_lock(&fixture.priv.vm_lock);
+    publish_state(&fixture.priv);
+    mp_mutex_unlock(&fixture.priv.vm_lock);
+    assert_true(fixture.priv.dvd_streams.audio[6].flags & TRACK_COMMENTARY);
+    assert_false(fixture.priv.dvd_streams.audio[6].flags & TRACK_FORCED);
+    uninit_fixture();
+}
+
 int main(void)
 {
+    mp_time_init();
+    test_highlight_palette();
+    test_still_activation(false);
+    test_still_activation(true);
+    test_logical_track_flags();
     test_selection_at_timeline_boundary();
     test_selection_during_wait();
     test_floor_seek();

@@ -608,8 +608,6 @@ static bool do_nav_cmd(stream_t *stream, struct stream_nav_cmd *cmd)
     return acted;
 }
 
-// Forget a held still. Runs with priv->vm_lock held.
-
 // A failed VM continuation cannot be resumed as a still or drain. vm_lock held.
 static void mark_failed(stream_t *s)
 {
@@ -676,20 +674,14 @@ static int handle_nav_cmd(stream_t *stream, struct stream_nav_cmd *cmd)
         return STREAM_UNSUPPORTED;
     if (nav_action_prohibited(priv->dvdnav, cmd->action))
         MP_DBG(stream, "disc prohibits this user operation at the current position, performing it anyway\n");
-    bool was_still = priv->still_active;
-    int prev_auto = priv->auto_actioned_button;
     bool acted = do_nav_cmd(stream, cmd);
-    bool activated = acted || priv->auto_actioned_button != prev_auto;
     // A VM jump invalidates the position until the next block; register-only
     // button commands leave it valid and must not discard the menu subpicture.
     bool position_lost = positioned &&
         dvdnav_get_position(priv->dvdnav, &pos, &len) != DVDNAV_STATUS_OK;
     if (position_lost && !priv->pending_drain)
         priv->at_boundary = false;
-    if (position_lost || (activated &&
-        (was_still || !priv->pci_valid || cmd->action == STREAM_NAV_GO_UP)))
-    {
-        release_still(priv);
+    if (position_lost || (acted && !priv->pci_valid)) {
         priv->terminal_stop = false;
         priv->wait_pending = false;
         bump_discontinuity(priv, true);
@@ -698,10 +690,8 @@ static int handle_nav_cmd(stream_t *stream, struct stream_nav_cmd *cmd)
     return STREAM_OK;
 }
 
-
-
 static bool dvd_logical_track_info(struct priv *priv,
-                                    struct stream_track_req *req, int n)
+                                   struct stream_track_req *req, int n)
 {
     uint16_t lang = 0xffff;
 
@@ -1439,21 +1429,21 @@ static int control_locked(stream_t *stream, int cmd, void *arg)
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_NUM_ANGLES: {
-        uint32_t curr, angles;
+        int32_t curr, angles;
         if (dvdnav_get_angle_info(dvdnav, &curr, &angles) != DVDNAV_STATUS_OK)
             break;
         *(int *)arg = angles;
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_ANGLE: {
-        uint32_t curr, angles;
+        int32_t curr, angles;
         if (dvdnav_get_angle_info(dvdnav, &curr, &angles) != DVDNAV_STATUS_OK)
             break;
         *(int *)arg = curr;
         return STREAM_OK;
     }
     case STREAM_CTRL_SET_ANGLE: {
-        uint32_t curr, angles;
+        int32_t curr, angles;
         int new_angle = *(int *)arg;
         if (dvdnav_get_angle_info(dvdnav, &curr, &angles) != DVDNAV_STATUS_OK)
             break;

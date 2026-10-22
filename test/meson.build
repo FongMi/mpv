@@ -431,3 +431,10 @@ if features['dvdnav']
                                                    '-Wl,-dead_strip'))
     test('dvdnav', dvdnav_test)
 endif
+
+bluray_rate_header = custom_target('bluray-rate-functions',
+    input: files('../stream/stream_bluray.c'),
+    output: 'bluray_rate_functions.h',
+    command: [python, files('bluray_rate.py'), '--generate', '@OUTPUT@'])
+bluray_rate = executable('bluray-rate', ['bluray_rate.c', bluray_rate_header])
+test('bluray-rate', bluray_rate)

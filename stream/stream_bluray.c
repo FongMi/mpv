@@ -1190,6 +1190,9 @@ static int bluray_stream_control_locked(stream_t *s, int cmd, void *arg)
             break;
         double rate = *(double *)arg;
         if (rate == 0) {
+            mp_mutex_lock(&b->overlay_lock);
+            b->pending_rate_set = false;
+            mp_mutex_unlock(&b->overlay_lock);
             bd_set_rate(b->bd, BD_TIME_FROM_S(rate));
         } else {
             mp_mutex_lock(&b->overlay_lock);
@@ -1569,7 +1572,7 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
     case STREAM_CTRL_GET_TIME_LENGTH:
     case STREAM_CTRL_GET_NUM_ANGLES:
     case STREAM_CTRL_GET_ANGLE:
-    case STREAM_CTRL_GET_LANG:
+    case STREAM_CTRL_GET_TRACK_INFO:
     case STREAM_CTRL_GET_NAV_STATE:
     case STREAM_CTRL_GET_NAV_OVERLAY:
         return bluray_stream_control_locked(s, cmd, arg);

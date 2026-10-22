@@ -713,11 +713,7 @@ static void d_seek(demuxer_t *demuxer, double seek_pts, int flags)
     if (p->is_dvd && resync && nav.still_active) {
         arm_dvd_sub_holds(p);
     } else {
-        if (p->is_dvd && resync && nav.still_active) {
-        arm_dvd_sub_holds(p);
-    } else {
         clear_dvd_sub_holds(p);
-    }
     }
 
     // Re-inject the still for the new position.
