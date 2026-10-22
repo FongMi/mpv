@@ -26,7 +26,9 @@ def main():
     state_start = source.index("struct egl_state {")
     state_end = source.index("};", state_start) + 2
     helpers = source[state_start:state_end] + "\n"
-    for name in ("save_egl", "restore_egl", "android_osd_geometry_from_node",
+    for name in ("save_egl", "restore_egl", "recreate_surface", "update_size",
+                 "get_size",
+                 "android_osd_geometry_from_node",
                  "android_osd_overlay_transforms_video",
                  "android_osd_overlay_active",
                  "android_osd_overlay_get_video_rects",
@@ -105,13 +107,23 @@ static int m_config_set_option_node(void *config, const char *name,
     commits++;
     return 0;
 }
-typedef int EGLDisplay, EGLContext, EGLSurface, EGLenum;
+typedef int EGLDisplay, EGLContext, EGLSurface, EGLenum, EGLint;
+typedef int EGLConfig, EGLNativeWindowType;
 #define EGL_NO_DISPLAY 0
+#define EGL_NO_CONTEXT 0
+#define EGL_NO_SURFACE 0
+#define EGL_WIDTH 10
+#define EGL_HEIGHT 11
 #define EGL_DRAW 1
 #define EGL_READ 2
 #define MP_ERR(ctx, ...) ((void)(ctx))
 static int display, context, draw, read_surface, api;
 static bool fail_restore, render_ok = true;
+static bool fail_unbind, fail_destroy_surface, fail_create_surface;
+static bool fail_surface_current, fail_query_surface;
+static int surface_creates, surface_destroys, swap_interval;
+static int consumer_width = 1280, consumer_height = 720;
+static int drawable_width = 1280, drawable_height = 720;
 static int eglGetCurrentDisplay(void) { return display; }
 static int eglGetCurrentContext(void) { return context; }
 static int eglGetCurrentSurface(int kind) {
@@ -120,6 +132,8 @@ static int eglGetCurrentSurface(int kind) {
 static int eglQueryAPI(void) { return api; }
 static bool eglBindAPI(int value) { api = value; return true; }
 static bool eglMakeCurrent(int d, int w, int r, int c) {
+    if ((!c && fail_unbind) || (w == 42 && fail_surface_current))
+        return false;
     if (c == 20) {
         assert(api == 7); // Bind the saved API before restoring its context.
         if (fail_restore)
@@ -131,12 +145,38 @@ static bool eglMakeCurrent(int d, int w, int r, int c) {
     read_surface = r;
     return true;
 }
+bool eglDestroySurface(int d, int s) {
+    assert(d == 1 && s == 41);
+    surface_destroys++;
+    return !fail_destroy_surface;
+}
+EGLSurface eglCreateWindowSurface(int d, int config, int window, const int *attrs) {
+    assert(d == 1 && config == 3 && window && !attrs);
+    surface_creates++;
+    if (fail_create_surface)
+        return EGL_NO_SURFACE;
+    drawable_width = consumer_width;
+    drawable_height = consumer_height;
+    return 42;
+}
+bool eglQuerySurface(int d, int s, int attr, int *value) {
+    if (fail_query_surface)
+        return false;
+    *value = attr == EGL_WIDTH ? drawable_width : drawable_height;
+    return true;
+}
+bool eglSwapInterval(int d, int interval) {
+    assert(d == 1);
+    swap_interval = interval;
+    return true;
+}
 struct mp_vo_opts {
     float scale_x, scale_y, pan_x, pan_y;
     bool android_video_surface_transform;
     float panscan;
     bool keepaspect;
     struct mpv_node android_video_geometry;
+    struct { int w, h; } android_osd_surface_size;
 };
 struct mp_rect { int unused; };
 struct driver { int caps; };
@@ -151,6 +191,12 @@ struct android_osd_overlay {
     struct vo *vo;
     bool window, geometry_dirty;
     int width, height, position, texcoord;
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface surface;
+    EGLConfig config;
+    int rendered_width, rendered_height;
+    bool pending;
     struct mp_osd_res osd_res;
 };
 struct overlay_texture { int width, height; };
@@ -193,7 +239,13 @@ static bool render(struct android_osd_overlay *ctx, double pts) {
 }
 static void destroy_egl(struct android_osd_overlay *ctx) {
     ctx->window = false;
+    ctx->surface = EGL_NO_SURFACE;
+    ctx->width = ctx->height = 0;
+    ctx->pending = false;
     display = context = draw = read_surface = 0;
+}
+static bool ensure_surface(struct android_osd_overlay *ctx) {
+    return ctx->window;
 }
 '''
     fixture += helpers
@@ -221,7 +273,73 @@ static double bitmap_video_par(struct mp_osd_res d, struct mp_image_params param
     fixture += bitmap_par
     fixture += "    return video_par;\n}\n"
     fixture += r'''
+static void test_surface_resize(void) {
+    struct mp_vo_opts opts = {.android_osd_surface_size = {720, 330}};
+    struct vo vo = {.opts = &opts};
+    struct android_osd_overlay overlay = {
+        .vo = &vo, .window = true, .display = 1, .context = 2,
+        .surface = 41, .config = 3, .width = 1280, .height = 720,
+        .rendered_width = 1280, .rendered_height = 720, .pending = true,
+    };
+    consumer_width = 720;
+    consumer_height = 330;
+    drawable_width = 1280;
+    drawable_height = 720;
+    assert(update_size(&overlay));
+    assert(drawable_width == overlay.width && drawable_height == overlay.height);
+    assert(overlay.width == 720 && overlay.height == 330);
+    assert(overlay.context == 2 && overlay.surface == 42);
+    assert(context == 2 && draw == 42 && swap_interval == 0);
+    assert(overlay.geometry_dirty && !overlay.pending);
+    assert(!overlay.rendered_width && !overlay.rendered_height);
+    assert(surface_creates == 1 && surface_destroys == 1);
+    assert(update_size(&overlay));
+    assert(surface_creates == 1 && surface_destroys == 1);
+
+    overlay.width = overlay.height = 0;
+    assert(update_size(&overlay));
+    assert(surface_creates == 1 && surface_destroys == 1);
+
+    for (int failure = 0; failure < 4; failure++) {
+        overlay.width = 1280;
+        overlay.height = 720;
+        overlay.surface = 41;
+        overlay.pending = true;
+        fail_unbind = failure == 0;
+        fail_destroy_surface = failure == 1;
+        fail_create_surface = failure == 2;
+        fail_surface_current = failure == 3;
+        assert(!update_size(&overlay));
+        assert(overlay.width == 1280 && overlay.height == 720);
+        assert(overlay.surface == (failure < 2 ? 41 : failure == 2 ? 0 : 42));
+        if (failure >= 2)
+            assert(!overlay.pending);
+    }
+    fail_unbind = fail_destroy_surface = false;
+    fail_create_surface = fail_surface_current = false;
+    opts.android_osd_surface_size.w = opts.android_osd_surface_size.h = 0;
+    overlay.width = drawable_width = 720;
+    overlay.height = drawable_height = 330;
+    assert(update_size(&overlay));
+    fail_query_surface = true;
+    assert(!update_size(&overlay));
+    fail_query_surface = false;
+
+    opts.android_osd_surface_size.w = 720;
+    opts.android_osd_surface_size.h = 330;
+    overlay.width = 1280;
+    overlay.height = 720;
+    overlay.surface = 41;
+    fail_create_surface = true;
+    int width = 640, height = 360;
+    assert(!get_size(&overlay, &width, &height));
+    assert(!overlay.window && width == 640 && height == 360);
+    assert(!overlay.surface && !overlay.width && !overlay.height && !overlay.pending);
+    fail_create_surface = false;
+}
+
 int main(void) {
+    test_surface_resize();
     struct MPContext mpctx = {0};
     struct mp_cmd_ctx cmd = {.mpctx = &mpctx};
     // Full 16:9 image in a 4:3 ZOOM viewport, before clipping at the View parent.
