@@ -458,6 +458,13 @@ if features['dvdnav']
     test('dvdnav', dvdnav_test)
 endif
 
+bluray_rate_header = custom_target('bluray-rate-functions',
+    input: files('../stream/stream_bluray.c'),
+    output: 'bluray_rate_functions.h',
+    command: [python, files('bluray_rate.py'), '--generate', '@OUTPUT@'])
+bluray_rate = executable('bluray-rate', ['bluray_rate.c', bluray_rate_header])
+test('bluray-rate', bluray_rate)
+
 dovi_bsf_header = custom_target('dovi-bsf-functions',
     input: files('../demux/dovi_split.c', '../demux/demux.h'),
     depend_files: files('vo_android_frame.py'),
