@@ -61,6 +61,9 @@ struct MPOpts {
     int osd_playing_msg_duration;
 };
 struct vo { bool config_ok; };
+struct mp_pin { struct mp_pin *connection; };
+struct mp_filter { struct mp_pin *pins[1]; };
+struct mp_output_chain { struct mp_filter *f; };
 struct mp_decoder_wrapper { int unused; };
 struct track {
     struct sh_stream *stream;
@@ -68,7 +71,12 @@ struct track {
     bool attached_picture;
     bool selected;
 };
-struct vo_chain { struct track *track; bool is_coverart; };
+struct vo_chain {
+    struct track *track;
+    bool is_coverart;
+    struct mp_pin *filter_src;
+    struct mp_output_chain *filter;
+};
 struct ao_chain { struct track *track; };
 struct demux_reader_state { bool eof; };
 struct mp_image { int unused; };
@@ -99,7 +107,10 @@ struct MPContext {
 };
 static struct vo output;
 static struct ao_chain audio_output;
-static struct vo_chain chain;
+static struct mp_pin filter_input;
+static struct mp_filter filter = {.pins = {&filter_input}};
+static struct mp_output_chain output_filter = {.f = &filter};
+static struct vo_chain chain = {.filter = &output_filter};
 static struct track *last_initialized_track;
 static bool simulated_direct_active, direct_wanted;
 static int last_control, control_result = 1, destroyed, initialized, seeks, wakeups;
@@ -107,6 +118,8 @@ static int last_seek_type, last_seek_exact;
 static double last_seek_pts;
 static int audio_starts;
 static int executed_seeks, restart_events;
+static bool output_init_failed;
+static int filter_connections;
 
 #if HAVE_ANDROID
 static bool pl_color_transfer_is_hdr(int transfer)
@@ -129,7 +142,11 @@ static void test_video_output_init(struct MPContext *ctx, struct track *track)
 {
     initialized++;
     last_initialized_track = track;
+    if (output_init_failed)
+        return;
     chain.track = track;
+    chain.filter_src = NULL;
+    chain.filter = &output_filter;
     ctx->video_out = &output;
     ctx->vo_chain = &chain;
 }
@@ -148,7 +165,18 @@ static void reinit_sub(struct MPContext *ctx, struct track *track) {}
 static void reselect_demux_stream(struct MPContext *ctx, struct track *track,
                                   bool refresh_only) {}
 static void vo_chain_reset_state(struct vo_chain *vo_c) {}
-static void vo_chain_uninit(struct vo_chain *vo_c) {}
+static void vo_chain_uninit(struct vo_chain *vo_c)
+{
+    if (vo_c->filter_src)
+        vo_c->filter_src->connection = NULL;
+    vo_c->filter_src = NULL;
+}
+static void mp_pin_connect(struct mp_pin *input, struct mp_pin *source)
+{
+    assert(!source->connection);
+    source->connection = input;
+    filter_connections++;
+}
 static void mp_notify(struct MPContext *ctx, int event, void *data)
 {
     if (event == MPV_EVENT_PLAYBACK_RESTART)
@@ -474,6 +502,51 @@ static void test_blank_output_contract(void)
     assert(initialized == before + 1); // Retain the original forced-direct gate.
 }
 
+static void test_lavfi_output_reinit(void)
+{
+    struct m_obj_settings gpu[] = {{"gpu-next"}, {NULL}};
+    struct mp_vo_opts vo_opts = {
+        .WinID = 10, .android_osd_wid = 20, .video_driver_list = gpu,
+    };
+    struct MPOpts opts = {.vo = &vo_opts};
+    direct_wanted = simulated_direct_active = false;
+    for (int fail = 0; fail < 2; fail++) {
+        struct mp_pin source = {.connection = &filter_input};
+        struct vo_chain old_chain = {
+            .filter_src = &source, .filter = &output_filter,
+        };
+        struct MPContext ctx = {
+            .opts = &opts, .video_out = &output, .vo_chain = &old_chain,
+        };
+        int connections = filter_connections, old_seeks = seeks;
+        output_init_failed = fail;
+        assert(update_video_output(&ctx, NULL, false) == !fail);
+        assert(!last_initialized_track && !old_chain.filter_src);
+        assert(filter_connections == connections + !fail);
+        assert(source.connection == (fail ? NULL : &filter_input));
+        assert(seeks == old_seeks + 1);
+        assert(last_seek_type == MPSEEK_RELATIVE && last_seek_pts == 0);
+        assert(last_seek_exact == MPSEEK_EXACT);
+        if (!fail)
+            assert(ctx.vo_chain->filter_src == &source);
+    }
+    output_init_failed = false;
+    chain.filter_src = NULL;
+
+    struct mp_pin source = {.connection = &filter_input};
+    struct vo_chain old_chain = {
+        .filter_src = &source, .filter = &output_filter,
+    };
+    struct MPContext ctx = {
+        .opts = &opts, .video_out = &output, .vo_chain = &old_chain,
+    };
+    int before = initialized, old_seeks = seeks;
+    control_result = 1;
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(ctx.vo_chain == &old_chain && source.connection == &filter_input);
+    assert(initialized == before && seeks == old_seeks);
+}
+
 static void test_queued_seek_before_restart(void)
 {
     struct MPOpts opts = {0};
@@ -609,6 +682,7 @@ int main(void)
         struct m_obj_settings android[] = {{"android"}, {NULL}};
         check_initial_output(gpu, android, false);
         check_initial_output(NULL, NULL, false);
+        test_lavfi_output_reinit();
         puts("Non-Android output initialization remains independent of wid");
         return 0;
     }
@@ -706,6 +780,7 @@ int main(void)
     test_headless_audio_start_and_eof();
     test_audio_and_pending_lifecycle();
     test_blank_output_contract();
+    test_lavfi_output_reinit();
     test_queued_seek_before_restart();
     test_hdr_output_policy();
     puts("Android OSD routing, Surface detach/restore and output policy contracts passed");
