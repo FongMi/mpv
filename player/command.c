@@ -3261,6 +3261,53 @@ static int mp_property_vo_passes(void *ctx, struct m_property *prop,
     return M_PROPERTY_OK;
 }
 
+static int mp_property_motion_info(void *ctx, struct m_property *p, int action,
+                                   void *arg)
+{
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    }
+    MPContext *mpctx = ctx;
+    struct voctrl_motion_info data;
+    if (!mpctx->video_out ||
+        vo_control(mpctx->video_out, VOCTRL_GET_MOTION_INFO, &data) <= 0)
+        return M_PROPERTY_UNAVAILABLE;
+
+    struct m_sub_property props[] = {
+        {"supported", SUB_PROP_BOOL(data.supported)},
+        {"target-fps", SUB_PROP_INT(data.target_fps)},
+        {"state", SUB_PROP_STR(data.state)},
+        {"epoch-ns", SUB_PROP_INT64(data.epoch_ns)},
+        {"timestamp-ns", SUB_PROP_INT64(data.timestamp_ns)},
+        {"source-captures", SUB_PROP_INT64(data.captured)},
+        {"analyzed-pairs", SUB_PROP_INT64(data.analyzed)},
+        {"synthesis-submissions", SUB_PROP_INT64(data.synthesized)},
+        {"repeated-outputs", SUB_PROP_INT64(data.repeated)},
+        {"swapchain-submissions", SUB_PROP_INT64(data.submitted)},
+        {"gpu-capture-ns", SUB_PROP_INT64(data.capture_ns),
+            .unavailable = !data.capture_ns},
+        {"gpu-coarse-pass-ns", SUB_PROP_INT64(data.coarse_ns),
+            .unavailable = !data.coarse_ns},
+        {"gpu-refinement-pass-ns", SUB_PROP_INT64(data.refinement_ns),
+            .unavailable = !data.refinement_ns},
+        {"gpu-warp-pass-ns", SUB_PROP_INT64(data.warp_ns),
+            .unavailable = !data.warp_ns},
+        {"gpu-synthesis-ns", SUB_PROP_INT64(data.synthesis_ns),
+            .unavailable = !data.synthesis_ns},
+        {"last-analysis-width", SUB_PROP_INT(data.analysis_width),
+            .unavailable = !data.analysis_width},
+        {"last-analysis-height", SUB_PROP_INT(data.analysis_height),
+            .unavailable = !data.analysis_height},
+        {"last-synthesis-width", SUB_PROP_INT(data.synthesis_width),
+            .unavailable = !data.synthesis_width},
+        {"last-synthesis-height", SUB_PROP_INT(data.synthesis_height),
+            .unavailable = !data.synthesis_height},
+        {0}
+    };
+    return m_property_read_sub(props, action, arg);
+}
+
 static int mp_property_perf_info(void *ctx, struct m_property *p, int action,
                                  void *arg)
 {
@@ -4964,6 +5011,7 @@ static const struct m_property mp_properties_base[] = {
     {"android-video-surface-frame", mp_property_android_surface_frame},
 #endif
     {"vo-passes", mp_property_vo_passes},
+    {"motion-interpolation-info", mp_property_motion_info},
     {"perf-info", mp_property_perf_info},
     {"current-vo", mp_property_vo},
     {"current-gpu-context", mp_property_gpu_context},
@@ -5106,14 +5154,16 @@ static const char *const *const mp_event_property_change[] = {
       "decoder-frame-drop-count", "frame-drop-count", "video-frame-info",
       "vf-metadata", "af-metadata", "sub-start", "sub-end", "secondary-sub-start",
       "secondary-sub-end", "sub-lines", "secondary-sub-lines", "video-out-params",
-      "video-dec-params", "video-params", "deinterlace-active", "video-target-params"),
+      "video-dec-params", "video-params", "deinterlace-active", "video-target-params",
+      "motion-interpolation-info"),
     E(MP_EVENT_DURATION_UPDATE, "duration"),
     E(MPV_EVENT_VIDEO_RECONFIG, "video-out-params", "video-params",
       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
       "video-dec-params", "osd-dimensions", "hwdec", "hwdec-current", "hwdec-interop",
       "window-id", "track-list", "current-tracks", "current-window-scale",
-      "android-video-surface-transform-active", "android-video-surface-frame"),
+      "android-video-surface-transform-active", "android-video-surface-frame",
+      "motion-interpolation-info"),
     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
       "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",
@@ -5140,7 +5190,7 @@ static const char *const *const mp_event_property_change[] = {
       "playlist-count", "playlist/count", "playlist-current-pos",
       "playlist-playing-pos"),
     E(MP_EVENT_INPUT_PROCESSED, "mouse-pos", "touch-pos", "tablet-pos", "dropped-files"),
-    E(MP_EVENT_CORE_IDLE, "core-idle", "eof-reached"),
+    E(MP_EVENT_CORE_IDLE, "core-idle", "eof-reached", "motion-interpolation-info"),
 };
 #undef E
 

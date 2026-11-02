@@ -3,13 +3,17 @@
 #undef NDEBUG
 #include <assert.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "../video/out/gpu_next/motion_clock.h"
+
 #define mp_assert assert
 #define MP_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define MP_ERR(p, ...) ((void)(p))
+#define MP_INFO(p, ...) ((void)(p))
 
 enum mp_imgfmt { IMGFMT_MEDIACODEC, IMGFMT_RGB0, IMGFMT_YUV420P };
 enum pl_color_primaries { PL_COLOR_PRIM_BT_709, PL_COLOR_PRIM_BT_2020 };
@@ -43,7 +47,107 @@ struct ra { bool uses_pl; };
 struct ra_ctx { struct ra *ra; };
 struct ra_hwdec { struct ra *ra; };
 struct timer_pool { int unused; };
-struct priv { void *gpu, *stats; struct ra_ctx *ra_ctx; };
+struct gl_next_opts { int motion_fps; };
+struct priv {
+    void *gpu, *stats;
+    struct ra_ctx *ra_ctx;
+    void *motion;
+    struct mp_motion_clock motion_clock;
+    int motion_fps;
+    enum motion_state motion_state;
+    bool paused;
+    uint64_t motion_captured, motion_presented;
+    int64_t motion_epoch;
+    struct gl_next_opts *next_opts;
+    bool motion_bypass_reported;
+    uint64_t motion_last_captured, motion_last_presented;
+    struct mp_motion_stats motion_last_stats;
+    int64_t motion_stats_time;
+};
+struct vo_frame {
+    double ideal_frame_duration;
+    double vsync_interval;
+    double approx_duration;
+};
+
+enum { CONF_TYPE_INT, CONF_TYPE_INT64, CONF_TYPE_STRING, CONF_TYPE_BOOL,
+       CONF_TYPE_NODE };
+enum { M_PROPERTY_GET, M_PROPERTY_GET_TYPE, M_PROPERTY_OK = 1,
+       M_PROPERTY_UNAVAILABLE = -1, VOCTRL_GET_MOTION_INFO };
+struct m_option { int type; };
+struct m_property { int unused; };
+struct m_sub_property {
+    const char *name;
+    struct m_option type;
+    union { int int_; int64_t int64; char *string; bool bool_; } value;
+    bool unavailable;
+};
+struct vo { struct priv *priv; };
+typedef struct { struct vo *video_out; } MPContext;
+
+static struct mp_motion_stats motion_stats;
+static struct m_sub_property motion_properties[24];
+static bool gpu_supported = true;
+static bool motion_control_available = true;
+static int motion_control_calls;
+static bool motion_create_fail;
+static int motion_create_calls, motion_destroy_calls, motion_queue_resets;
+
+static struct mp_motion_stats mp_motion_get_stats(void *motion)
+{
+    return motion ? motion_stats : (struct mp_motion_stats){0};
+}
+
+static bool mp_motion_supported(void *gpu)
+{
+    return gpu && gpu_supported;
+}
+
+static void *mp_motion_create(void *gpu, int max_dimension)
+{
+    assert(gpu && max_dimension == 480);
+    motion_create_calls++;
+    motion_stats = (struct mp_motion_stats){0};
+    return motion_create_fail ? NULL : (void *)2;
+}
+
+static void mp_motion_destroy(void **motion)
+{
+    motion_destroy_calls++;
+    *motion = NULL;
+}
+
+static void reset_frame_queue(struct priv *p)
+{
+    (void)p;
+    motion_queue_resets++;
+}
+
+static int64_t mp_time_ns(void) { return 123456789; }
+static void get_motion_info(struct priv *p, struct voctrl_motion_info *info);
+
+static int vo_control(struct vo *vo, int request, void *data)
+{
+    assert(request == VOCTRL_GET_MOTION_INFO);
+    motion_control_calls++;
+    if (!motion_control_available)
+        return -1;
+    get_motion_info(vo->priv, data);
+    return 1;
+}
+
+static int m_property_read_sub(const struct m_sub_property *props, int action,
+                               void *arg)
+{
+    (void)arg;
+    assert(action == M_PROPERTY_GET);
+    int count = 0;
+    do {
+        assert(count < MP_ARRAY_SIZE(motion_properties));
+        motion_properties[count] = props[count];
+    } while (props[count++].name);
+    return M_PROPERTY_OK;
+}
 
 static struct {
     int creates, frees, maps, unmaps, timer_creates, timer_destroys;
@@ -278,6 +382,175 @@ static void test_metadata_and_failure(struct priv *p, struct ra_hwdec *hwdec)
     slot_uninit(p, &slot);
 }
 
+static const struct m_sub_property *motion_property(const char *name)
+{
+    for (int n = 0; motion_properties[n].name; n++) {
+        if (strcmp(motion_properties[n].name, name) == 0)
+            return &motion_properties[n];
+    }
+    abort();
+}
+
+static void check_motion_event(const char *const *properties)
+{
+    for (int n = 0; properties[n]; n++) {
+        if (strcmp(properties[n], "motion-interpolation-info") == 0)
+            return;
+    }
+    abort();
+}
+
+static void test_motion_info(void)
+{
+    check_motion_event(event_MPV_EVENT_TICK);
+    check_motion_event(event_MPV_EVENT_VIDEO_RECONFIG);
+    check_motion_event(event_MP_EVENT_CORE_IDLE);
+    MPContext context = {0};
+    struct m_option type;
+    assert(mp_property_motion_info(&context, NULL, M_PROPERTY_GET_TYPE, &type) == M_PROPERTY_OK);
+    assert(type.type == CONF_TYPE_NODE && motion_control_calls == 0);
+    assert(mp_property_motion_info(&context, NULL, M_PROPERTY_GET, NULL) == M_PROPERTY_UNAVAILABLE);
+    assert(motion_control_calls == 0);
+    struct priv p = {
+        .gpu = (void *)1, .motion = (void *)2, .motion_fps = 120,
+        .motion_state = MOTION_ACTIVE, .motion_captured = UINT64_C(1) << 40,
+        .motion_presented = (UINT64_C(1) << 40) + 99,
+        .motion_epoch = 1000,
+    };
+    struct vo vo = {.priv = &p};
+    context.video_out = &vo;
+    motion_control_available = false;
+    assert(mp_property_motion_info(&context, NULL, M_PROPERTY_GET, NULL) == M_PROPERTY_UNAVAILABLE);
+    motion_control_available = true;
+    motion_stats = (struct mp_motion_stats) {
+        .analyzed_pairs = 17, .generated_frames = 31, .repeated_frames = 7,
+        .capture_ns = 100, .coarse_ns = 200, .refinement_ns = 300,
+        .warp_ns = 400, .synthesis_ns = 500,
+        .analysis_width = 480, .analysis_height = 270,
+        .synthesis_width = 1920, .synthesis_height = 1080,
+    };
+    assert(mp_property_motion_info(&context, NULL, M_PROPERTY_GET, NULL) == M_PROPERTY_OK);
+    assert(motion_property("supported")->type.type == CONF_TYPE_BOOL);
+    assert(motion_property("supported")->value.bool_);
+    assert(motion_property("target-fps")->value.int_ == 120);
+    assert(strcmp(motion_property("state")->value.string, "active") == 0);
+    assert(motion_property("timestamp-ns")->value.int64 == 123456789);
+    assert(motion_property("epoch-ns")->value.int64 == 1000);
+    assert(motion_property("source-captures")->type.type == CONF_TYPE_INT64);
+    assert(motion_property("source-captures")->value.int64 == (INT64_C(1) << 40));
+    assert(motion_property("swapchain-submissions")->value.int64 == (INT64_C(1) << 40) + 99);
+    assert(motion_property("analyzed-pairs")->value.int64 == 17);
+    assert(motion_property("synthesis-submissions")->value.int64 == 31);
+    assert(motion_property("repeated-outputs")->value.int64 == 7);
+    assert(motion_property("gpu-capture-ns")->value.int64 == 100);
+    assert(motion_property("gpu-coarse-pass-ns")->value.int64 == 200);
+    assert(motion_property("gpu-refinement-pass-ns")->value.int64 == 300);
+    assert(motion_property("gpu-warp-pass-ns")->value.int64 == 400);
+    assert(motion_property("gpu-synthesis-ns")->value.int64 == 500);
+    assert(motion_property("last-analysis-width")->value.int_ == 480);
+    assert(motion_property("last-analysis-height")->value.int_ == 270);
+    assert(motion_property("last-synthesis-width")->value.int_ == 1920);
+    assert(motion_property("last-synthesis-height")->value.int_ == 1080);
+    p.paused = true;
+    assert(mp_property_motion_info(&context, NULL, M_PROPERTY_GET, NULL) == M_PROPERTY_OK);
+    assert(strcmp(motion_property("state")->value.string, "paused") == 0);
+    assert(motion_property("epoch-ns")->value.int64 == 1000);
+    p = (struct priv){.gpu = (void *)1};
+    gpu_supported = false;
+    assert(mp_property_motion_info(&context, NULL, M_PROPERTY_GET, NULL) == M_PROPERTY_OK);
+    assert(!motion_property("supported")->value.bool_);
+    assert(strcmp(motion_property("state")->value.string, "disabled") == 0);
+    assert(motion_property("synthesis-submissions")->value.int64 == 0);
+    assert(motion_property("epoch-ns")->value.int64 == 0);
+    assert(motion_property("gpu-synthesis-ns")->unavailable);
+    assert(motion_property("last-synthesis-width")->unavailable);
+    p.motion_fps = 60;
+    p.motion_state = MOTION_UNSUPPORTED;
+    assert(!motion_backend_failed(&p));
+    report_motion_stats(&vo, true);
+    assert(p.motion_presented == 1);
+    report_motion_stats(&vo, false);
+    assert(p.motion_presented == 1);
+    assert(mp_property_motion_info(&context, NULL, M_PROPERTY_GET, NULL) == M_PROPERTY_OK);
+    assert(strcmp(motion_property("state")->value.string, "unsupported") == 0);
+    p.motion_state = MOTION_ERROR;
+    assert(motion_backend_failed(&p));
+    assert(mp_property_motion_info(&context, NULL, M_PROPERTY_GET, NULL) == M_PROPERTY_OK);
+    assert(strcmp(motion_property("state")->value.string, "error") == 0);
+    gpu_supported = true;
+    puts("motion info: backend capability, state, 64-bit counters, timing and unavailable data passed");
+}
+
+static void test_motion_capability_transition(void)
+{
+    struct gl_next_opts options = {.motion_fps = 60};
+    struct priv p = {
+        .gpu = (void *)1, .next_opts = &options,
+        .motion_captured = 20, .motion_presented = 30,
+    };
+    struct vo vo = {.priv = &p};
+    gpu_supported = false;
+    update_motion_options(&vo);
+    assert(p.motion_state == MOTION_UNSUPPORTED && !p.motion);
+    assert(p.motion_fps == 60 && !motion_backend_failed(&p));
+    assert(p.motion_captured == 0 && p.motion_presented == 0);
+    assert(p.motion_epoch == 123456789);
+    assert(motion_create_calls == 0);
+    assert(motion_destroy_calls == 1 && motion_queue_resets == 1);
+    update_motion_options(&vo);
+    assert(motion_destroy_calls == 1 && motion_queue_resets == 1);
+    gpu_supported = true;
+    options.motion_fps = 120;
+    update_motion_options(&vo);
+    assert(p.motion_state == MOTION_READY && p.motion);
+    assert(p.motion_fps == 120 && !motion_backend_failed(&p));
+    assert(motion_create_calls == 1);
+    motion_create_fail = true;
+    options.motion_fps = 60;
+    update_motion_options(&vo);
+    assert(p.motion_state == MOTION_ERROR && !p.motion);
+    assert(motion_backend_failed(&p));
+    assert(motion_create_calls == 2);
+    options.motion_fps = 0;
+    update_motion_options(&vo);
+    assert(p.motion_state == MOTION_DISABLED && !p.motion);
+    assert(!motion_backend_failed(&p));
+    assert(motion_create_calls == 2);
+    assert(motion_destroy_calls == 4 && motion_queue_resets == 4);
+    motion_create_fail = false;
+    puts("motion capability: unsupported GPU passes through; initialization failures remain fatal");
+}
+
+static void test_motion_cadence(double display_fps, double source_fps,
+                               int target_fps, double speed,
+                               bool interpolate, int expected_changes)
+{
+    struct priv p = {.motion = (void *)1, .motion_fps = target_fps};
+    struct vo_frame frame = {
+        .ideal_frame_duration = 1.0 / (source_fps * speed),
+        .approx_duration = 1.0 / source_fps,
+        .vsync_interval = 1.0 / display_fps,
+    };
+    bool needed = motion_interpolation_needed(&p, &frame);
+    assert(needed == interpolate);
+    double previous = -1;
+    int changes = 0;
+    for (int i = 0; i < (int) display_fps * 3; i++) {
+        double pts = i * speed / display_fps;
+        if (!needed)
+            pts = floor(pts * source_fps + 1e-7) / source_fps;
+        double output = needed ? motion_output_pts(&p, &frame, pts) : pts;
+        if (output > previous)
+            changes++;
+        assert(output >= previous && output <= pts + 1e-8);
+        previous = output;
+    }
+    printf("motion cadence: source=%.0f speed=%.1f target=%d display=%.0f "
+           "timestamps=%d in 3 seconds\n",
+           source_fps, speed, target_fps, display_fps, changes);
+    assert(changes == expected_changes);
+}
+
 int main(void)
 {
     struct ra ra = {.uses_pl = true};
@@ -288,6 +561,19 @@ int main(void)
     test_format(&p, &hwdec);
     test_hwdec_change(&p, &hwdec);
     test_metadata_and_failure(&p, &hwdec);
+    test_motion_info();
+    test_motion_capability_transition();
+    test_motion_cadence(120, 120, 60, 1, false, 360);
+    test_motion_cadence(120, 60, 60, 1, false, 180);
+    test_motion_cadence(120, 24, 60, 1, true, 180);
+    test_motion_cadence(144, 24, 60, 1, true, 180);
+    test_motion_cadence(60, 24, 120, 1, true, 180);
+    test_motion_cadence(60, 60, 120, 1, false, 180);
+    test_motion_cadence(120, 60, 120, 1, true, 360);
+    test_motion_cadence(120, 24, 60, 3, false, 216);
+    test_motion_cadence(60, 24, 120, 3, false, 180);
+    test_motion_cadence(120, 120, 60, 0.5, false, 180);
+    puts("gpu-next motion target preserves source cadence and playback speed");
     puts("gpu-next mapper aspect, format, metadata and failure tests passed");
     return 0;
 }
