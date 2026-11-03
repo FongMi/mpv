@@ -77,6 +77,22 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+motion_clock = executable('motion-clock', 'motion_clock.c',
+                          include_directories: incdir, dependencies: libm)
+test('motion-clock', motion_clock)
+
+if features['vulkan']
+    motion_shaders = custom_target('motion-shaders',
+        input: files('../video/out/gpu_next/motion.c'),
+        output: 'gpu_motion_shaders.h',
+        command: [python, files('gpu_motion.py'), '--source', '@INPUT@',
+                  '--generate', '@OUTPUT@'])
+    gpu_motion = executable('gpu-motion',
+        ['gpu_motion.c', '../video/out/gpu_next/motion.c', motion_shaders],
+        include_directories: incdir, dependencies: [libplacebo, libm])
+    test('gpu-motion', gpu_motion, suite: 'gpu')
+endif
+
 disc_still_header = custom_target('disc-still-functions',
     input: files('../demux/demux_disc.c', '../stream/stream_bluray.c'),
     depend_files: files('vo_android_frame.py'),
@@ -100,6 +116,8 @@ if features['lua']
     if lua_test.found()
         test('stats-audio', lua_test,
              args: [files('stats_audio.lua'), files('../player/lua/stats.lua')])
+        test('stats-motion', lua_test,
+             args: [files('stats_motion.lua'), files('../player/lua/stats.lua')])
     endif
 endif
 
@@ -206,12 +224,15 @@ test('gpu-dumb', gpu_dumb)
 
 gpu_next_headers = custom_target('gpu-next-mapping-headers',
     input: files('../video/mp_image.h', '../video/out/gpu/hwdec.h',
-                 '../video/mp_image.c', '../video/out/vo_gpu_next.c'),
+                 '../video/mp_image.c', '../video/out/vo_gpu_next.c',
+                 '../video/out/gpu_next/motion.h', '../video/out/vo.h',
+                 '../player/command.c', '../options/m_property.h'),
     output: ['vo_gpu_next_contracts.h', 'vo_gpu_next_functions.h'],
     command: [python, files('vo_gpu_next.py'), '--mpv', source_root,
               '--generate', '@OUTPUT0@', '@OUTPUT1@'])
 gpu_next_mapping = executable('gpu-next-mapping',
-                              ['vo_gpu_next.c', gpu_next_headers])
+                              ['vo_gpu_next.c', gpu_next_headers],
+                              dependencies: libm)
 test('gpu-next-mapping', gpu_next_mapping)
 
 android_osd_source = custom_target('android-osd-contracts-source',

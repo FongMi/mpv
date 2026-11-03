@@ -1064,6 +1064,42 @@ local function add_video(s)
 end
 
 
+local motion_last
+
+local function add_motion(s)
+    local info = mp.get_property_native("motion-interpolation-info")
+    if not info then
+        motion_last = nil
+        return
+    end
+
+    append(s, info.state, {prefix="MEMC:"})
+    if info["target-fps"] > 0 then
+        append(s, format("target %d fps", info["target-fps"]),
+               {prefix="(", suffix=")", nl="", indent=" ", prefix_sep="",
+                no_prefix_markup=true})
+    end
+    local last = motion_last
+    motion_last = info["target-fps"] > 0 and info or nil
+    if last and motion_last and info["epoch-ns"] == last["epoch-ns"] and
+       info["timestamp-ns"] > last["timestamp-ns"] and
+       info["swapchain-submissions"] >= last["swapchain-submissions"] and
+       info["synthesis-submissions"] >= last["synthesis-submissions"] then
+        local seconds = (info["timestamp-ns"] - last["timestamp-ns"]) / 1e9
+        local submitted = info["swapchain-submissions"] - last["swapchain-submissions"]
+        local synthesized = info["synthesis-submissions"] - last["synthesis-submissions"]
+        append(s, format("%.1f/s, synthesis %.1f/s", submitted / seconds,
+                         synthesized / seconds), {prefix="MEMC submissions:"})
+    end
+    if info["last-analysis-width"] and info["last-analysis-height"] and
+       info["last-synthesis-width"] and info["last-synthesis-height"] then
+        append(s, format("%dx%d ➜ %dx%d", info["last-analysis-width"],
+                         info["last-analysis-height"], info["last-synthesis-width"],
+                         info["last-synthesis-height"]), {prefix="Last motion resolution:"})
+    end
+end
+
+
 local function add_audio(s)
     local r = mp.get_property_native("audio-params")
     local output = mp.get_property_native("audio-out-params")
@@ -1199,6 +1235,7 @@ local function default_stats(_, plain_text)
     add_file(stats, true, false)
     add_video_out(stats)
     add_video(stats)
+    add_motion(stats)
     add_audio(stats)
     return finalize_page({}, stats, false, plain_text)
 end

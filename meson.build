@@ -271,6 +271,7 @@ sources = files(
     'video/out/placebo/utils.c',
     'video/out/vo_gpu_next.c',
     'video/out/gpu_next/context.c',
+    'video/out/gpu_next/motion.c',
 
     ## osdep
     'osdep/io.c',
