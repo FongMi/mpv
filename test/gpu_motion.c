@@ -715,6 +715,7 @@ static void synthesis_policy(pl_gpu gpu)
         };
         pl_shader shader = pl_dispatch_begin(dispatch);
         assert(pl_shader_custom(shader, &(struct pl_custom_shader) {
+            .header = test_sample_header,
             .body = test_synthesis_body,
             .compute = true, .compute_group_size = {8, 8},
             .output = PL_SHADER_SIG_COLOR,
@@ -1111,6 +1112,152 @@ static void capabilities(pl_gpu gpu)
     assert(mp_motion_supported(&limited));
 }
 
+static float reference_sample(const float *pixels, int width, int height,
+                              float x, float y, int channel)
+{
+    x = fminf(width - 1, fmaxf(0, x));
+    y = fminf(height - 1, fmaxf(0, y));
+    int x0 = (int)floorf(x), y0 = (int)floorf(y);
+    int x1 = x0 + 1 < width ? x0 + 1 : x0;
+    int y1 = y0 + 1 < height ? y0 + 1 : y0;
+    float fx = x - x0, fy = y - y0;
+    float a = pixels[(y0 * width + x0) * 4 + channel];
+    float b = pixels[(y0 * width + x1) * 4 + channel];
+    float c = pixels[(y1 * width + x0) * 4 + channel];
+    float d = pixels[(y1 * width + x1) * 4 + channel];
+    return (a + fx * (b - a)) * (1 - fy) + (c + fx * (d - c)) * fy;
+}
+
+static float reference_smooth(float lo, float hi, float value)
+{
+    float t = fminf(1, fmaxf(0, (value - lo) / (hi - lo)));
+    return t * t * (3 - 2 * t);
+}
+
+static void synthesis_sampling(pl_gpu gpu)
+{
+    int width = 1920, height = 1080;
+    size_t bytes = (size_t)width * height * 4 * sizeof(float);
+    float *pixels = malloc(bytes), *first = malloc(bytes);
+    float *second = malloc(bytes), *output = malloc(bytes);
+    assert(pixels && first && second && output);
+    pl_dispatch dispatch = pl_dispatch_create(gpu->log, gpu);
+    bool failed = false;
+    for (int test = 0; test < 3; test++) {
+        width = test == 2 ? 127 : 1920;
+        height = test == 2 ? 95 : 1080;
+        float shift = test ? .30029296875f : 6;
+        diagonal_pixels(pixels, width, height, 4, 0, true, 0);
+        for (int y = 0; y < height; y++) for (int x = 0; x < width; x++)
+            for (int c = 0; c < 3; c++) {
+                int index = (y * width + x) * 4 + c;
+                pixels[index] = fminf(1, fmaxf(0, pixels[index] +
+                    (noise(x, y, c) - .5f) / 255));
+            }
+        if (test == 2) for (int y = 0; y < height; y++) for (int x = 0; x < width; x++)
+            pixels[(y * width + x) * 4 + 3] = (float)x / (width - 1);
+        pl_tex a = upload_size(gpu, pixels, width, height);
+        diagonal_pixels(pixels, width, height, 4, shift, true, 0);
+        for (int y = 0; y < height; y++) for (int x = 0; x < width; x++)
+            for (int c = 0; c < 3; c++) {
+                int index = (y * width + x) * 4 + c;
+                pixels[index] = fminf(1, fmaxf(0, pixels[index] +
+                    (noise(x, y, c + (int)(shift * 4)) - .5f) / 255));
+            }
+        if (test == 2) for (int y = 0; y < height; y++) for (int x = 0; x < width; x++)
+            pixels[(y * width + x) * 4 + 3] = (float)y / (height - 1);
+        pl_tex b = upload_size(gpu, pixels, width, height);
+        readback(gpu, a, first);
+        readback(gpu, b, second);
+        pl_fmt format = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 0,
+            PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_STORABLE);
+        assert(format);
+        pl_tex target = pl_tex_create(gpu, pl_tex_params(
+            .w = width, .h = height, .format = format,
+            .sampleable = true, .renderable = true, .storable = true));
+        assert(target);
+        for (int step = 1; step <= 3; step++) {
+            float alpha = step * .25f;
+            pl_tex maps[3];
+            float displacement[2];
+            for (int direction = 0; direction < 3; direction++) {
+                for (int i = 0; i < 480 * 270; i++) {
+                    pixels[i * 4] = 0;
+                    pixels[i * 4 + 1] = direction == 0 ? -alpha * shift :
+                        direction == 1 ? (1 - alpha) * shift : 0;
+                    pixels[i * 4 + 2] = direction < 2 ? .0625f : 0;
+                    pixels[i * 4 + 3] = 1;
+                }
+                maps[direction] = upload_size(gpu, pixels, 480, 270);
+                if (direction < 2) {
+                    readback(gpu, maps[direction], pixels);
+                    displacement[direction] = pixels[1] * ((float)height / 270);
+                }
+            }
+            struct pl_shader_desc descriptors[] = {
+                policy_sampled("first", a), policy_sampled("second", b),
+                policy_sampled("forward", maps[0]), policy_sampled("backward", maps[1]),
+                policy_sampled("scene", maps[2]),
+            };
+            float size[] = {width, height}, motion_size[] = {480, 270};
+            struct pl_shader_var variables[] = {
+                {.var = pl_var_vec2("motion_size"), .data = motion_size},
+                {.var = pl_var_vec2("output_size"), .data = size},
+                {.var = pl_var_float("alpha"), .data = &alpha},
+            };
+            pl_shader shader = pl_dispatch_begin(dispatch);
+            assert(pl_shader_custom(shader, &(struct pl_custom_shader) {
+                .header = test_sample_header, .body = test_synthesis_body,
+                .compute = true, .compute_group_size = {8, 8},
+                .output = PL_SHADER_SIG_COLOR,
+                .descriptors = descriptors, .num_descriptors = 5,
+                .variables = variables, .num_variables = 3,
+            }));
+            assert(pl_dispatch_finish(dispatch, pl_dispatch_params(
+                .shader = &shader, .target = target,
+            )));
+            readback(gpu, target, output);
+            float maximum = 0;
+            int worst_x = 0, worst_y = 0;
+            int border = test == 2 ? 0 : 64;
+            for (int y = border; y < height - border; y++) {
+                for (int x = border; x < width - border; x++) {
+                    float wa[4], wb[4], conflict = 0;
+                    for (int c = 0; c < 4; c++) {
+                        wa[c] = reference_sample(first, width, height, x, y + displacement[0], c);
+                        wb[c] = reference_sample(second, width, height, x, y + displacement[1], c);
+                        if (c < 3) conflict = fmaxf(conflict, fabsf(wa[c] - wb[c]));
+                    }
+                    // Known geometry is reliable; coarse-match quality is lower.
+                    float trust = fmaxf(.0625f, 1 - reference_smooth(.002f, .02f, conflict));
+                    trust *= 1 - reference_smooth(.03f, .15f, conflict);
+                    for (int c = 0; c < 4; c++) {
+                        int index = (y * width + x) * 4 + c;
+                        float original = first[index] * (1 - alpha) + second[index] * alpha;
+                        float warped = wa[c] * (1 - alpha) + wb[c] * alpha;
+                        float expected = original * (1 - trust) + warped * trust;
+                        assert(isfinite(output[index]) && isfinite(expected));
+                        float difference = fabsf(output[index] - expected);
+                        if (difference > maximum) {
+                            maximum = difference; worst_x = x; worst_y = y;
+                        }
+                    }
+                }
+            }
+            printf("synthesis sampling case=%d alpha=%.2f max=%.9g at=%d,%d\n",
+                   test, alpha, maximum, worst_x, worst_y);
+            fflush(stdout);
+            failed |= maximum >= .002f;
+            for (int i = 0; i < 3; i++) pl_tex_destroy(gpu, &maps[i]);
+        }
+        pl_tex_destroy(gpu, &a); pl_tex_destroy(gpu, &b);
+        pl_tex_destroy(gpu, &target);
+    }
+    free(pixels); free(first); free(second); free(output);
+    pl_dispatch_destroy(&dispatch);
+    assert(!failed);
+}
+
 int main(void)
 {
     pl_log log = pl_log_create(PL_API_VER, pl_log_params(
@@ -1164,6 +1311,7 @@ int main(void)
         diagonal_edge(vulkan->gpu, motion, false, variant);
         diagonal_edge(vulkan->gpu, motion, true, variant);
     }
+    synthesis_sampling(vulkan->gpu);
     mp_motion_destroy(&motion);
     pl_vulkan_destroy(&vulkan);
     assert(gpu_errors == 0);

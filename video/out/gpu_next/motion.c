@@ -33,18 +33,23 @@ struct mp_motion {
 };
 
 static const char sample_header[] = GLSL(
-    vec3 sample_color(sampler2D image, vec2 p)
+    vec4 sample_rgba(sampler2D image, vec2 p)
     {
         ivec2 size = textureSize(image, 0);
         p = clamp(p, vec2(0), vec2(size - 1));
         ivec2 lo = ivec2(floor(p));
         ivec2 hi = min(lo + ivec2(1), size - 1);
         vec2 fraction = p - vec2(lo);
-        vec3 a = texelFetch(image, lo, 0).rgb;
-        vec3 b = texelFetch(image, ivec2(hi.x, lo.y), 0).rgb;
-        vec3 c = texelFetch(image, ivec2(lo.x, hi.y), 0).rgb;
-        vec3 d = texelFetch(image, hi, 0).rgb;
+        vec4 a = texelFetch(image, lo, 0);
+        vec4 b = texelFetch(image, ivec2(hi.x, lo.y), 0);
+        vec4 c = texelFetch(image, ivec2(lo.x, hi.y), 0);
+        vec4 d = texelFetch(image, hi, 0);
         return mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
+    }
+
+    vec3 sample_color(sampler2D image, vec2 p)
+    {
+        return sample_rgba(image, p).rgb;
     }
 );
 
@@ -429,8 +434,10 @@ static const char warp_body[] = GLSL(
 
 static const char synthesis_body[] = GLSL(
     vec2 uv = (vec2(gl_GlobalInvocationID.xy) + 0.5) / output_size;
-    vec4 original0 = textureLod(first, uv, 0.0);
-    vec4 original1 = textureLod(second, uv, 0.0);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 source_pixel = clamp(pixel, ivec2(0), textureSize(first, 0) - 1);
+    vec4 original0 = texelFetch(first, source_pixel, 0);
+    vec4 original1 = texelFetch(second, source_pixel, 0);
     vec2 scene_change = texelFetch(scene, ivec2(0), 0).rg;
     if (scene_change.r > 0.45 || scene_change.g > 0.08) {
         color = alpha < 0.5 ? original0 : original1;
@@ -442,10 +449,10 @@ static const char synthesis_body[] = GLSL(
             f = vec4(0.0);
             r = vec4(0.0);
         }
-        vec2 a = uv + f.xy / motion_size;
-        vec2 b = uv + r.xy / motion_size;
-        vec4 warped0 = textureLod(first, a, 0.0);
-        vec4 warped1 = textureLod(second, b, 0.0);
+        // Match the photometric data term in source pixel coordinates.
+        vec2 scale = output_size / motion_size;
+        vec4 warped0 = sample_rgba(first, vec2(pixel) + f.xy * scale);
+        vec4 warped1 = sample_rgba(second, vec2(pixel) + r.xy * scale);
         vec3 conflict = abs(warped0.rgb - warped1.rgb);
         float color_error = max(conflict.r, max(conflict.g, conflict.b));
         // An edge can constrain motion without a unique tangential match.
