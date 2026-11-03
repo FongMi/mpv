@@ -1231,6 +1231,7 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
     // A bad guess, only needed when reverting to audio sync.
     mpctx->time_frame = isnan(time_left) ? 0 : time_left;
 
+    frame->display_vsync_interval = vsync;
     frame->vsync_interval = vsync;
     frame->vsync_offset = -prev_error;
     frame->ideal_frame_duration = frame_duration;

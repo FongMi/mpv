@@ -32,8 +32,10 @@ struct mp_image;
 struct mp_image_params;
 struct mp_log;
 struct mpv_global;
+struct stats_ctx;
 struct vo;
 struct vo_frame;
+struct voctrl_motion_info;
 struct voctrl_performance_data;
 struct voctrl_screenshot;
 
@@ -70,6 +72,7 @@ bool mppl_video_begin_frame(struct mppl_video *p, struct vo_frame *frame,
                             bool *backend_error);
 enum mppl_video_hint mppl_video_get_target_hint(struct mppl_video *p, struct vo_frame *frame,
                                                 struct pl_color_space *out_hint);
+bool mppl_video_take_source_capture_error(struct mppl_video *p);
 void mppl_video_skip_frame(struct mppl_video *p, struct vo_frame *frame);
 bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
                              const struct pl_swapchain_frame *swframe, int fb_depth,
@@ -79,6 +82,10 @@ bool mppl_video_render_frame(struct mppl_video *p, struct vo_frame *frame,
                              bool *rendered_video, bool *backend_error);
 bool mppl_video_get_hdr_metadata(struct mppl_video *p, struct pl_hdr_metadata *out);
 enum pl_color_levels mppl_video_get_output_levels(struct mppl_video *p);
+bool mppl_video_prepare_decoder_flush(struct mppl_video *p, const struct vo_frame *frame);
+void mppl_video_report_motion_stats(struct mppl_video *p, bool submitted);
+void mppl_video_get_motion_info(struct mppl_video *p, struct voctrl_motion_info *info);
+struct stats_ctx *mppl_video_stats(struct mppl_video *p);
 void mppl_video_set_paused(struct mppl_video *p, bool paused);
 bool mppl_video_showing_interpolated_frame(struct mppl_video *p);
 void mppl_video_reset(struct mppl_video *p);

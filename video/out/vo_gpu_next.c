@@ -22,6 +22,7 @@
 
 #include "common/common.h"
 #include "common/msg.h"
+#include "common/stats.h"
 #include "misc/bstr.h"
 #include "options/m_config.h"
 #include "sub/osd.h"
@@ -43,6 +44,7 @@ struct priv {
     struct gpu_ctx *context;
     pl_swapchain sw;
     struct mppl_video *renderer;
+    struct stats_ctx *stats;
     bool frame_pending;
 #if HAVE_ANDROID
     struct android_osd_overlay *osd_overlay;
@@ -130,6 +132,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     pl_swapchain pl_sw = get_active_swapchain(p);
     if (!pl_sw || !should_draw || !pl_swapchain_start_frame(pl_sw, &swframe)) {
         mppl_video_skip_frame(p->renderer, frame);
+        if (mppl_video_take_source_capture_error(p->renderer))
+            vo_report_backend_error(vo);
         return VO_FALSE;
     }
 
@@ -168,6 +172,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     return VO_TRUE;
 }
 
+static void publish_motion_info(struct vo *vo, struct mppl_video *renderer)
+{
+    struct voctrl_motion_info info;
+    mppl_video_get_motion_info(renderer, &info);
+    vo_set_motion_info(vo, &info);
+}
+
 static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
@@ -176,21 +187,36 @@ static void flip_page(struct vo *vo)
 
     bool submitted = false;
     if (p->frame_pending) {
+        stats_time_start(p->stats, "present-submit");
         submitted = pl_sw && pl_swapchain_submit_frame(pl_sw);
+        stats_time_end(p->stats, "present-submit");
         if (pl_sw && !submitted)
             MP_ERR(vo, "Failed presenting frame!\n");
         p->frame_pending = false;
     }
 
 #if HAVE_ANDROID
-    if (!submitted)
+    if (!submitted) {
+        stats_time_start(p->stats, "present-notify");
         vo_android_surface_frame_drawn(vo, 0, 0);
+        stats_time_end(p->stats, "present-notify");
+    }
 #endif
+    stats_time_start(p->stats, "present-swap");
     sw->fns->swap_buffers(sw);
+    stats_time_end(p->stats, "present-swap");
+    mppl_video_report_motion_stats(p->renderer, submitted);
+    publish_motion_info(vo, p->renderer);
 #if HAVE_ANDROID
-    if (submitted && strcmp(p->ra_ctx->fns->type, "vulkan") == 0)
+    if (submitted && strcmp(p->ra_ctx->fns->type, "vulkan") == 0) {
+        stats_time_start(p->stats, "present-notify");
         vo_android_surface_frame_presented(vo, vo->dwidth, vo->dheight);
-    if (!android_osd_overlay_present(p->osd_overlay)) {
+        stats_time_end(p->stats, "present-notify");
+    }
+    stats_time_start(p->stats, "present-osd");
+    bool osd_ok = android_osd_overlay_present(p->osd_overlay);
+    stats_time_end(p->stats, "present-osd");
+    if (!osd_ok) {
         vo_event(vo, VO_EVENT_WIN_STATE);
         vo_report_backend_error(vo);
     }
@@ -201,8 +227,11 @@ static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
 {
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
-    if (sw->fns->get_vsync)
+    if (sw->fns->get_vsync) {
+        stats_time_start(p->stats, "present-vsync");
         sw->fns->get_vsync(sw, info);
+        stats_time_end(p->stats, "present-vsync");
+    }
 }
 
 static int query_format(struct vo *vo, int format)
@@ -315,13 +344,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
         if (mppl_video_showing_interpolated_frame(p->renderer))
             vo->want_redraw = true;
         mppl_video_set_paused(p->renderer, true);
+        publish_motion_info(vo, p->renderer);
         return VO_TRUE;
     case VOCTRL_RESUME:
         mppl_video_set_paused(p->renderer, false);
+        publish_motion_info(vo, p->renderer);
         return VO_TRUE;
 
     case VOCTRL_UPDATE_RENDER_OPTS: {
         mppl_video_reload_options(p->renderer);
+        publish_motion_info(vo, p->renderer);
         mppl_video_configure_queue(p->renderer, vo);
 
         p->ra_ctx->opts.want_alpha = mppl_video_want_alpha(p->renderer);
@@ -338,8 +370,12 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return VO_TRUE;
     }
 
+    case VOCTRL_PREPARE_DECODER_FLUSH:
+        return mppl_video_prepare_decoder_flush(p->renderer, data) ? VO_TRUE : VO_FALSE;
+
     case VOCTRL_RESET:
         mppl_video_reset(p->renderer);
+        publish_motion_info(vo, p->renderer);
         return VO_TRUE;
 
     case VOCTRL_PERFORMANCE_DATA:
@@ -348,6 +384,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
 
     case VOCTRL_SCREENSHOT:
         mppl_video_screenshot(p->renderer, data);
+        if (mppl_video_take_source_capture_error(p->renderer))
+            vo_report_backend_error(vo);
         return true;
 
     case VOCTRL_EXTERNAL_RESIZE:
@@ -399,6 +437,7 @@ static void uninit(struct vo *vo)
     android_osd_overlay_destroy(p->osd_overlay);
 #endif
 
+    vo_set_motion_info(vo, NULL);
     mppl_video_uninit(p->renderer);
     hwdec_devices_set_loader(vo->hwdec_devs, NULL, NULL);
     hwdec_devices_destroy(vo->hwdec_devs);
@@ -436,6 +475,10 @@ static int preinit(struct vo *vo)
 #endif
 
     p->renderer = mppl_video_init(vo->log, vo->global, p->context);
+    if (!p->renderer)
+        goto fail;
+    p->stats = mppl_video_stats(p->renderer);
+    publish_motion_info(vo, p->renderer);
     mppl_video_set_osd_source(p->renderer, vo->osd);
     mppl_video_configure_queue(p->renderer, vo);
 

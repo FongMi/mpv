@@ -106,6 +106,7 @@ struct mppl_video {
 struct priv {
     struct ra_ctx *ra_ctx;
     struct mppl_video *renderer;
+    void *stats;
     bool frame_pending;
     void *osd_overlay;
     bool submitted_video;
@@ -185,6 +186,18 @@ int vo_control(struct vo *vo, int request, void *out)
 static pl_swapchain get_active_swapchain(struct priv *p) { return p; }
 static bool pl_swapchain_submit_frame(pl_swapchain sw) { (void)sw; return submit_ok; }
 static bool android_osd_overlay_present(void *overlay) { (void)overlay; return true; }
+static void stats_time_start(void *stats, const char *name) { (void)stats; (void)name; }
+static void stats_time_end(void *stats, const char *name) { (void)stats; (void)name; }
+static void publish_motion_info(struct vo *vo, struct mppl_video *renderer)
+{
+    (void)vo;
+    (void)renderer;
+}
+static void mppl_video_report_motion_stats(struct mppl_video *renderer, bool submitted)
+{
+    (void)renderer;
+    (void)submitted;
+}
 static int osd_geometry_invalidations;
 static void android_osd_overlay_invalidate_geometry(void *overlay)
 {

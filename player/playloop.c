@@ -241,6 +241,8 @@ void step_frame_mute(struct MPContext *mpctx, bool mute)
 // Clear some playback-related fields on file loading or after seeks.
 void reset_playback_state(struct MPContext *mpctx)
 {
+    if (mpctx->video_out)
+        vo_prepare_decoder_flush(mpctx->video_out);
     mp_filter_reset(mpctx->filter_root);
 
     reset_video_state(mpctx);
