@@ -179,6 +179,11 @@ int vo_control(struct vo *vo, int request, void *out)
 static pl_swapchain get_active_swapchain(struct priv *p) { return p; }
 static bool pl_swapchain_submit_frame(pl_swapchain sw) { (void)sw; return submit_ok; }
 static bool android_osd_overlay_present(void *overlay) { (void)overlay; return true; }
+static void report_motion_stats(struct vo *vo, bool submitted)
+{
+    (void)vo;
+    (void)submitted;
+}
 static int osd_geometry_invalidations;
 static void android_osd_overlay_invalidate_geometry(void *overlay)
 {

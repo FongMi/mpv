@@ -136,6 +136,8 @@ struct vo_internal {
     struct vo_android_surface_frame android_surface_frame;
     bool android_video_surface_transform;
 #endif
+    struct voctrl_motion_info motion_info;
+    bool motion_info_valid;
     bool need_wakeup;
     bool terminate;
 
@@ -1484,6 +1486,31 @@ bool vo_want_redraw(struct vo *vo)
     return r;
 }
 
+static void run_prepare_decoder_flush(void *ptr)
+{
+    struct vo *vo = ptr;
+    struct vo_internal *in = vo->in;
+
+    mp_mutex_lock(&in->lock);
+    forget_frames(vo);
+    mp_mutex_unlock(&in->lock);
+
+    // Backend teardown can release frame references and must run unlocked.
+    int ret = vo->driver->control(vo, VOCTRL_PREPARE_DECODER_FLUSH,
+                                  in->current_frame);
+    if (ret == VO_TRUE) {
+        mp_mutex_lock(&in->lock);
+        TA_FREEP(&in->current_frame);
+        reset_vsync_timings(vo);
+        mp_mutex_unlock(&in->lock);
+    }
+}
+
+void vo_prepare_decoder_flush(struct vo *vo)
+{
+    mp_dispatch_run(vo->in->dispatch, run_prepare_decoder_flush, vo);
+}
+
 void vo_seek_reset(struct vo *vo)
 {
     struct vo_internal *in = vo->in;
@@ -1600,6 +1627,27 @@ double vo_get_vsync_interval(struct vo *vo)
     double res = vo->in->vsync_interval > 1 ? vo->in->vsync_interval : -1;
     mp_mutex_unlock(&in->lock);
     return res;
+}
+
+void vo_set_motion_info(struct vo *vo, const struct voctrl_motion_info *info)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    in->motion_info_valid = info != NULL;
+    if (info)
+        in->motion_info = *info;
+    mp_mutex_unlock(&in->lock);
+}
+
+bool vo_get_motion_info(struct vo *vo, struct voctrl_motion_info *info)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    bool valid = in->motion_info_valid;
+    if (valid)
+        *info = in->motion_info;
+    mp_mutex_unlock(&in->lock);
+    return valid;
 }
 
 double vo_get_estimated_vsync_interval(struct vo *vo)

@@ -108,10 +108,34 @@ vo_vsync = executable('vo-vsync', ['vo_vsync.c', vo_vsync_functions],
                       include_directories: incdir, dependencies: libm)
 test('vo-vsync', vo_vsync)
 
+motion_clock = executable('motion-clock', 'motion_clock.c',
+                          include_directories: incdir, dependencies: libm)
+test('motion-clock', motion_clock)
+
 if features['vulkan']
     vulkan_present = executable('vulkan-present', 'vulkan_present.c',
                                 include_directories: incdir)
     test('vulkan-present', vulkan_present)
+
+    motion_shaders = custom_target('motion-shaders',
+        input: files('../video/out/gpu_next/motion.c', '../video/out/vo_gpu_next.c'),
+        output: 'gpu_motion_shaders.h',
+        command: [python, files('gpu_motion.py'), '--source', '@INPUT0@',
+                  '--vo-source', '@INPUT1@',
+                  '--generate', '@OUTPUT@'])
+    gpu_motion = executable('gpu-motion',
+        ['gpu_motion.c', motion_shaders], link_with: libmpv_motion,
+        include_directories: incdir, dependencies: [libplacebo, libm])
+    test('gpu-motion', gpu_motion, suite: 'gpu')
+
+    hwdec_copy = custom_target('gpu-hwdec-copy',
+        input: files('../video/out/vo_gpu_next.c'),
+        output: 'gpu_hwdec_copy.h',
+        command: [python, files('gpu_hwdec.py'), '--source', '@INPUT@',
+                  '--generate', '@OUTPUT@'])
+    gpu_hwdec = executable('gpu-hwdec', ['gpu_hwdec.c', hwdec_copy],
+                           include_directories: incdir, dependencies: libplacebo)
+    test('gpu-hwdec', gpu_hwdec, suite: 'gpu')
 endif
 
 disc_still_header = custom_target('disc-still-functions',
@@ -137,6 +161,8 @@ if features['lua']
     if lua_test.found()
         test('stats-audio', lua_test,
              args: [files('stats_audio.lua'), files('../player/lua/stats.lua')])
+        test('stats-motion', lua_test,
+             args: [files('stats_motion.lua'), files('../player/lua/stats.lua')])
     endif
 endif
 
@@ -243,12 +269,20 @@ test('gpu-dumb', gpu_dumb)
 
 gpu_next_headers = custom_target('gpu-next-mapping-headers',
     input: files('../video/mp_image.h', '../video/out/gpu/hwdec.h',
-                 '../video/mp_image.c', '../video/out/vo_gpu_next.c'),
+                 '../video/mp_image.c', '../video/out/vo_gpu_next.c',
+                 '../video/out/gpu_next/motion.h', '../video/out/vo.h',
+                 '../player/command.c', '../options/m_property.h',
+                 '../video/out/vo.c'),
     output: ['vo_gpu_next_contracts.h', 'vo_gpu_next_functions.h'],
     command: [python, files('vo_gpu_next.py'), '--mpv', source_root,
               '--generate', '@OUTPUT0@', '@OUTPUT1@'])
+gpu_next_mapping_deps = [libm]
+if not win32
+    gpu_next_mapping_deps += pthreads
+endif
 gpu_next_mapping = executable('gpu-next-mapping',
-                              ['vo_gpu_next.c', gpu_next_headers])
+                              ['vo_gpu_next.c', gpu_next_headers],
+                              dependencies: gpu_next_mapping_deps)
 test('gpu-next-mapping', gpu_next_mapping)
 
 aimage_mapper_header = custom_target('aimage-mapper-functions',
@@ -567,3 +601,17 @@ filter_options_header = custom_target('filter-options-functions',
     command: [python, files('filter_options.py'), '--generate', '@OUTPUT@'])
 filter_options = executable('filter-options', ['filter_options.c', filter_options_header])
 test('filter-options', filter_options)
+
+vo_decoder_flush_header = custom_target('vo-decoder-flush-functions',
+    input: files('../player/playloop.c', '../video/out/vo.c', '../video/out/vo.h'),
+    depend_files: files('vo_android_frame.py'),
+    output: 'vo_decoder_flush_functions.h',
+    command: [python, files('vo_decoder_flush.py'), '--generate', '@OUTPUT@'])
+vo_decoder_flush_deps = []
+if host_machine.system() != 'windows'
+    vo_decoder_flush_deps += pthreads
+endif
+vo_decoder_flush = executable('vo-decoder-flush',
+    ['vo_decoder_flush.c', vo_decoder_flush_header],
+    dependencies: vo_decoder_flush_deps)
+test('vo-decoder-flush', vo_decoder_flush)
