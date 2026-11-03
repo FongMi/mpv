@@ -105,6 +105,11 @@ struct ra_hwdec_mapper_driver {
     // displayed frame with an error color.
     bool map_on_reset;
 
+    // Mapping consumes a one-shot decoder output. A render queue must retain
+    // its sampled planes before mapping another source, rather than remap an
+    // entry after the mapper has evicted it.
+    bool consumes_source;
+
     // Whether this mapper needs the first source frame to determine dst_params
     // for the current rendering API. Legacy vo=gpu cannot defer that decision.
     bool (*needs_dst_params_probe)(struct ra *ra);

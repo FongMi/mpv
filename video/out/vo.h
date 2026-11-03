@@ -144,6 +144,8 @@ enum mp_voctrl {
     // Clipboard
     VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
     VOCTRL_SET_CLIPBOARD,
+
+    VOCTRL_GET_MOTION_INFO,             // struct voctrl_motion_info*
 };
 
 // Helper to expose what kind of content is currently playing to the VO.
@@ -195,6 +197,21 @@ struct mp_frame_perf {
 
 struct voctrl_performance_data {
     struct mp_frame_perf fresh, redraw;
+};
+
+struct voctrl_motion_info {
+    bool supported;
+    int target_fps;
+    const char *state; // Static storage, valid after the VOCTRL returns.
+    // The epoch changes when counters reset; both times use mp_time_ns().
+    int64_t epoch_ns, timestamp_ns;
+    uint64_t captured, analyzed, synthesized, repeated, submitted;
+    // Rolling GPU means in ns; zero means no completed sample is available.
+    uint64_t capture_ns, coarse_ns, refinement_ns;
+    uint64_t translation_cost_ns, translation_select_ns;
+    uint64_t evidence_ns, reconstruction_ns, warp_ns, synthesis_ns;
+    int analysis_width, analysis_height;
+    int synthesis_width, synthesis_height;
 };
 
 struct voctrl_screenshot {
