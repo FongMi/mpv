@@ -1093,6 +1093,7 @@ const struct ra_hwdec_driver ra_hwdec_aimagereader = {
     .mapper = &(const struct ra_hwdec_mapper_driver){
         .priv_size = sizeof(struct priv),
         .map_on_reset = true,
+        .consumes_source = true,
         .needs_dst_params_probe = needs_dst_params_probe,
         .init = mapper_init,
         .uninit = mapper_uninit,

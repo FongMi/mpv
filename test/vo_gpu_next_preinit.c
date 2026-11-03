@@ -5,14 +5,14 @@
 #include <stddef.h>
 
 #define HAVE_ANDROID 1
-enum stage { SUCCESS, RA, GPU, SWAPCHAIN, OVERLAY, SURFACE };
+enum stage { SUCCESS, RA, GPU, SWAPCHAIN, OVERLAY, SURFACE, RENDERER };
 static enum stage fail_at;
 static int ra, swapchain, overlay, renderer;
 static bool owns_ra, owns_gpu, owns_overlay;
 static struct ra_ctx_opts { bool want_alpha; } opts;
 static struct gpu_ctx { void *swapchain; } gpu = {&swapchain};
 struct priv {
-    void *ra_ctx, *log, *sw, *osd_overlay, *renderer;
+    void *ra_ctx, *log, *sw, *osd_overlay, *renderer, *stats;
     struct gpu_ctx *context;
 };
 struct vo {
@@ -28,7 +28,9 @@ struct vo {
 #define gpu_ctx_create_swapchain(...) (fail_at != SWAPCHAIN)
 #define android_osd_overlay_create(...) ((owns_overlay = fail_at != OVERLAY) ? &overlay : NULL)
 #define android_osd_overlay_set_surface(...) (fail_at != SURFACE)
-#define mppl_video_init(...) (&renderer)
+#define mppl_video_init(...) (fail_at == RENDERER ? NULL : &renderer)
+#define mppl_video_stats(ptr) (ptr)
+#define publish_motion_info(...) ((void)0)
 #define mppl_video_set_osd_source(...) ((void)0)
 #define mppl_video_configure_queue(...) ((void)0)
 #define hwdec_devices_create() (&renderer)
@@ -65,7 +67,7 @@ static void ra_ctx_destroy(void **ptr)
 
 int main(void)
 {
-    for (fail_at = RA; fail_at <= SURFACE; fail_at++) {
+    for (fail_at = RA; fail_at <= RENDERER; fail_at++) {
         struct priv p = {0};
         struct vo vo = {.priv = &p};
         assert(preinit(&vo) < 0);

@@ -45,7 +45,7 @@ struct MPContext {
 
 struct vo_frame {
     bool can_drop, display_synced;
-    double vsync_interval, vsync_offset, ideal_frame_duration;
+    double display_vsync_interval, vsync_interval, vsync_offset, ideal_frame_duration;
     double ideal_frame_vsync, ideal_frame_vsync_duration, approx_duration;
     int num_vsyncs;
 };
@@ -141,6 +141,7 @@ static void test_timing(double hz, double duration, double speed, int request,
     if (repeat && count > 0)
         interval *= normal.num_vsyncs / (double)count;
     assert_float_equal(frame.vsync_interval, interval, 1e-12);
+    assert_float_equal(frame.display_vsync_interval, 1 / hz, 1e-12);
     assert_float_equal(ctx.display_sync_error, reference.display_sync_error, 1e-12);
     assert_float_equal(ctx.time_frame, reference.time_frame + repeat / hz, 1e-12);
     assert_int_equal(ctx.mistimed_frames_total, repeat != 0);

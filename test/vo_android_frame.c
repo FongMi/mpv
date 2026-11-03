@@ -3,10 +3,14 @@
  */
 #undef NDEBUG
 #include <assert.h>
+#include <limits.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#include "vo_android_frame_types.h"
 
 #define HAVE_ANDROID 1
 #define VO_CAP_NORETAIN (1 << 0)
@@ -23,6 +27,8 @@
 #define MPV_EVENT_VIDEO_RECONFIG 1
 #define MP_TIME_S_TO_NS(x) ((int64_t)((x) * 1000000000))
 #define MP_TIME_MS_TO_NS(x) ((int64_t)((x) * 1000000))
+#define MPMIN(a, b) ((a) < (b) ? (a) : (b))
+#define MP_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define MPMAX(a, b) ((a) > (b) ? (a) : (b))
 #define mp_assert assert
 #define talloc_free free
@@ -49,9 +55,20 @@ struct mp_vo_opts {
     int64_t WinID;
     double timing_offset;
     bool android_keep_video_frame;
+    int swapchain_depth;
 };
 struct vo_internal {
+    struct present_record presents[VO_MAX_SWAPCHAIN_DEPTH + 2];
+    struct timed_lateness late;
+    int64_t flips, presentation_delay, vsync_grid, last_due;
+    int grid_misses;
+    double round_edge, shown_at_once;
+    enum vo_refresh_kind refresh_kind;
+    bool follows;
+    double nominal_vsync_interval, vsync_interval, next_vsync_deadline;
+    bool queue_display_time_only;
     int lock, wakeup;
+    int queued_events;
     bool hasframe, hasframe_rendered, has_video_frame, request_redraw;
     bool dropped_frame, paused, expecting_vsync, rendering, visible;
     int64_t video_wid, drop_count, delayed_count, prev_vsync;
@@ -63,9 +80,6 @@ struct vo_internal {
     uint64_t timing_offset;
 };
 struct vo;
-struct vo_vsync_info {
-    int64_t last_queue_display_time, skipped_vsyncs;
-};
 struct vo_driver {
     int caps;
     bool (*draw_frame)(struct vo *, struct vo_frame *);
@@ -116,11 +130,15 @@ static void check_vo_caps(struct vo *vo) { (void)vo; }
 static void reset_vsync_timings(struct vo *vo) { assert(vo->in->lock); }
 static void stats_time_start(void *stats, const char *name) { (void)stats; (void)name; }
 static void stats_time_end(void *stats, const char *name) { (void)stats; (void)name; }
-static void wait_until(struct vo *vo, int64_t target) { (void)target; assert(!vo->in->lock); }
-static void update_vsync_timing_after_swap(struct vo *vo, struct vo_vsync_info *vsync)
+static void wait_until(int64_t target, bool exact) { (void)target; (void)exact; }
+static void update_vsync_timing_after_swap(struct vo *vo, int64_t time, bool grid,
+                                           bool on_grid, bool queue_only)
 {
+    (void)grid;
+    (void)on_grid;
+    (void)queue_only;
     assert(vo->in->lock);
-    vo->in->prev_vsync = vsync->last_queue_display_time;
+    vo->in->prev_vsync = time;
 }
 static struct vo_frame *vo_frame_ref(struct vo_frame *frame)
 {

@@ -25,9 +25,25 @@ def function(source, name):
 
 def generate(root, output):
     vo = (root / "video/out/vo.c").read_text(encoding="utf-8")
+    public = (root / "video/out/vo.h").read_text(encoding="utf-8")
+    begin = public.index("enum vo_refresh_kind {")
+    types = public[begin:public.index("\n};", begin) + 3]
+    begin = public.rfind("enum {", 0, public.index("VO_EVENT_EXPOSE"))
+    types += "\n" + public[begin:public.index("\n};", begin) + 3]
+    types += "\n" + re.search(r"^#define VO_MAX_SWAPCHAIN_DEPTH .*", public, re.M)[0]
+    for name in ("present_record", "timed_lateness"):
+        begin = vo.index("struct " + name + " {")
+        types += "\n" + vo[begin:vo.index("\n};", begin) + 3]
+    begin = public.index("struct vo_vsync_info {")
+    types += "\n" + public[begin:public.index("\n};", begin) + 3]
+    output.with_name("vo_android_frame_types.h").write_text(types, encoding="utf-8")
     source = ""
-    for name in ("read_opts", "forget_frames", "run_reconfig", "vo_queue_frame",
-                 "vo_seek_reset", "vo_has_video_frame", "render_frame", "do_redraw"):
+    for name in ("restart_lateness", "set_presentation_delay",
+                 "predict_display_time", "late_frame_catches_up",
+                 "check_timed_frame_late", "record_present", "update_vsync_grid",
+                 "read_opts", "forget_frames", "run_reconfig", "vo_queue_frame",
+                 "vo_seek_reset", "vo_has_video_frame", "advance_vsyncs", "schedule_vsync_slot",
+                 "render_frame", "do_redraw"):
         source += function(vo, name)
     playloop = (root / "player/playloop.c").read_text(encoding="utf-8")
     source += function(playloop, "handle_force_window")

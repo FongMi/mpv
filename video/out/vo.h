@@ -145,6 +145,10 @@ enum mp_voctrl {
     // Clipboard
     VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
     VOCTRL_SET_CLIPBOARD,
+
+    // Retire one-shot decoder outputs before decoder flush. The borrowed
+    // current vo_frame may be NULL. VO_TRUE also invalidates core redraw.
+    VOCTRL_PREPARE_DECODER_FLUSH,
 };
 
 // Helper to expose what kind of content is currently playing to the VO.
@@ -196,6 +200,22 @@ struct mp_frame_perf {
 
 struct voctrl_performance_data {
     struct mp_frame_perf fresh, redraw;
+};
+
+struct voctrl_motion_info {
+    bool supported;
+    int target_fps;
+    const char *state; // Static storage, valid after copying the snapshot.
+    // The epoch changes when counters reset; both times use mp_time_ns().
+    // timestamp_ns is publication time, not property query time.
+    int64_t epoch_ns, timestamp_ns;
+    uint64_t captured, analyzed, synthesized, repeated, submitted;
+    // Rolling GPU means in ns; zero means no completed sample is available.
+    uint64_t capture_ns, coarse_ns, refinement_ns;
+    uint64_t translation_cost_ns, translation_select_ns;
+    uint64_t evidence_ns, reconstruction_ns, warp_ns, synthesis_ns;
+    int analysis_width, analysis_height;
+    int synthesis_width, synthesis_height;
 };
 
 struct voctrl_screenshot {
@@ -260,7 +280,9 @@ struct vo_frame {
     int64_t pts;
     // Approximate frame duration, in ns.
     double duration;
-    // Realtime of estimated distance between 2 vsync events.
+    // Estimated display refresh interval, in seconds.
+    double display_vsync_interval;
+    // Realtime step between slots within the frame, scaled for repeat/drop.
     double vsync_interval;
     // "ideal" display time within the vsync
     double vsync_offset;
@@ -601,6 +623,8 @@ bool vo_has_rendered_frame(struct vo *vo);
 bool vo_has_video_frame(struct vo *vo);
 void vo_redraw(struct vo *vo);
 bool vo_want_redraw(struct vo *vo);
+// Wait for rendering and retire decoder outputs invalidated by a flush.
+void vo_prepare_decoder_flush(struct vo *vo);
 void vo_seek_reset(struct vo *vo);
 void vo_destroy(struct vo *vo);
 void vo_set_paused(struct vo *vo, bool paused);
@@ -617,6 +641,12 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames,
 int vo_get_num_req_frames(struct vo *vo);
 int vo_get_num_frame_refs(struct vo *vo);
 double vo_get_vsync_interval(struct vo *vo);
+
+// Only the VO thread publishes; readers never wait for a driver callback.
+// NULL invalidates the snapshot before driver teardown.
+void vo_set_motion_info(struct vo *vo, const struct voctrl_motion_info *info);
+bool vo_get_motion_info(struct vo *vo, struct voctrl_motion_info *info);
+
 double vo_get_estimated_vsync_interval(struct vo *vo);
 double vo_get_estimated_vsync_jitter(struct vo *vo);
 double vo_get_display_fps(struct vo *vo);
