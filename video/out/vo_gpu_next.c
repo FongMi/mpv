@@ -37,6 +37,7 @@
 #include "options/path.h"
 #include "osdep/io.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "stream/stream.h"
 #include "sub/draw_bmp.h"
 #include "video/fmt-conversion.h"
@@ -50,6 +51,8 @@
 #include "gpu/video_shaders.h"
 #include "sub/osd.h"
 #include "gpu_next/context.h"
+#include "gpu_next/motion.h"
+#include "gpu_next/motion_clock.h"
 
 #if HAVE_ANDROID
 #include "android_common.h"
@@ -121,6 +124,16 @@ struct hwdec_slot {
     pl_tex tex[4];            // plane textures of the current mapping
 };
 
+enum motion_state {
+    MOTION_DISABLED,
+    MOTION_READY,
+    MOTION_UNSUPPORTED,
+    MOTION_SOURCE,
+    MOTION_IDLE,
+    MOTION_ACTIVE,
+    MOTION_ERROR,
+};
+
 struct priv {
     struct mp_log *log;
     struct mpv_global *global;
@@ -143,6 +156,18 @@ struct priv {
     pl_renderer rr;
     pl_queue queue;
     pl_swapchain sw;
+    struct mp_motion *motion;
+    struct mp_motion_clock motion_clock;
+    int motion_fps;
+    enum motion_state motion_state;
+    bool motion_bypass_reported;
+    uint64_t motion_captured;
+    uint64_t motion_presented;
+    uint64_t motion_last_captured;
+    uint64_t motion_last_presented;
+    struct mp_motion_stats motion_last_stats;
+    int64_t motion_epoch;
+    int64_t motion_stats_time;
     pl_fmt osd_fmt[SUBBITMAP_COUNT];
     pl_tex *sub_tex;
     int num_sub_tex;
@@ -206,6 +231,7 @@ struct gl_next_opts {
     float background_blur_radius;
     float corner_rounding;
     bool inter_preserve;
+    int motion_fps;
     struct user_lut lut;
     struct user_lut image_lut;
     struct user_lut target_lut;
@@ -247,6 +273,7 @@ const struct m_sub_options gl_next_conf = {
         {"background-blur-radius", OPT_FLOAT(background_blur_radius)},
         {"corner-rounding", OPT_FLOAT(corner_rounding), M_RANGE(0, 1)},
         {"interpolation-preserve", OPT_BOOL(inter_preserve)},
+        {"motion-interpolation", OPT_INT(motion_fps), M_RANGE(0, 240)},
         {"lut", OPT_STRING(lut.opt), .flags = M_OPT_FILE},
         {"lut-type", OPT_CHOICE_C(lut.type, lut_types)},
         {"image-lut", OPT_STRING(image_lut.opt), .flags = M_OPT_FILE},
@@ -606,6 +633,9 @@ struct frame_priv {
     struct ra_hwdec *el_hwdec;
     pl_tex el_tex[4];
     struct pl_frame el_frame;
+    bool motion_capture;
+    pl_tex motion_texture;
+    uint64_t motion_id;
 };
 
 static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
@@ -1106,6 +1136,59 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
     return true;
 }
 
+static bool capture_motion_frame(struct vo *vo, struct mp_image *mpi,
+                                  struct pl_frame *frame)
+{
+    struct priv *p = vo->priv;
+    struct frame_priv *fp = mpi->priv;
+    if (!p->motion || !fp->motion_capture)
+        return true;
+    if (pl_color_transfer_is_hdr(frame->color.transfer) ||
+        frame->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION ||
+        (mpi->fields & MP_IMGFIELD_INTERLACED)) {
+        if (!p->motion_bypass_reported) {
+            MP_INFO(vo, "Motion interpolation supports SDR progressive video; "
+                        "passing unsupported frames through.\n");
+            p->motion_bypass_reported = true;
+        }
+        return true;
+    }
+
+    struct pl_frame input = *frame;
+    const struct mp_image_params *mapped = &fp->mapped_params;
+    if (fp->mapped_coordinates && mp_image_crop_valid(mapped)) {
+        input.crop = (struct pl_rect2df) {
+            mapped->crop.x0, mapped->crop.y0,
+            mapped->crop.x1, mapped->crop.y1,
+        };
+    } else {
+        input.crop = (struct pl_rect2df) {
+            .x1 = mpi->params.w, .y1 = mpi->params.h,
+        };
+    }
+    if (!mp_motion_capture(p->motion, &input, mpi->params.w, mpi->params.h,
+                            &fp->motion_texture)) {
+        MP_ERR(vo, "Failed capturing GPU frame for motion interpolation.\n");
+        p->motion_state = MOTION_ERROR;
+        pl_tex_destroy(p->gpu, &fp->motion_texture);
+        return false;
+    }
+    *frame = (struct pl_frame) {
+        .num_planes = 1,
+        .planes[0] = {
+            .texture = fp->motion_texture, .components = 4,
+            .component_mapping = {0, 1, 2, 3},
+        },
+        .repr = pl_color_repr_rgb,
+        .color = frame->color,
+        .rotation = frame->rotation,
+        .user_data = mpi,
+    };
+    fp->mapped_coordinates = false;
+    p->motion_captured++;
+    return true;
+}
+
 static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
                       struct pl_frame *frame)
 {
@@ -1268,6 +1351,15 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     update_lut(p, &p->next_opts->image_lut);
     frame->lut = p->next_opts->image_lut.lut;
     frame->lut_type = p->next_opts->image_lut.type;
+    if (!capture_motion_frame(vo, mpi, frame)) {
+        vo_report_backend_error(vo);
+        slot_release_owner(p, &p->hwdec, mpi);
+        slot_release_owner(p, &p->el_hwdec, mpi);
+        for (int n = 0; n < MP_ARRAY_SIZE(fp->el_tex); n++)
+            pl_tex_destroy(gpu, &fp->el_tex[n]);
+        talloc_free(mpi);
+        return false;
+    }
     return true;
 }
 
@@ -1286,6 +1378,7 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
         if (fp->el_tex[i])
             pl_tex_destroy(gpu, &fp->el_tex[i]);
     }
+    pl_tex_destroy(gpu, &fp->motion_texture);
     slot_release_owner(p, &p->hwdec, mpi);
     slot_release_owner(p, &p->el_hwdec, mpi);
     talloc_free(mpi);
@@ -1564,6 +1657,8 @@ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
 static void reset_frame_queue(struct priv *p)
 {
     pl_queue_reset(p->queue);
+    mp_motion_reset(p->motion);
+    p->motion_clock = (struct mp_motion_clock) {0};
     p->last_pts = 0.0;
     p->last_id = 0;
     p->reset_map_failed_id = 0;
@@ -1627,6 +1722,77 @@ static int preload_deferred_hwdec_frame(struct priv *p,
     return 1;
 }
 
+static int prepare_motion_frame(struct vo *vo, const struct pl_frame_mix *mix,
+                                 struct pl_frame *output)
+{
+    struct priv *p = vo->priv;
+    int before = -1;
+    int after = -1;
+    for (int n = 0; n < mix->num_frames && mix->timestamps; n++) {
+        if (mix->timestamps[n] == 0)
+            return 0;
+        if (mix->timestamps[n] < 0)
+            before = n;
+        if (mix->timestamps[n] > 0 && after < 0)
+            after = n;
+    }
+    if (before < 0 || after < 0)
+        return 0;
+    const struct pl_frame *first = mix->frames[before];
+    const struct pl_frame *second = mix->frames[after];
+    const struct mp_image *mpi0 = first->user_data;
+    const struct mp_image *mpi1 = second->user_data;
+    const struct frame_priv *fp0 = mpi0->priv;
+    const struct frame_priv *fp1 = mpi1->priv;
+    if (!fp0->motion_texture || !fp1->motion_texture ||
+        first->rotation != second->rotation ||
+        first->crop.x0 != second->crop.x0 || first->crop.y0 != second->crop.y0 ||
+        first->crop.x1 != second->crop.x1 || first->crop.y1 != second->crop.y1 ||
+        !mp_image_params_equal(&mpi0->params, &mpi1->params))
+        return 0;
+    float t0 = mix->timestamps[before];
+    float t1 = mix->timestamps[after];
+    float alpha = -t0 / (t1 - t0);
+    pl_tex texture;
+    if (!mp_motion_render(p->motion, fp0->motion_texture, fp1->motion_texture,
+                            fp0->motion_id, fp1->motion_id,
+                            alpha, &texture)) {
+        MP_ERR(vo, "GPU motion estimation or synthesis failed.\n");
+        return -1;
+    }
+    *output = *(alpha < 0.5f ? first : second);
+    output->planes[0].texture = texture;
+    return 1;
+}
+
+static bool motion_interpolation_needed(const struct priv *p,
+                                        const struct vo_frame *frame)
+{
+    return p->motion && frame->ideal_frame_duration > 0 &&
+           frame->vsync_interval > 0 &&
+           p->motion_fps * frame->ideal_frame_duration > 1.0 + 1e-6 &&
+           frame->ideal_frame_duration > frame->vsync_interval * (1.0 + 1e-6);
+}
+
+static double motion_output_pts(struct priv *p, const struct vo_frame *frame,
+                                 double pts)
+{
+    if (!p->motion || frame->ideal_frame_duration <= 0 ||
+        frame->vsync_interval <= 0)
+        return pts;
+    double speed = frame->approx_duration / frame->ideal_frame_duration;
+    if (p->motion_fps * frame->vsync_interval >= 1.0 - 1e-6) {
+        p->motion_clock = (struct mp_motion_clock) {0};
+        return pts;
+    }
+    return mp_motion_clock_sample(&p->motion_clock, pts, speed, p->motion_fps);
+}
+
+static bool motion_backend_failed(const struct priv *p)
+{
+    return p->motion_fps && !p->motion && p->motion_state != MOTION_UNSUPPORTED;
+}
+
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
 #if HAVE_ANDROID
@@ -1636,6 +1802,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
+    if (motion_backend_failed(p)) {
+        vo_report_backend_error(vo);
+        return VO_FALSE;
+    }
+    if (p->motion)
+        p->motion_state = frame->current ? MOTION_SOURCE : MOTION_IDLE;
 
     bool external_osd = false;
 #if HAVE_ANDROID
@@ -1654,12 +1826,20 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     const struct gl_video_opts *opts = p->opts_cache->opts;
     bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
     bool cache_frame = will_redraw || frame->still || p->paused;
-    bool can_interpolate = opts->interpolation && frame->display_synced &&
+    bool motion = motion_interpolation_needed(p, frame);
+    bool can_interpolate = (p->motion_fps ? motion : opts->interpolation) &&
+                           frame->display_synced &&
                            !frame->still && frame->num_frames > 1 && !p->paused;
+    if (!can_interpolate)
+        p->motion_clock = (struct mp_motion_clock) {0};
     double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
     params.info_callback = info_callback;
     params.info_priv = vo;
     params.skip_caching_single_frame = !cache_frame;
+    if (p->motion_fps)
+        params.frame_mixer = NULL;
+    if (p->motion)
+        params.skip_caching_single_frame = true;
     params.preserve_mixing_cache = p->next_opts->inter_preserve && !frame->still;
     if (frame->still || p->paused)
         params.frame_mixer = NULL;
@@ -1762,6 +1942,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         }
 
         struct frame_priv *fp = mpi->priv;
+        fp->motion_id = id;
+        fp->motion_capture = motion;
         int ret = preload_deferred_hwdec_frame(p, fp, mpi);
         if (ret < 0) {
             talloc_free(mpi);
@@ -1861,7 +2043,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             // Advance the queue state to the current PTS to discard unused frames
             struct pl_queue_params qparams = *pl_queue_params(
                 .pts = frame->current->pts + pts_offset,
-                .radius = pl_frame_mix_radius(&params),
+                .radius = motion ? 1.0 : pl_frame_mix_radius(&params),
                 .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
                 .drift_compensation = 0,
             );
@@ -1941,9 +2123,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     struct pl_frame_mix mix = {0};
     if (frame->current) {
         // Update queue state
+        double output_pts = frame->current->pts + pts_offset;
+        if (can_interpolate)
+            output_pts = motion_output_pts(p, frame, output_pts);
         struct pl_queue_params qparams = *pl_queue_params(
-            .pts = frame->current->pts + pts_offset,
-            .radius = pl_frame_mix_radius(&params),
+            .pts = output_pts,
+            .radius = motion ? 1.0 : pl_frame_mix_radius(&params),
             .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
             .interpolation_threshold = opts->interpolation_threshold,
             .drift_compensation = 0,
@@ -2048,11 +2233,21 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     // Render frame
     stats_time_start(p->stats, "render");
-    bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
+    struct pl_frame motion_frame;
+    int motion_result = p->motion && can_interpolate
+                      ? prepare_motion_frame(vo, &mix, &motion_frame) : 0;
+    if (p->motion && motion_result != 0)
+        p->motion_state = motion_result > 0 ? MOTION_ACTIVE : MOTION_ERROR;
+    bool render_ok = motion_result > 0
+                   ? pl_render_image(p->rr, &motion_frame, &target, &params)
+                   : motion_result == 0 &&
+                     pl_render_image_mix(p->rr, &mix, &target, &params);
     stats_time_end(p->stats, "render");
     if (!render_ok) {
+        if (p->motion)
+            p->motion_state = MOTION_ERROR;
         MP_ERR(vo, "Failed rendering frame!\n");
-        if (deferred_hwdec_path_active(p))
+        if (motion_result < 0 || deferred_hwdec_path_active(p))
             vo_report_backend_error(vo);
         goto done;
     }
@@ -2078,7 +2273,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
     mp_mutex_unlock(&vo->params_mutex);
 
-    p->is_interpolated = pts_offset != 0 && mix.num_frames > 1;
+    p->is_interpolated = p->motion ? motion_result > 0
+                                 : pts_offset != 0 && mix.num_frames > 1;
     valid = true;
     // fall through
 
@@ -2094,6 +2290,40 @@ done:
 #endif
     p->frame_pending = true;
     return VO_TRUE;
+}
+
+static void report_motion_stats(struct vo *vo, bool submitted)
+{
+    struct priv *p = vo->priv;
+    if (!p->motion_fps)
+        return;
+    p->motion_presented += submitted;
+    if (!p->motion)
+        return;
+    int64_t now = mp_time_ns();
+    double elapsed = (now - p->motion_stats_time) / 1e9;
+    if (elapsed < 5)
+        return;
+    struct mp_motion_stats stats = mp_motion_get_stats(p->motion);
+    MP_INFO(vo, "Motion interpolation: target=%d source_captures=%.2f/s "
+                "synthesis_submits=%.2f/s swapchain_submits=%.2f/s "
+                "analyzed_pairs=%"PRIu64" repeated_outputs=%"PRIu64"\n",
+            p->motion_fps,
+            (p->motion_captured - p->motion_last_captured) / elapsed,
+            (stats.generated_frames - p->motion_last_stats.generated_frames) / elapsed,
+            (p->motion_presented - p->motion_last_presented) / elapsed,
+            stats.analyzed_pairs, stats.repeated_frames);
+    MP_INFO(vo, "Motion GPU means: capture=%.3f coarse-pass=%.3f refinement-pass=%.3f "
+                "warp-pass=%.3f synthesis=%.3f ms (-1=unavailable)\n",
+            stats.capture_ns ? stats.capture_ns / 1e6 : -1.0,
+            stats.coarse_ns ? stats.coarse_ns / 1e6 : -1.0,
+            stats.refinement_ns ? stats.refinement_ns / 1e6 : -1.0,
+            stats.warp_ns ? stats.warp_ns / 1e6 : -1.0,
+            stats.synthesis_ns ? stats.synthesis_ns / 1e6 : -1.0);
+    p->motion_stats_time = now;
+    p->motion_last_captured = p->motion_captured;
+    p->motion_last_presented = p->motion_presented;
+    p->motion_last_stats = stats;
 }
 
 static void flip_page(struct vo *vo)
@@ -2115,6 +2345,7 @@ static void flip_page(struct vo *vo)
         vo_android_surface_frame_drawn(vo, 0, 0);
 #endif
     sw->fns->swap_buffers(sw);
+    report_motion_stats(vo, submitted);
 #if HAVE_ANDROID
     if (submitted && strcmp(p->ra_ctx->fns->type, "vulkan") == 0)
         vo_android_surface_frame_presented(vo, vo->dwidth, vo->dheight);
@@ -2142,7 +2373,7 @@ static int query_format(struct vo *vo, int format)
         bool direct_external =
             hwdec_driver_uses_deferred_dst_params(p, mapper);
         const struct gl_video_opts *opts = p->opts_cache->opts;
-        if (direct_external && opts->interpolation) {
+        if (direct_external && opts->interpolation && !p->motion_fps) {
             MP_WARN(vo, "Vulkan external-format MediaCodec frames do not "
                         "support interpolation; using a copy path.\n");
             return false;
@@ -2526,6 +2757,48 @@ static void update_ra_ctx_options(struct vo *vo, struct ra_ctx_opts *ctx_opts)
                             border_alpha;
 }
 
+static const char *motion_state_name(enum motion_state state)
+{
+    static const char *const names[] = {
+        [MOTION_DISABLED] = "disabled",
+        [MOTION_READY] = "ready",
+        [MOTION_UNSUPPORTED] = "unsupported",
+        [MOTION_SOURCE] = "source",
+        [MOTION_IDLE] = "idle",
+        [MOTION_ACTIVE] = "active",
+        [MOTION_ERROR] = "error",
+    };
+    mp_assert((unsigned)state < MP_ARRAY_SIZE(names));
+    return names[state];
+}
+
+static void get_motion_info(struct priv *p, struct voctrl_motion_info *info)
+{
+    struct mp_motion_stats stats = mp_motion_get_stats(p->motion);
+    *info = (struct voctrl_motion_info) {
+        .supported = mp_motion_supported(p->gpu),
+        .target_fps = p->motion_fps,
+        .state = p->motion && p->paused ? "paused"
+               : motion_state_name(p->motion_state),
+        .epoch_ns = p->motion_epoch,
+        .timestamp_ns = mp_time_ns(),
+        .captured = p->motion_captured,
+        .analyzed = stats.analyzed_pairs,
+        .synthesized = stats.generated_frames,
+        .repeated = stats.repeated_frames,
+        .submitted = p->motion_presented,
+        .capture_ns = stats.capture_ns,
+        .coarse_ns = stats.coarse_ns,
+        .refinement_ns = stats.refinement_ns,
+        .warp_ns = stats.warp_ns,
+        .synthesis_ns = stats.synthesis_ns,
+        .analysis_width = stats.analysis_width,
+        .analysis_height = stats.analysis_height,
+        .synthesis_width = stats.synthesis_width,
+        .synthesis_height = stats.synthesis_height,
+    };
+}
+
 static int control(struct vo *vo, uint32_t request, void *data)
 {
     struct priv *p = vo->priv;
@@ -2596,6 +2869,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
         copy_frame_info_to_mp(&p->perf_redraw, &perf->redraw, NULL, NULL);
         return true;
     }
+
+    case VOCTRL_GET_MOTION_INFO:
+        get_motion_info(p, data);
+        return VO_TRUE;
 
     case VOCTRL_SCREENSHOT:
         video_screenshot(vo, data);
@@ -2845,6 +3122,7 @@ static void uninit(struct vo *vo)
         pl_gpu_finish(p->gpu);
 
     pl_queue_destroy(&p->queue); // destroy this first
+    mp_motion_destroy(&p->motion);
     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
     for (int i = 0; i < p->num_sub_tex; i++)
@@ -2950,6 +3228,8 @@ static int preinit(struct vo *vo)
 
     p->pars = pl_options_alloc(p->pllog);
     update_render_options(vo);
+    if (motion_backend_failed(p))
+        goto err_out;
     return 0;
 
 err_out:
@@ -3228,9 +3508,43 @@ static void update_hook_opts(struct priv *p, char **opts, const char *shaderpath
     }
 }
 
+static void update_motion_options(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    int fps = p->next_opts->motion_fps;
+    if (p->motion_fps == fps)
+        return;
+    reset_frame_queue(p);
+    mp_motion_destroy(&p->motion);
+    p->motion_fps = fps;
+    p->motion_state = fps ? MOTION_READY : MOTION_DISABLED;
+    p->motion_bypass_reported = false;
+    p->motion_captured = p->motion_presented = 0;
+    p->motion_last_captured = p->motion_last_presented = 0;
+    p->motion_last_stats = (struct mp_motion_stats) {0};
+    p->motion_epoch = p->motion_stats_time = mp_time_ns();
+    if (fps) {
+        if (!mp_motion_supported(p->gpu)) {
+            p->motion_state = MOTION_UNSUPPORTED;
+            MP_INFO(vo, "GPU motion interpolation is unsupported on this "
+                        "context; passing source frames through.\n");
+            return;
+        }
+        p->motion = mp_motion_create(p->gpu, 480);
+        if (!p->motion) {
+            p->motion_state = MOTION_ERROR;
+            MP_ERR(vo, "Failed initializing GPU motion interpolation.\n");
+        } else {
+            MP_INFO(vo, "GPU motion interpolation enabled: target=%d fps, "
+                        "analysis<=480 pixels, synthesis=source resolution.\n", fps);
+        }
+    }
+}
+
 static void update_render_options(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    update_motion_options(vo);
     pl_options pars = p->pars;
     const struct gl_video_opts *opts = p->opts_cache->opts;
     pars->params.background_color[0] = opts->background_color.r / 255.0;
@@ -3264,7 +3578,8 @@ static void update_render_options(struct vo *vo)
     pars->params.upscaler = map_scaler(p, SCALER_SCALE);
     pars->params.downscaler = map_scaler(p, SCALER_DSCALE);
     pars->params.plane_upscaler = map_scaler(p, SCALER_CSCALE);
-    pars->params.frame_mixer = opts->interpolation ? map_scaler(p, SCALER_TSCALE) : NULL;
+    pars->params.frame_mixer = p->motion || (!p->motion_fps && opts->interpolation)
+                            ? map_scaler(p, SCALER_TSCALE) : NULL;
 
     // Request as many frames as required from the decoder, depending on the
     // speed VPS/FPS ratio libplacebo may need more frames. Request frames up to
