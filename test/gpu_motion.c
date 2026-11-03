@@ -239,6 +239,86 @@ static void translated_pair(pl_gpu gpu, struct mp_motion *motion)
     free(output);
 }
 
+static void diagonal_pixels(float *pixels, int width, int height, int scale,
+                             float shift, bool bands, int variant)
+{
+    static const float background[6][3] = {
+        {1, 0, 0}, {0, 1, 0}, {1, 1, 0},
+        {0, 0, 1}, {1, 0, 1}, {0, 1, 1},
+    };
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            float origin = variant == 1 ? 96 : variant == 2 ? 180 : 24;
+            float slope = variant == 2 ? -0.25f : 0.25f;
+            float center = (origin + shift) * scale + slope * (x + 0.5f);
+            float edge = 2 * scale + 0.5f - fabsf(y + 0.5f - center);
+            float coverage = fminf(1, fmaxf(0, edge));
+            for (int c = 0; c < 3; c++) {
+                float base = bands ? background[x * 6 / width][c] : 0;
+                pixels[(y * width + x) * 4 + c] =
+                    base + coverage * (1 - 2 * base);
+                if (variant == 3)
+                    pixels[(y * width + x) * 4 + c] =
+                        0.45f + 0.1f * pixels[(y * width + x) * 4 + c];
+            }
+            pixels[(y * width + x) * 4 + 3] = 1;
+        }
+    }
+}
+
+static void diagonal_edge(pl_gpu gpu, struct mp_motion *motion,
+                           bool bands, int variant)
+{
+    int width = 1920, height = 1080, scale = 4;
+    size_t bytes = width * height * 4 * sizeof(float);
+    float *pixels = malloc(bytes);
+    float *expected = malloc(bytes);
+    float *output = malloc(bytes);
+    assert(pixels && expected && output);
+    float displacement = variant == 1 ? -16 : 16;
+    diagonal_pixels(pixels, width, height, scale, 0, bands, variant);
+    pl_tex a = upload_size(gpu, pixels, width, height);
+    diagonal_pixels(pixels, width, height, scale, displacement, bands, variant);
+    pl_tex b = upload_size(gpu, pixels, width, height);
+    for (int step = 1; step <= 3; step++) {
+        float alpha = step * 0.25f;
+        diagonal_pixels(expected, width, height, scale, displacement * alpha,
+                        bands, variant);
+        pl_tex result;
+        assert(mp_motion_render(motion, a, b, 90, 91, alpha, &result));
+        readback(gpu, result, output);
+        float maximum = 0;
+        double error = 0;
+        int count = 0;
+        for (int y = 16 * scale; y < height - 16 * scale; y++) {
+            for (int x = 16 * scale; x < width - 16 * scale; x++) {
+                for (int c = 0; c < 3; c++) {
+                    int index = (y * width + x) * 4 + c;
+                    assert(isfinite(output[index]));
+                    float difference = fabsf(output[index] - expected[index]);
+                    if (variant == 3)
+                        difference /= 0.1f;
+                    maximum = fmaxf(maximum, difference);
+                    error += difference;
+                    count++;
+                }
+            }
+        }
+        printf("diagonal variant=%d %s alpha=%.2f error=%.6f maximum=%.6f\n",
+               variant, bands ? "bands" : "flat", alpha, error / count,
+               maximum);
+        fflush(stdout);
+        assert(error / count < 0.02);
+        assert(maximum < 0.1);
+    }
+    mp_motion_reset(motion);
+    pl_tex_destroy(gpu, &a);
+    pl_tex_destroy(gpu, &b);
+    free(pixels);
+    free(expected);
+    free(output);
+}
+
 static void static_and_cut(pl_gpu gpu, struct mp_motion *motion)
 {
     float *pixels = calloc(WIDTH * HEIGHT * 4, sizeof(float));
@@ -916,6 +996,95 @@ static void color_roundtrip(pl_gpu gpu, struct mp_motion *motion)
     free(output);
 }
 
+static pl_tex cache_input(pl_gpu gpu, int width, int height, int offset)
+{
+    float *pixels = calloc(width * height * 4, sizeof(float));
+    assert(pixels);
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            for (int c = 0; c < 4; c++)
+                pixels[(y * width + x) * 4 + c] = c == 3
+                    ? 1 : noise(x + offset, y - offset, c);
+        }
+    }
+    pl_tex result = upload_size(gpu, pixels, width, height);
+    free(pixels);
+    return result;
+}
+
+static void cache_compare(pl_gpu gpu, struct mp_motion *motion,
+                          struct mp_motion *fresh, pl_tex first, pl_tex second,
+                          uint64_t first_id, uint64_t second_id, float alpha,
+                          bool expected_analysis)
+{
+    struct mp_motion_stats stats = mp_motion_get_stats(motion);
+    pl_tex result = NULL;
+    assert(mp_motion_render(motion, first, second, first_id, second_id,
+                            alpha, &result));
+    assert(mp_motion_get_stats(motion).analyzed_pairs - stats.analyzed_pairs ==
+           expected_analysis);
+    assert(result->params.w == first->params.w);
+    assert(result->params.h == first->params.h);
+    size_t count = (size_t)first->params.w * first->params.h * 4;
+    float *actual = calloc(count, sizeof(float));
+    float *expected = calloc(count, sizeof(float));
+    assert(actual && expected);
+    readback(gpu, result, actual);
+    mp_motion_reset(fresh);
+    assert(mp_motion_render(fresh, first, second, first_id, second_id,
+                            alpha, &result));
+    readback(gpu, result, expected);
+    for (size_t i = 0; i < count; i++) {
+        assert(isfinite(actual[i]) && isfinite(expected[i]));
+        assert(actual[i] == expected[i]);
+    }
+    free(actual);
+    free(expected);
+}
+
+static void pyramid_reuse(pl_gpu gpu)
+{
+    pl_tex inputs[6];
+    for (int i = 0; i < 6; i++)
+        inputs[i] = cache_input(gpu, i < 4 ? 128 : 256,
+                               i < 4 ? 96 : 192, i * 3);
+    const struct {
+        const char *name;
+        int first, second;
+        uint64_t first_id, second_id;
+        bool reset, analyze;
+    } cases[] = {
+        {"forward-adjacent", 1, 2, 11, 12, false, true},
+        {"backward-adjacent", 2, 0, 12, 10, false, true},
+        {"shared-first", 0, 2, 10, 12, false, true},
+        {"shared-second", 2, 1, 12, 11, false, true},
+        {"reversed", 1, 0, 11, 10, false, true},
+        {"disjoint", 2, 3, 12, 13, false, true},
+        {"same-pair-new-alpha", 0, 1, 10, 11, false, false},
+        {"reset-same-pair", 0, 1, 10, 11, true, true},
+        {"same-ids-new-source-size", 4, 5, 10, 11, false, true},
+    };
+    for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+        struct mp_motion *motion = mp_motion_create(gpu, 128);
+        struct mp_motion *fresh = mp_motion_create(gpu, 128);
+        assert(motion && fresh);
+        pl_tex result;
+        assert(mp_motion_render(motion, inputs[0], inputs[1], 10, 11, 0.2f,
+                                &result));
+        if (cases[i].reset)
+            mp_motion_reset(motion);
+        cache_compare(gpu, motion, fresh, inputs[cases[i].first],
+                      inputs[cases[i].second], cases[i].first_id,
+                      cases[i].second_id, 0.5f, cases[i].analyze);
+        printf("pyramid reuse %s: exact output\n", cases[i].name);
+        mp_motion_destroy(&motion);
+        mp_motion_destroy(&fresh);
+    }
+    for (int i = 0; i < 6; i++)
+        pl_tex_destroy(gpu, &inputs[i]);
+    puts("Pyramid reuse regression: passed (9 cases, exact half-output equality)");
+}
+
 static void capabilities(pl_gpu gpu)
 {
     assert(!mp_motion_supported(NULL));
@@ -966,6 +1135,7 @@ int main(void)
     capabilities(vulkan->gpu);
     assert(motion);
     subpixel_matching(vulkan->gpu);
+    pyramid_reuse(vulkan->gpu);
     translated_pair(vulkan->gpu, motion);
     affine_pair(vulkan->gpu, motion, 129, 97, 1);
     foreground_pair(vulkan->gpu, motion, WIDTH, HEIGHT, 1);
@@ -990,6 +1160,10 @@ int main(void)
     assert(motion);
     affine_pair(vulkan->gpu, motion, 1920, 1080, 8);
     foreground_pair(vulkan->gpu, motion, 1920, 1080, 4);
+    for (int variant = 0; variant < 4; variant++) {
+        diagonal_edge(vulkan->gpu, motion, false, variant);
+        diagonal_edge(vulkan->gpu, motion, true, variant);
+    }
     mp_motion_destroy(&motion);
     pl_vulkan_destroy(&vulkan);
     assert(gpu_errors == 0);

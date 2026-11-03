@@ -23,6 +23,7 @@ struct mp_motion {
     pl_tex scene;
     pl_tex result;
     int max_dimension;
+    int source_width, source_height;
     uint64_t ids[2];
     bool pair_valid;
     bool result_valid;
@@ -146,6 +147,28 @@ static const char match_body[] = GLSL(
 );
 
 static const char refine_header[] = GLSL(
+    // The first patch is identical for every parent, LK and axis candidate.
+    vec3 reference_colors[16];
+
+    // Central differences stay inside the matching patch extent.
+    vec3 patch_tensor(sampler2D first, vec2 p)
+    {
+        float xx = 0.0, xy = 0.0, yy = 0.0;
+        for (int y = -2; y <= 2; y++) {
+            for (int x = -2; x <= 2; x++) {
+                vec2 q = p + vec2(x, y);
+                vec3 dx = sample_color(first, q + vec2(1, 0)) -
+                          sample_color(first, q - vec2(1, 0));
+                vec3 dy = sample_color(first, q + vec2(0, 1)) -
+                          sample_color(first, q - vec2(0, 1));
+                xx += dot(dx, dx);
+                xy += dot(dx, dy);
+                yy += dot(dy, dy);
+            }
+        }
+        return vec3(xx, xy, yy);
+    }
+
     float predictor_strength(sampler2D image, vec2 p)
     {
         vec3 center = sample_color(image, p);
@@ -156,13 +179,14 @@ static const char refine_header[] = GLSL(
         return max(contrast.r, max(contrast.g, contrast.b));
     }
 
-    float patch_cost(sampler2D first, sampler2D second, vec2 p, vec2 vector)
+    float patch_cost(sampler2D second, vec2 p, vec2 vector)
     {
         float cost = 0.0;
         for (int y = -3; y <= 3; y += 2) {
             for (int x = -3; x <= 3; x += 2) {
                 vec2 q = p + vec2(x, y);
-                vec3 error = sample_color(first, q) - sample_color(second, q + vector);
+                vec3 error = reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2] -
+                             sample_color(second, q + vector);
                 cost += dot(abs(error), vec3(0.25)) +
                         0.25 * abs(dot(error, vec3(0.2126, 0.7152, 0.0722)));
             }
@@ -178,25 +202,51 @@ static const char refine_body[] = GLSL(
     vec2 uv = (vec2(gl_GlobalInvocationID.xy) + 0.5) / vec2(settings.xy);
     vec2 size = vec2(textureSize(first, 0));
     vec2 p = uv * size - 0.5;
+    for (int y = -3; y <= 3; y += 2) {
+        for (int x = -3; x <= 3; x += 2)
+            reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2] =
+                sample_color(first, p + vec2(x, y));
+    }
+    vec3 tensor = vec3(0);
+    bool tensor_valid = false;
     ivec2 parent_size = textureSize(parent, 0);
     ivec2 nearest = clamp(ivec2(uv * vec2(parent_size)), ivec2(0), parent_size - 1);
     vec4 inherited = texelFetch(parent, nearest, 0);
     vec2 seed = clamp(inherited.xy / motion_scale, -p, size - 1.0 - p);
-    float best = patch_cost(first, second, p, seed);
+    float best = patch_cost(second, p, seed);
     float strength = predictor_strength(first,
         (vec2(nearest) + 0.5) / vec2(parent_size) * size - 0.5);
     ivec2 base = ivec2(floor(uv * vec2(parent_size) - 0.5));
-    for (int y = 0; y < 2; y++) {
-        for (int x = 0; x < 2; x++) {
+    // Include one parent ring to carry observed motion across flat support.
+    for (int y = -1; y <= 2; y++) {
+        for (int x = -1; x <= 2; x++) {
             ivec2 q = clamp(base + ivec2(x, y), ivec2(0), parent_size - 1);
             vec4 candidate = texelFetch(parent, q, 0);
             vec2 vector = clamp(candidate.xy / motion_scale, -p, size - 1.0 - p);
             if (all(equal(vector, seed)))
                 continue;
-            float cost = patch_cost(first, second, p, vector);
+            float cost = patch_cost(second, p, vector);
             float support = predictor_strength(first,
                 (vec2(q) + 0.5) / vec2(parent_size) * size - 0.5);
-            if (cost < best || (cost == best && support > strength)) {
+            bool preferred = support > strength;
+            // Flat support inherits structure. Observed ties retain the shorter
+            // normal displacement instead of jumping to a repeated edge.
+            if (cost == best) {
+                if (!tensor_valid) {
+                    tensor = patch_tensor(first, p);
+                    tensor_valid = true;
+                }
+                if (tensor.x + tensor.z > 0.000001) {
+                    vec2 normal = tensor.x > tensor.z
+                        ? vec2(1, tensor.y / tensor.x)
+                        : vec2(tensor.y / tensor.z, 1);
+                    float candidate_motion = abs(dot(normal, vector));
+                    float seed_motion = abs(dot(normal, seed));
+                    preferred = candidate_motion < seed_motion ||
+                        (candidate_motion == seed_motion && support > strength);
+                }
+            }
+            if (cost < best || (cost == best && preferred)) {
                 best = cost;
                 strength = support;
                 seed = vector;
@@ -216,7 +266,8 @@ static const char refine_body[] = GLSL(
             for (int x = -3; x <= 3; x += 2) {
                 vec2 q = p + vec2(x, y);
                 vec2 position = q + vector;
-                vec3 error = sample_color(second, position) - sample_color(first, q);
+                vec3 error = sample_color(second, position) -
+                             reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2];
                 residual += dot(abs(error), vec3(1.0 / 3.0));
                 vec3 dx = 0.5 * (sample_color(second, position + vec2(1, 0)) -
                                   sample_color(second, position - vec2(1, 0)));
@@ -245,7 +296,55 @@ static const char refine_body[] = GLSL(
         if (change < 0.001)
             break;
     }
-    residual = patch_cost(first, second, p, vector);
+    residual = patch_cost(second, p, vector);
+    // Exact zero motion is already the unique closest zero-cost candidate.
+    if (any(notEqual(vector, vec2(0))) || residual != 0.0) {
+        // Choose an equivalent lattice representative before interpolation mixes
+        // tangentially ambiguous vectors. Sampled edges need not produce an
+        // exactly rank-one structure tensor.
+        if (!tensor_valid)
+            tensor = patch_tensor(first, p);
+        float xx = tensor.x, xy = tensor.y, yy = tensor.z;
+        float trace = xx + yy;
+        if (trace > 0.000001) {
+            vec2 axis = xx > yy ? vec2(1, 0) : vec2(0, 1);
+            float projected = xx > yy ? vector.x + xy / xx * vector.y
+                                      : vector.y + xy / yy * vector.x;
+            // Bound acceptance by the original minimum, then rank candidates.
+            float limit = residual + 0.000001;
+            float lowest = 1e20;
+            float distance = 1e20;
+            float magnitude = 1e20;
+            vec2 selected = vector;
+            bool unique = false;
+            for (int offset = -1; offset <= 1; offset++) {
+                vec2 candidate = clamp(axis * (round(projected) + float(offset)),
+                                       -p, size - 1.0 - p);
+                float cost = patch_cost(second, p, candidate);
+                float delta = abs(dot(candidate, axis) - projected);
+                float norm = dot(candidate, candidate);
+                if (cost > limit)
+                    continue;
+                if (cost < lowest || (cost == lowest &&
+                    (delta < distance ||
+                     (delta == distance && norm < magnitude)))) {
+                    lowest = cost;
+                    distance = delta;
+                    magnitude = norm;
+                    selected = candidate;
+                    unique = true;
+                } else if (cost == lowest && delta == distance &&
+                           norm == magnitude &&
+                           any(notEqual(candidate, selected))) {
+                    unique = false;
+                }
+            }
+            if (unique) {
+                vector = selected;
+                residual = lowest;
+            }
+        }
+    }
     color = vec4(vector * motion_scale, residual, inherited.w);
 );
 
@@ -448,8 +547,23 @@ static bool downsample(struct mp_motion *m, pl_tex source, pl_tex target)
 static bool analyze(struct mp_motion *m, pl_tex first, pl_tex second,
                     uint64_t first_id, uint64_t second_id)
 {
-    if (m->pair_valid && m->ids[0] == first_id && m->ids[1] == second_id)
+    bool valid = m->pair_valid && m->source_width == first->params.w &&
+                 m->source_height == first->params.h;
+    if (valid && m->ids[0] == first_id && m->ids[1] == second_id)
         return true;
+    bool reuse[2] = {
+        valid && m->ids[0] == first_id,
+        valid && m->ids[1] == second_id,
+    };
+    if (valid && (m->ids[1] == first_id || m->ids[0] == second_id)) {
+        for (int level = 0; level < LEVELS; level++) {
+            pl_tex image = m->images[level][0];
+            m->images[level][0] = m->images[level][1];
+            m->images[level][1] = image;
+        }
+        reuse[0] = m->ids[1] == first_id;
+        reuse[1] = m->ids[0] == second_id;
+    }
     m->pair_valid = false;
     m->result_valid = false;
     int width = first->params.w;
@@ -467,7 +581,8 @@ static bool analyze(struct mp_motion *m, pl_tex first, pl_tex second,
                 !recreate(m, &m->vectors[level][direction],
                           (width + spacing - 1) / spacing,
                           (height + spacing - 1) / spacing) ||
-                !downsample(m, inputs[direction], m->images[level][direction]))
+                (!reuse[direction] &&
+                 !downsample(m, inputs[direction], m->images[level][direction])))
                 return false;
             inputs[direction] = m->images[level][direction];
         }
@@ -534,6 +649,8 @@ static bool analyze(struct mp_motion *m, pl_tex first, pl_tex second,
             .descriptors = scene_desc, .num_descriptors = 4,
         }))
         return false;
+    m->source_width = first->params.w;
+    m->source_height = first->params.h;
     m->ids[0] = first_id;
     m->ids[1] = second_id;
     m->pair_valid = true;
