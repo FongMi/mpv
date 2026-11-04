@@ -22,6 +22,10 @@ struct mp_motion_stats {
     int synthesis_width, synthesis_height;
 };
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 bool mp_motion_supported(pl_gpu gpu);
 struct mp_motion *mp_motion_create(pl_gpu gpu, int max_dimension);
 void mp_motion_destroy(struct mp_motion **motion);
@@ -38,5 +42,9 @@ bool mp_motion_capture(struct mp_motion *motion, const struct pl_frame *source,
 bool mp_motion_render(struct mp_motion *motion, pl_tex first, pl_tex second,
                       uint64_t first_id, uint64_t second_id, float alpha,
                       pl_tex *output);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
