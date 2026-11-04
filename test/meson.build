@@ -88,7 +88,7 @@ if features['vulkan']
         command: [python, files('gpu_motion.py'), '--source', '@INPUT@',
                   '--generate', '@OUTPUT@'])
     gpu_motion = executable('gpu-motion',
-        ['gpu_motion.c', '../video/out/gpu_next/motion.c', motion_shaders],
+        ['gpu_motion.c', motion_shaders], link_with: libmpv_motion,
         include_directories: incdir, dependencies: [libplacebo, libm])
     test('gpu-motion', gpu_motion, suite: 'gpu')
 endif

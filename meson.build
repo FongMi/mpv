@@ -1895,6 +1895,10 @@ libmpv = library('mpv', sources, dependencies: dependencies, gnu_symbol_visibili
                  version: client_api_version, install: get_option('libmpv'),
                  build_by_default: get_option('libmpv'))
 
+libmpv_motion = static_library('mpv-motion',
+    objects: libmpv.extract_objects('video/out/gpu_next/motion.c'),
+    install: get_option('libmpv'), build_by_default: get_option('libmpv'))
+
 
 if get_option('libmpv')
     pkg = import('pkgconfig')
@@ -1905,6 +1909,7 @@ if get_option('libmpv')
                'include/mpv/render_d3d11.h', 'include/mpv/render_gl.h',
                'include/mpv/stream_cb.h']
     install_headers(headers, subdir: 'mpv')
+    install_headers('video/out/gpu_next/motion.h', subdir: 'mpv-motion')
 
     # Allow projects to build with libmpv by cloning into ./subprojects/mpv
     libmpv_dep = declare_dependency(include_directories: incdir_public, link_with: libmpv)
