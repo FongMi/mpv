@@ -257,234 +257,241 @@ static const char refine_header[] = GLSL(
 // use a neighbor supported by visible structure, without averaging motions
 // across independent surfaces into a predictor belonging to neither.
 static const char refine_body[] = GLSL(
-    vec2 uv = (vec2(gl_GlobalInvocationID.xy) + 0.5) / vec2(settings.xy);
-    vec2 size = vec2(textureSize(first, 0));
-    vec2 p = uv * size - 0.5;
-    for (int y = -3; y <= 3; y += 2) {
-        for (int x = -3; x <= 3; x += 2)
-            reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2] =
-                sample_color(first, p + vec2(x, y));
-    }
-    vec3 tensor = vec3(0);
-    bool tensor_valid = false;
-    ivec2 parent_size = textureSize(parent, 0);
-    ivec2 nearest = clamp(ivec2(uv * vec2(parent_size)), ivec2(0), parent_size - 1);
-    vec4 inherited = texelFetch(parent, nearest, 0);
-    vec2 seed = clamp(inherited.xy / motion_scale, -p, size - 1.0 - p);
-    float best = patch_cost(second, p, seed);
-    float strength = predictor_strength(first,
-        (vec2(nearest) + 0.5) / vec2(parent_size) * size - 0.5);
-    ivec2 base = ivec2(floor(uv * vec2(parent_size) - 0.5));
-    // Include one parent ring to carry observed motion across flat support.
-    for (int y = -1; y <= 2; y++) {
-        for (int x = -1; x <= 2; x++) {
-            ivec2 q = clamp(base + ivec2(x, y), ivec2(0), parent_size - 1);
-            vec4 candidate = texelFetch(parent, q, 0);
-            vec2 vector = clamp(candidate.xy / motion_scale, -p, size - 1.0 - p);
-            if (all(equal(vector, seed)))
-                continue;
-            float cost = patch_cost(second, p, vector);
-            float support = predictor_strength(first,
-                (vec2(q) + 0.5) / vec2(parent_size) * size - 0.5);
-            bool preferred = support > strength;
-            // Flat support inherits structure. Observed ties retain the shorter
-            // normal displacement instead of jumping to a repeated edge.
-            if (cost == best) {
-                if (!tensor_valid) {
-                    tensor = patch_tensor(first, p);
-                    tensor_valid = true;
-                }
-                if (tensor.x + tensor.z > 0.000001) {
-                    vec2 normal = tensor.x > tensor.z
-                        ? vec2(1, tensor.y / tensor.x)
-                        : vec2(tensor.y / tensor.z, 1);
-                    float candidate_motion = abs(dot(normal, vector));
-                    float seed_motion = abs(dot(normal, seed));
-                    preferred = candidate_motion < seed_motion ||
-                        (candidate_motion == seed_motion && support > strength);
-                }
-            }
-            if (cost < best || (cost == best && preferred)) {
-                best = cost;
-                strength = support;
-                seed = vector;
-                inherited = candidate;
-            }
-        }
-    }
-    vec2 vector = seed;
-    float residual = 0.0;
-    for (int iteration = 0; iteration < 3 && best > 0.000001; iteration++) {
-        residual = 0.0;
-        float xx = 0.000001;
-        float xy = 0.0;
-        float yy = 0.000001;
-        vec2 rhs = vec2(0.0);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(pixel, settings.xy))) {
+        vec2 uv = (vec2(gl_GlobalInvocationID.xy) + 0.5) / vec2(settings.xy);
+        vec2 size = vec2(textureSize(first, 0));
+        vec2 p = uv * size - 0.5;
         for (int y = -3; y <= 3; y += 2) {
-            for (int x = -3; x <= 3; x += 2) {
-                vec2 q = p + vec2(x, y);
-                vec2 position = q + vector;
-                vec3 error = sample_color(second, position) -
-                             reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2];
-                residual += dot(abs(error), vec3(1.0 / 3.0));
-                vec3 dx = 0.5 * (sample_color(second, position + vec2(1, 0)) -
-                                  sample_color(second, position - vec2(1, 0)));
-                vec3 dy = 0.5 * (sample_color(second, position + vec2(0, 1)) -
-                                  sample_color(second, position - vec2(0, 1)));
-                xx += dot(dx, dx);
-                xy += dot(dx, dy);
-                yy += dot(dy, dy);
-                rhs += vec2(dot(dx, error), dot(dy, error));
-            }
+            for (int x = -3; x <= 3; x += 2)
+                reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2] =
+                    sample_color(first, p + vec2(x, y));
         }
-        if (residual < 0.000001)
-            break;
-        float determinant = xx * yy - xy * xy;
-        if (determinant <= 0.000000000001)
-            break;
-        vec2 step = vec2(yy * rhs.x - xy * rhs.y,
-                          xx * rhs.y - xy * rhs.x) / determinant;
-        vec2 next = clamp(vector - step, seed - vec2(settings.z),
-                           seed + vec2(settings.z));
-        next = clamp(next, -p, size - 1.0 - p);
-        if (any(isnan(next)) || any(isinf(next)))
-            break;
-        float change = length(next - vector);
-        vector = next;
-        if (change < 0.001)
-            break;
-    }
-    residual = patch_cost(second, p, vector);
-    // Exact zero motion is already the unique closest zero-cost candidate.
-    if (any(notEqual(vector, vec2(0))) || residual != 0.0) {
-        // Choose an equivalent lattice representative before interpolation mixes
-        // tangentially ambiguous vectors. Sampled edges need not produce an
-        // exactly rank-one structure tensor.
-        if (!tensor_valid)
-            tensor = patch_tensor(first, p);
-        float xx = tensor.x, xy = tensor.y, yy = tensor.z;
-        float trace = xx + yy;
-        if (trace > 0.000001) {
-            vec2 axis = xx > yy ? vec2(1, 0) : vec2(0, 1);
-            float projected = xx > yy ? vector.x + xy / xx * vector.y
-                                      : vector.y + xy / yy * vector.x;
-            // Bound acceptance by the original minimum, then rank candidates.
-            float limit = residual + 0.000001;
-            float lowest = 1e20;
-            float distance = 1e20;
-            float magnitude = 1e20;
-            vec2 selected = vector;
-            bool unique = false;
-            for (int offset = -1; offset <= 1; offset++) {
-                vec2 candidate = clamp(axis * (round(projected) + float(offset)),
-                                       -p, size - 1.0 - p);
-                float cost = patch_cost(second, p, candidate);
-                float delta = abs(dot(candidate, axis) - projected);
-                float norm = dot(candidate, candidate);
-                if (cost > limit)
+        vec3 tensor = vec3(0);
+        bool tensor_valid = false;
+        ivec2 parent_size = textureSize(parent, 0);
+        ivec2 nearest = clamp(ivec2(uv * vec2(parent_size)), ivec2(0), parent_size - 1);
+        vec4 inherited = texelFetch(parent, nearest, 0);
+        vec2 seed = clamp(inherited.xy / motion_scale, -p, size - 1.0 - p);
+        float best = patch_cost(second, p, seed);
+        float strength = predictor_strength(first,
+            (vec2(nearest) + 0.5) / vec2(parent_size) * size - 0.5);
+        ivec2 base = ivec2(floor(uv * vec2(parent_size) - 0.5));
+        // Include one parent ring to carry observed motion across flat support.
+        for (int y = -1; y <= 2; y++) {
+            for (int x = -1; x <= 2; x++) {
+                ivec2 q = clamp(base + ivec2(x, y), ivec2(0), parent_size - 1);
+                vec4 candidate = texelFetch(parent, q, 0);
+                vec2 vector = clamp(candidate.xy / motion_scale, -p, size - 1.0 - p);
+                if (all(equal(vector, seed)))
                     continue;
-                if (cost < lowest || (cost == lowest &&
-                    (delta < distance ||
-                     (delta == distance && norm < magnitude)))) {
-                    lowest = cost;
-                    distance = delta;
-                    magnitude = norm;
-                    selected = candidate;
-                    unique = true;
-                } else if (cost == lowest && delta == distance &&
-                           norm == magnitude &&
-                           any(notEqual(candidate, selected))) {
-                    unique = false;
+                float cost = patch_cost(second, p, vector);
+                float support = predictor_strength(first,
+                    (vec2(q) + 0.5) / vec2(parent_size) * size - 0.5);
+                bool preferred = support > strength;
+                // Flat support inherits structure. Observed ties retain the shorter
+                // normal displacement instead of jumping to a repeated edge.
+                if (cost == best) {
+                    if (!tensor_valid) {
+                        tensor = patch_tensor(first, p);
+                        tensor_valid = true;
+                    }
+                    if (tensor.x + tensor.z > 0.000001) {
+                        vec2 normal = tensor.x > tensor.z
+                            ? vec2(1, tensor.y / tensor.x)
+                            : vec2(tensor.y / tensor.z, 1);
+                        float candidate_motion = abs(dot(normal, vector));
+                        float seed_motion = abs(dot(normal, seed));
+                        preferred = candidate_motion < seed_motion ||
+                            (candidate_motion == seed_motion && support > strength);
+                    }
+                }
+                if (cost < best || (cost == best && preferred)) {
+                    best = cost;
+                    strength = support;
+                    seed = vector;
+                    inherited = candidate;
                 }
             }
-            if (unique) {
-                vector = selected;
-                residual = lowest;
-            }
         }
-    }
-    // Dense support can observe motion missed by central-difference tensors.
-    // Resolve equivalent axis vectors without increasing the original cost.
-    if (all(equal(motion_scale, vec2(1))) && any(notEqual(vector, vec2(0)))) {
-        vec2 cost = dense_pair_cost(first, second, p, vector);
-        if (cost.x > cost.y) {
-            float limit = cost.y + 0.000001;
-            vec2 original = vector;
-            float magnitude = dot(vector, vector);
-            float distance = 0.0;
-            for (int index = 0; index < 2 * (2 * settings.z + 1); index++) {
-                int offset = index % (2 * settings.z + 1) - settings.z;
-                vec2 axis = index < 2 * settings.z + 1 ? vec2(1, 0) : vec2(0, 1);
-                vec2 candidate = clamp(axis * float(offset), -p, size - 1.0 - p);
-                float norm = dot(candidate, candidate);
-                float delta = dot(candidate - original, candidate - original);
-                if ((norm < magnitude || (norm == magnitude && delta < distance)) &&
-                    dense_cost(first, second, p, candidate, limit) <= limit) {
-                    vector = candidate;
-                    magnitude = norm;
-                    distance = delta;
+        vec2 vector = seed;
+        float residual = 0.0;
+        for (int iteration = 0; iteration < 3 && best > 0.000001; iteration++) {
+            residual = 0.0;
+            float xx = 0.000001;
+            float xy = 0.0;
+            float yy = 0.000001;
+            vec2 rhs = vec2(0.0);
+            for (int y = -3; y <= 3; y += 2) {
+                for (int x = -3; x <= 3; x += 2) {
+                    vec2 q = p + vec2(x, y);
+                    vec2 position = q + vector;
+                    vec3 error = sample_color(second, position) -
+                                 reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2];
+                    residual += dot(abs(error), vec3(1.0 / 3.0));
+                    vec3 dx = 0.5 * (sample_color(second, position + vec2(1, 0)) -
+                                      sample_color(second, position - vec2(1, 0)));
+                    vec3 dy = 0.5 * (sample_color(second, position + vec2(0, 1)) -
+                                      sample_color(second, position - vec2(0, 1)));
+                    xx += dot(dx, dx);
+                    xy += dot(dx, dy);
+                    yy += dot(dy, dy);
+                    rhs += vec2(dot(dx, error), dot(dy, error));
                 }
             }
-            residual = patch_cost(second, p, vector);
+            if (residual < 0.000001)
+                break;
+            float determinant = xx * yy - xy * xy;
+            if (determinant <= 0.000000000001)
+                break;
+            vec2 step = vec2(yy * rhs.x - xy * rhs.y,
+                              xx * rhs.y - xy * rhs.x) / determinant;
+            vec2 next = clamp(vector - step, seed - vec2(settings.z),
+                               seed + vec2(settings.z));
+            next = clamp(next, -p, size - 1.0 - p);
+            if (any(isnan(next)) || any(isinf(next)))
+                break;
+            float change = length(next - vector);
+            vector = next;
+            if (change < 0.001)
+                break;
         }
+        residual = patch_cost(second, p, vector);
+        // Exact zero motion is already the unique closest zero-cost candidate.
+        if (any(notEqual(vector, vec2(0))) || residual != 0.0) {
+            // Choose an equivalent lattice representative before interpolation mixes
+            // tangentially ambiguous vectors. Sampled edges need not produce an
+            // exactly rank-one structure tensor.
+            if (!tensor_valid)
+                tensor = patch_tensor(first, p);
+            float xx = tensor.x, xy = tensor.y, yy = tensor.z;
+            float trace = xx + yy;
+            if (trace > 0.000001) {
+                vec2 axis = xx > yy ? vec2(1, 0) : vec2(0, 1);
+                float projected = xx > yy ? vector.x + xy / xx * vector.y
+                                          : vector.y + xy / yy * vector.x;
+                // Bound acceptance by the original minimum, then rank candidates.
+                float limit = residual + 0.000001;
+                float lowest = 1e20;
+                float distance = 1e20;
+                float magnitude = 1e20;
+                vec2 selected = vector;
+                bool unique = false;
+                for (int offset = -1; offset <= 1; offset++) {
+                    vec2 candidate = clamp(axis * (round(projected) + float(offset)),
+                                           -p, size - 1.0 - p);
+                    float cost = patch_cost(second, p, candidate);
+                    float delta = abs(dot(candidate, axis) - projected);
+                    float norm = dot(candidate, candidate);
+                    if (cost > limit)
+                        continue;
+                    if (cost < lowest || (cost == lowest &&
+                        (delta < distance ||
+                         (delta == distance && norm < magnitude)))) {
+                        lowest = cost;
+                        distance = delta;
+                        magnitude = norm;
+                        selected = candidate;
+                        unique = true;
+                    } else if (cost == lowest && delta == distance &&
+                               norm == magnitude &&
+                               any(notEqual(candidate, selected))) {
+                        unique = false;
+                    }
+                }
+                if (unique) {
+                    vector = selected;
+                    residual = lowest;
+                }
+            }
+        }
+        // Dense support can observe motion missed by central-difference tensors.
+        // Resolve equivalent axis vectors without increasing the original cost.
+        if (all(equal(motion_scale, vec2(1))) && any(notEqual(vector, vec2(0)))) {
+            vec2 cost = dense_pair_cost(first, second, p, vector);
+            if (cost.x > cost.y) {
+                float limit = cost.y + 0.000001;
+                vec2 original = vector;
+                float magnitude = dot(vector, vector);
+                float distance = 0.0;
+                for (int index = 0; index < 2 * (2 * settings.z + 1); index++) {
+                    int offset = index % (2 * settings.z + 1) - settings.z;
+                    vec2 axis = index < 2 * settings.z + 1 ? vec2(1, 0) : vec2(0, 1);
+                    vec2 candidate = clamp(axis * float(offset), -p, size - 1.0 - p);
+                    float norm = dot(candidate, candidate);
+                    float delta = dot(candidate - original, candidate - original);
+                    if ((norm < magnitude || (norm == magnitude && delta < distance)) &&
+                        dense_cost(first, second, p, candidate, limit) <= limit) {
+                        vector = candidate;
+                        magnitude = norm;
+                        distance = delta;
+                    }
+                }
+                residual = patch_cost(second, p, vector);
+            }
+        }
+        color = vec4(vector * motion_scale, residual, inherited.w);
     }
-    color = vec4(vector * motion_scale, residual, inherited.w);
 );
 
 static const char evidence_body[] = GLSL(
     ivec2 grid = textureSize(forward, 0);
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    vec2 position = (vec2(pixel) + 0.5) / vec2(grid);
-    vec2 size = vec2(textureSize(first, 0));
-    vec2 center = position * size - 0.5;
-    vec4 value = texelFetch(forward, pixel, 0);
-    float evidence = 0.0;
-    if (any(notEqual(value.xy, vec2(0)))) {
-        vec2 cost = dense_pair_cost(first, second, center, value.xy);
-        evidence = max(0.0, cost.x - cost.y);
+    if (all(lessThan(pixel, grid))) {
+        vec2 position = (vec2(pixel) + 0.5) / vec2(grid);
+        vec2 size = vec2(textureSize(first, 0));
+        vec2 center = position * size - 0.5;
+        vec4 value = texelFetch(forward, pixel, 0);
+        float evidence = 0.0;
+        if (any(notEqual(value.xy, vec2(0)))) {
+            vec2 cost = dense_pair_cost(first, second, center, value.xy);
+            evidence = max(0.0, cost.x - cost.y);
+        }
+        color = pack_evidence(evidence);
     }
-    color = pack_evidence(evidence);
 );
 
 static const char reconstruction_body[] = GLSL(
     ivec2 grid = textureSize(forward, 0);
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    vec2 uv = (vec2(pixel) + 0.5) / vec2(grid);
-    vec2 size = vec2(textureSize(first, 0));
-    vec2 p = uv * size - 0.5;
-    for (int y = -3; y <= 3; y += 2) {
-        for (int x = -3; x <= 3; x += 2)
-            reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2] =
-                sample_color(first, p + vec2(x, y));
-    }
-    // Select an observed vector; averaging aliases can invent invalid motion.
-    vec4 selected = texelFetch(forward, pixel, 0);
-    float limit = patch_cost(second, p, selected.xy) + 0.000001;
-    float best = -1.0;
-    float nearest = 1e20;
-    for (int y = -2; y <= 2; y++) {
-        for (int x = -2; x <= 2; x++) {
-            ivec2 q = clamp(pixel + ivec2(x, y), ivec2(0), grid - 1);
-            float evidence = unpack_evidence(texelFetch(evidence_map, q, 0));
-            float distance = float(x * x + y * y);
-            if (!(evidence > best || (evidence == best && distance < nearest)))
-                continue;
-            vec2 position = (vec2(q) + 0.5) / vec2(grid);
-            vec4 value = texelFetch(forward, q, 0);
-            vec4 reverse = textureLod(backward,
-                                      position + value.xy / size, 0.0);
-            if (any(isnan(value)) || any(isinf(value)) ||
-                any(isnan(reverse)) || any(isinf(reverse)))
-                continue;
-            float cycle = length(value.xy + reverse.xy);
-            if (cycle >= 1.5 || patch_cost(second, p, value.xy) > limit)
-                continue;
-            selected = value;
-            best = evidence;
-            nearest = distance;
+    if (all(lessThan(pixel, grid))) {
+        vec2 uv = (vec2(pixel) + 0.5) / vec2(grid);
+        vec2 size = vec2(textureSize(first, 0));
+        vec2 p = uv * size - 0.5;
+        for (int y = -3; y <= 3; y += 2) {
+            for (int x = -3; x <= 3; x += 2)
+                reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2] =
+                    sample_color(first, p + vec2(x, y));
         }
+        // Select an observed vector; averaging aliases can invent invalid motion.
+        vec4 selected = texelFetch(forward, pixel, 0);
+        float limit = patch_cost(second, p, selected.xy) + 0.000001;
+        float best = -1.0;
+        float nearest = 1e20;
+        for (int y = -2; y <= 2; y++) {
+            for (int x = -2; x <= 2; x++) {
+                ivec2 q = clamp(pixel + ivec2(x, y), ivec2(0), grid - 1);
+                float evidence = unpack_evidence(texelFetch(evidence_map, q, 0));
+                float distance = float(x * x + y * y);
+                if (!(evidence > best || (evidence == best && distance < nearest)))
+                    continue;
+                vec2 position = (vec2(q) + 0.5) / vec2(grid);
+                vec4 value = texelFetch(forward, q, 0);
+                vec4 reverse = textureLod(backward,
+                                          position + value.xy / size, 0.0);
+                if (any(isnan(value)) || any(isinf(value)) ||
+                    any(isnan(reverse)) || any(isinf(reverse)))
+                    continue;
+                float cycle = length(value.xy + reverse.xy);
+                if (cycle >= 1.5 || patch_cost(second, p, value.xy) > limit)
+                    continue;
+                selected = value;
+                best = evidence;
+                nearest = distance;
+            }
+        }
+        color = vec4(selected.xy, patch_cost(second, p, selected.xy), selected.w);
     }
-    color = vec4(selected.xy, patch_cost(second, p, selected.xy), selected.w);
 );
 
 static const char scene_body[] = GLSL(

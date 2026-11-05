@@ -1097,6 +1097,37 @@ static void pyramid_reuse(pl_gpu gpu)
     puts("Pyramid reuse regression: passed (9 cases, exact half-output equality)");
 }
 
+static void padding_sizes(pl_gpu gpu)
+{
+    static const int sizes[][2] = {
+        {8, 8}, {8, 17}, {17, 8}, {9, 9}, {65, 73}, {129, 97},
+    };
+    for (int i = 0; i < 6; i++) {
+        int width = sizes[i][0], height = sizes[i][1];
+        pl_tex first = cache_input(gpu, width, height, 0);
+        pl_tex second = cache_input(gpu, width, height, 1);
+        struct mp_motion *motion = mp_motion_create(gpu, 480);
+        assert(motion);
+        for (int step = 1; step <= 3; step++) {
+            pl_tex result;
+            assert(mp_motion_render(motion, first, second, 1, 2,
+                                    step * 0.25f, &result));
+            size_t count = (size_t) width * height * 4;
+            float *pixels = malloc(count * sizeof(float));
+            assert(pixels);
+            readback(gpu, result, pixels);
+            for (size_t j = 0; j < count; j++)
+                assert(isfinite(pixels[j]));
+            free(pixels);
+            printf("padding size=%dx%d step=%d finite output\n", width, height, step);
+        }
+        assert(mp_motion_get_stats(motion).analyzed_pairs == 1);
+        mp_motion_destroy(&motion);
+        pl_tex_destroy(gpu, &first);
+        pl_tex_destroy(gpu, &second);
+    }
+}
+
 static void capabilities(pl_gpu gpu)
 {
     assert(!mp_motion_supported(NULL));
@@ -1436,6 +1467,7 @@ int main(void)
     assert(motion);
     subpixel_matching(vulkan->gpu);
     pyramid_reuse(vulkan->gpu);
+    padding_sizes(vulkan->gpu);
     translated_pair(vulkan->gpu, motion);
     affine_pair(vulkan->gpu, motion, 129, 97, 1);
     foreground_pair(vulkan->gpu, motion, WIDTH, HEIGHT, 1);
