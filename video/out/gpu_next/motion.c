@@ -465,6 +465,10 @@ static const char reconstruction_body[] = GLSL(
     for (int y = -2; y <= 2; y++) {
         for (int x = -2; x <= 2; x++) {
             ivec2 q = clamp(pixel + ivec2(x, y), ivec2(0), grid - 1);
+            float evidence = unpack_evidence(texelFetch(evidence_map, q, 0));
+            float distance = float(x * x + y * y);
+            if (!(evidence > best || (evidence == best && distance < nearest)))
+                continue;
             vec2 position = (vec2(q) + 0.5) / vec2(grid);
             vec4 value = texelFetch(forward, q, 0);
             vec4 reverse = textureLod(backward,
@@ -475,13 +479,9 @@ static const char reconstruction_body[] = GLSL(
             float cycle = length(value.xy + reverse.xy);
             if (cycle >= 1.5 || patch_cost(second, p, value.xy) > limit)
                 continue;
-            float evidence = unpack_evidence(texelFetch(evidence_map, q, 0));
-            float distance = float(x * x + y * y);
-            if (evidence > best || (evidence == best && distance < nearest)) {
-                selected = value;
-                best = evidence;
-                nearest = distance;
-            }
+            selected = value;
+            best = evidence;
+            nearest = distance;
         }
     }
     color = vec4(selected.xy, patch_cost(second, p, selected.xy), selected.w);
