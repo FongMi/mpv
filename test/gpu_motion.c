@@ -1269,6 +1269,71 @@ static void synthesis_sampling(pl_gpu gpu)
     assert(!failed);
 }
 
+static void dense_pair_equivalence(pl_gpu gpu)
+{
+    static const float vectors[][2] = {
+        {0, 0}, {3, 0}, {1.25f, -0.5f}, {-3.75f, 2.125f},
+    };
+    float *pixels = malloc(WIDTH * HEIGHT * 4 * sizeof(float));
+    assert(pixels);
+    pattern(pixels, 0);
+    pl_tex first = upload(gpu, pixels);
+    pattern(pixels, 3);
+    pl_tex second = upload(gpu, pixels);
+    free(pixels);
+    pl_fmt format = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+        PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_STORABLE | PL_FMT_CAP_HOST_READABLE);
+    assert(format);
+    pl_tex target = pl_tex_create(gpu, pl_tex_params(
+        .w = 32, .h = 24, .format = format,
+        .renderable = true, .storable = true, .host_readable = true,
+    ));
+    assert(target);
+    pl_dispatch dispatch = pl_dispatch_create(gpu->log, gpu);
+    assert(dispatch);
+    struct pl_shader_desc descriptors[] = {
+        policy_sampled("first", first), policy_sampled("second", second),
+    };
+    for (size_t i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
+        struct pl_shader_var variable = {
+            .var = pl_var_vec2("vector"), .data = vectors[i], .dynamic = true,
+        };
+        pl_shader shader = pl_dispatch_begin(dispatch);
+        assert(pl_shader_custom(shader, &(struct pl_custom_shader) {
+            .header = test_sample_header,
+        }));
+        assert(pl_shader_custom(shader, &(struct pl_custom_shader) {
+            .header = test_refine_header,
+            .body = "vec2 p = vec2(gl_GlobalInvocationID.xy) *"
+                    " vec2(2.75, 2.5) + 0.375;"
+                    "vec2 cost = dense_pair_cost(first, second, p, vector);"
+                    "color = vec4(cost, dense_cost(first, second, p, vec2(0), 1e20),"
+                    "dense_cost(first, second, p, vector, 1e20));",
+            .compute = true, .compute_group_size = {8, 8},
+            .output = PL_SHADER_SIG_COLOR,
+            .descriptors = descriptors, .num_descriptors = 2,
+            .variables = &variable, .num_variables = 1,
+        }));
+        assert(pl_dispatch_finish(dispatch, pl_dispatch_params(
+            .shader = &shader, .target = target,
+        )));
+        uint32_t actual[32 * 24 * 4];
+        assert(pl_tex_download(gpu, pl_tex_transfer_params(
+            .tex = target, .ptr = actual,
+        )));
+        for (int pixel = 0; pixel < 32 * 24; pixel++) {
+            assert(actual[pixel * 4] == actual[pixel * 4 + 2]);
+            assert(actual[pixel * 4 + 1] == actual[pixel * 4 + 3]);
+        }
+        printf("dense pair vector=%.3f,%.3f exact_costs=1536\n",
+               vectors[i][0], vectors[i][1]);
+    }
+    pl_dispatch_destroy(&dispatch);
+    pl_tex_destroy(gpu, &first);
+    pl_tex_destroy(gpu, &second);
+    pl_tex_destroy(gpu, &target);
+}
+
 static void evidence_bits(pl_gpu gpu)
 {
     static const uint32_t values[] = {
@@ -1322,7 +1387,8 @@ static void evidence_bits(pl_gpu gpu)
         }));
         assert(pl_shader_custom(shader, &(struct pl_custom_shader) {
             .header = test_refine_header,
-            .body = "color = vec4(unpack_evidence(texelFetch(encoded, ivec2(0), 0)));",
+            .body = "color = vec4(unpack_evidence("
+                    "texelFetch(encoded, ivec2(0), 0)));",
             .compute = true, .compute_group_size = {1, 1},
             .output = PL_SHADER_SIG_COLOR,
             .descriptors = &descriptor, .num_descriptors = 1,
@@ -1366,6 +1432,7 @@ int main(void)
     struct mp_motion *motion = mp_motion_create(vulkan->gpu, 128);
     capabilities(vulkan->gpu);
     evidence_bits(vulkan->gpu);
+    dense_pair_equivalence(vulkan->gpu);
     assert(motion);
     subpixel_matching(vulkan->gpu);
     pyramid_reuse(vulkan->gpu);

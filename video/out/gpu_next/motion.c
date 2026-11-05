@@ -201,6 +201,24 @@ static const char refine_header[] = GLSL(
         return max(contrast.r, max(contrast.g, contrast.b));
     }
 
+    vec2 dense_pair_cost(sampler2D first, sampler2D second, vec2 p, vec2 vector)
+    {
+        vec2 cost = vec2(0);
+        for (int y = -3; y <= 3; y++) {
+            for (int x = -3; x <= 3; x++) {
+                vec2 q = p + vec2(x, y);
+                vec3 source = sample_color(first, q);
+                vec3 zero_error = source - sample_color(second, q);
+                vec3 motion_error = source - sample_color(second, q + vector);
+                cost.x += dot(abs(zero_error), vec3(0.25)) +
+                    0.25 * abs(dot(zero_error, vec3(0.2126, 0.7152, 0.0722)));
+                cost.y += dot(abs(motion_error), vec3(0.25)) +
+                    0.25 * abs(dot(motion_error, vec3(0.2126, 0.7152, 0.0722)));
+            }
+        }
+        return cost / 49.0;
+    }
+
     float dense_cost(sampler2D first, sampler2D second, vec2 p, vec2 vector,
                      float limit)
     {
@@ -208,7 +226,8 @@ static const char refine_header[] = GLSL(
         for (int y = -3; y <= 3; y++) {
             for (int x = -3; x <= 3; x++) {
                 vec2 q = p + vec2(x, y);
-                vec3 error = sample_color(first, q) - sample_color(second, q + vector);
+                vec3 error = sample_color(first, q) -
+                             sample_color(second, q + vector);
                 cost += dot(abs(error), vec3(0.25)) +
                         0.25 * abs(dot(error, vec3(0.2126, 0.7152, 0.0722)));
                 if (cost / 49.0 > limit)
@@ -386,11 +405,10 @@ static const char refine_body[] = GLSL(
     }
     // Dense support can observe motion missed by central-difference tensors.
     // Resolve equivalent axis vectors without increasing the original cost.
-    if (all(equal(motion_scale, vec2(1)))) {
-        float original_cost = dense_cost(first, second, p, vector, 1e20);
-        float zero_cost = dense_cost(first, second, p, vec2(0), 1e20);
-        if (zero_cost > original_cost) {
-            float limit = original_cost + 0.000001;
+    if (all(equal(motion_scale, vec2(1))) && any(notEqual(vector, vec2(0)))) {
+        vec2 cost = dense_pair_cost(first, second, p, vector);
+        if (cost.x > cost.y) {
+            float limit = cost.y + 0.000001;
             vec2 original = vector;
             float magnitude = dot(vector, vector);
             float distance = 0.0;
@@ -420,9 +438,11 @@ static const char evidence_body[] = GLSL(
     vec2 size = vec2(textureSize(first, 0));
     vec2 center = position * size - 0.5;
     vec4 value = texelFetch(forward, pixel, 0);
-    float evidence = max(0.0,
-        dense_cost(first, second, center, vec2(0), 1e20) -
-        dense_cost(first, second, center, value.xy, 1e20));
+    float evidence = 0.0;
+    if (any(notEqual(value.xy, vec2(0)))) {
+        vec2 cost = dense_pair_cost(first, second, center, value.xy);
+        evidence = max(0.0, cost.x - cost.y);
+    }
     color = pack_evidence(evidence);
 );
 
