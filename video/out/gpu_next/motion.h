@@ -16,6 +16,8 @@ struct mp_motion_stats {
     uint64_t capture_ns;
     uint64_t coarse_ns;
     uint64_t refinement_ns;
+    uint64_t evidence_ns;
+    uint64_t reconstruction_ns;
     uint64_t warp_ns;
     uint64_t synthesis_ns;
     int analysis_width, analysis_height;

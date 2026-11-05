@@ -19,6 +19,8 @@ struct mp_motion {
     pl_renderer renderer;
     pl_tex images[LEVELS][2];
     pl_tex vectors[LEVELS][2];
+    pl_tex evidence[2];
+    pl_tex reconstructed[2];
     pl_tex warps[2];
     pl_tex scene;
     pl_tex result;
@@ -152,6 +154,21 @@ static const char match_body[] = GLSL(
 );
 
 static const char refine_header[] = GLSL(
+    // Keep FP32 ordering scores exact in the supported RGBA16F format.
+    vec4 pack_evidence(float evidence)
+    {
+        uint bits = floatBitsToUint(evidence);
+        return vec4(uvec4(bits, bits >> 8, bits >> 16, bits >> 24) & uvec4(255));
+    }
+
+    float unpack_evidence(vec4 evidence)
+    {
+        uvec4 bytes = uvec4(evidence);
+        uint bits = bytes.x | (bytes.y << 8) | (bytes.z << 16) |
+                    (bytes.w << 24);
+        return uintBitsToFloat(bits);
+    }
+
     // The first patch is identical for every parent, LK and axis candidate.
     vec3 reference_colors[16];
 
@@ -182,6 +199,23 @@ static const char refine_header[] = GLSL(
         contrast = max(contrast, abs(center - sample_color(image, p + vec2(0, 6))));
         contrast = max(contrast, abs(center - sample_color(image, p - vec2(0, 6))));
         return max(contrast.r, max(contrast.g, contrast.b));
+    }
+
+    float dense_cost(sampler2D first, sampler2D second, vec2 p, vec2 vector,
+                     float limit)
+    {
+        float cost = 0.0;
+        for (int y = -3; y <= 3; y++) {
+            for (int x = -3; x <= 3; x++) {
+                vec2 q = p + vec2(x, y);
+                vec3 error = sample_color(first, q) - sample_color(second, q + vector);
+                cost += dot(abs(error), vec3(0.25)) +
+                        0.25 * abs(dot(error, vec3(0.2126, 0.7152, 0.0722)));
+                if (cost / 49.0 > limit)
+                    return cost / 49.0;
+            }
+        }
+        return cost / 49.0;
     }
 
     float patch_cost(sampler2D second, vec2 p, vec2 vector)
@@ -350,7 +384,87 @@ static const char refine_body[] = GLSL(
             }
         }
     }
+    // Dense support can observe motion missed by central-difference tensors.
+    // Resolve equivalent axis vectors without increasing the original cost.
+    if (all(equal(motion_scale, vec2(1)))) {
+        float original_cost = dense_cost(first, second, p, vector, 1e20);
+        float zero_cost = dense_cost(first, second, p, vec2(0), 1e20);
+        if (zero_cost > original_cost) {
+            float limit = original_cost + 0.000001;
+            vec2 original = vector;
+            float magnitude = dot(vector, vector);
+            float distance = 0.0;
+            for (int index = 0; index < 2 * (2 * settings.z + 1); index++) {
+                int offset = index % (2 * settings.z + 1) - settings.z;
+                vec2 axis = index < 2 * settings.z + 1 ? vec2(1, 0) : vec2(0, 1);
+                vec2 candidate = clamp(axis * float(offset), -p, size - 1.0 - p);
+                float norm = dot(candidate, candidate);
+                float delta = dot(candidate - original, candidate - original);
+                if ((norm < magnitude || (norm == magnitude && delta < distance)) &&
+                    dense_cost(first, second, p, candidate, limit) <= limit) {
+                    vector = candidate;
+                    magnitude = norm;
+                    distance = delta;
+                }
+            }
+            residual = patch_cost(second, p, vector);
+        }
+    }
     color = vec4(vector * motion_scale, residual, inherited.w);
+);
+
+static const char evidence_body[] = GLSL(
+    ivec2 grid = textureSize(forward, 0);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    vec2 position = (vec2(pixel) + 0.5) / vec2(grid);
+    vec2 size = vec2(textureSize(first, 0));
+    vec2 center = position * size - 0.5;
+    vec4 value = texelFetch(forward, pixel, 0);
+    float evidence = max(0.0,
+        dense_cost(first, second, center, vec2(0), 1e20) -
+        dense_cost(first, second, center, value.xy, 1e20));
+    color = pack_evidence(evidence);
+);
+
+static const char reconstruction_body[] = GLSL(
+    ivec2 grid = textureSize(forward, 0);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(grid);
+    vec2 size = vec2(textureSize(first, 0));
+    vec2 p = uv * size - 0.5;
+    for (int y = -3; y <= 3; y += 2) {
+        for (int x = -3; x <= 3; x += 2)
+            reference_colors[((y + 3) / 2) * 4 + (x + 3) / 2] =
+                sample_color(first, p + vec2(x, y));
+    }
+    // Select an observed vector; averaging aliases can invent invalid motion.
+    vec4 selected = texelFetch(forward, pixel, 0);
+    float limit = patch_cost(second, p, selected.xy) + 0.000001;
+    float best = -1.0;
+    float nearest = 1e20;
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            ivec2 q = clamp(pixel + ivec2(x, y), ivec2(0), grid - 1);
+            vec2 position = (vec2(q) + 0.5) / vec2(grid);
+            vec4 value = texelFetch(forward, q, 0);
+            vec4 reverse = textureLod(backward,
+                                      position + value.xy / size, 0.0);
+            if (any(isnan(value)) || any(isinf(value)) ||
+                any(isnan(reverse)) || any(isinf(reverse)))
+                continue;
+            float cycle = length(value.xy + reverse.xy);
+            if (cycle >= 1.5 || patch_cost(second, p, value.xy) > limit)
+                continue;
+            float evidence = unpack_evidence(texelFetch(evidence_map, q, 0));
+            float distance = float(x * x + y * y);
+            if (evidence > best || (evidence == best && distance < nearest)) {
+                selected = value;
+                best = evidence;
+                nearest = distance;
+            }
+        }
+    }
+    color = vec4(selected.xy, patch_cost(second, p, selected.xy), selected.w);
 );
 
 static const char scene_body[] = GLSL(
@@ -644,6 +758,41 @@ static bool analyze(struct mp_motion *m, pl_tex first, pl_tex second,
                 return false;
         }
     }
+    for (int direction = 0; direction < 2; direction++) {
+        pl_tex vectors = m->vectors[0][direction];
+        if (!recreate(m, &m->evidence[direction],
+                      vectors->params.w, vectors->params.h))
+            return false;
+        struct pl_shader_desc evidence_desc[] = {
+            sampled("first", m->images[0][direction]),
+            sampled("second", m->images[0][!direction]),
+            sampled("forward", vectors),
+        };
+        m->timing_stage = LEVELS + 2;
+        if (!dispatch(m, m->evidence[direction], &(struct pl_custom_shader) {
+            .description = "motion observed evidence",
+            .header = refine_header, .body = evidence_body,
+            .descriptors = evidence_desc, .num_descriptors = 3,
+        }))
+            return false;
+        if (!recreate(m, &m->reconstructed[direction],
+                      vectors->params.w, vectors->params.h))
+            return false;
+        struct pl_shader_desc desc[] = {
+            sampled("first", m->images[0][direction]),
+            sampled("second", m->images[0][!direction]),
+            sampled("forward", m->vectors[0][direction]),
+            sampled("backward", m->vectors[0][!direction]),
+            sampled("evidence_map", m->evidence[direction]),
+        };
+        m->timing_stage = LEVELS + 3;
+        if (!dispatch(m, m->reconstructed[direction], &(struct pl_custom_shader) {
+            .description = "motion field reconstruction",
+            .header = refine_header, .body = reconstruction_body,
+            .descriptors = desc, .num_descriptors = 5,
+        }))
+            return false;
+    }
     struct pl_shader_desc scene_desc[] = {
         sampled("first", m->images[0][0]), sampled("second", m->images[0][1]),
         sampled("forward", m->vectors[0][0]), sampled("backward", m->vectors[0][1]),
@@ -680,6 +829,10 @@ static void gpu_timing(void *priv, const struct pl_dispatch_info *info)
         m->stats.warp_ns = info->average;
     else if (m->timing_stage == LEVELS + 1)
         m->stats.synthesis_ns = info->average;
+    else if (m->timing_stage == LEVELS + 2)
+        m->stats.evidence_ns = info->average;
+    else if (m->timing_stage == LEVELS + 3)
+        m->stats.reconstruction_ns = info->average;
 }
 
 static void capture_timing(void *priv, const struct pl_render_info *info)
@@ -754,8 +907,11 @@ void mp_motion_destroy(struct mp_motion **motion)
             pl_tex_destroy(m->gpu, &m->vectors[level][direction]);
         }
     }
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 2; i++) {
+        pl_tex_destroy(m->gpu, &m->evidence[i]);
+        pl_tex_destroy(m->gpu, &m->reconstructed[i]);
         pl_tex_destroy(m->gpu, &m->warps[i]);
+    }
     pl_tex_destroy(m->gpu, &m->scene);
     pl_tex_destroy(m->gpu, &m->result);
     pl_dispatch_destroy(&m->dispatch);
@@ -825,8 +981,8 @@ bool mp_motion_render(struct mp_motion *m, pl_tex first, pl_tex second,
         if (!recreate(m, &m->warps[direction], map_size[0], map_size[1]))
             return false;
         struct pl_shader_desc warp_desc[] = {
-            sampled("forward", m->vectors[0][direction]),
-            sampled("backward", m->vectors[0][!direction]),
+            sampled("forward", m->reconstructed[direction]),
+            sampled("backward", m->reconstructed[!direction]),
         };
         float weight = direction ? 1.0f - alpha : alpha;
         struct pl_shader_var warp_vars[] = {

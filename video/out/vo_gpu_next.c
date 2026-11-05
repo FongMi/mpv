@@ -2314,10 +2314,13 @@ static void report_motion_stats(struct vo *vo, bool submitted)
             (p->motion_submitted - p->motion_last_submitted) / elapsed,
             stats.analyzed_pairs, stats.repeated_frames);
     MP_INFO(vo, "Motion GPU means: capture=%.3f coarse-pass=%.3f refinement-pass=%.3f "
+                "evidence-pass=%.3f reconstruction-pass=%.3f "
                 "warp-pass=%.3f synthesis=%.3f ms (-1=unavailable)\n",
             stats.capture_ns ? stats.capture_ns / 1e6 : -1.0,
             stats.coarse_ns ? stats.coarse_ns / 1e6 : -1.0,
             stats.refinement_ns ? stats.refinement_ns / 1e6 : -1.0,
+            stats.evidence_ns ? stats.evidence_ns / 1e6 : -1.0,
+            stats.reconstruction_ns ? stats.reconstruction_ns / 1e6 : -1.0,
             stats.warp_ns ? stats.warp_ns / 1e6 : -1.0,
             stats.synthesis_ns ? stats.synthesis_ns / 1e6 : -1.0);
     p->motion_stats_time = now;
@@ -2790,6 +2793,8 @@ static void get_motion_info(struct priv *p, struct voctrl_motion_info *info)
         .capture_ns = stats.capture_ns,
         .coarse_ns = stats.coarse_ns,
         .refinement_ns = stats.refinement_ns,
+        .evidence_ns = stats.evidence_ns,
+        .reconstruction_ns = stats.reconstruction_ns,
         .warp_ns = stats.warp_ns,
         .synthesis_ns = stats.synthesis_ns,
         .analysis_width = stats.analysis_width,

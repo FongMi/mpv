@@ -426,6 +426,7 @@ static void test_motion_info(void)
         .analyzed_pairs = 17, .generated_frames = 31, .repeated_frames = 7,
         .capture_ns = 100, .coarse_ns = 200, .refinement_ns = 300,
         .warp_ns = 400, .synthesis_ns = 500,
+        .evidence_ns = 600, .reconstruction_ns = 700,
         .analysis_width = 480, .analysis_height = 270,
         .synthesis_width = 1920, .synthesis_height = 1080,
     };
@@ -445,6 +446,8 @@ static void test_motion_info(void)
     assert(motion_property("gpu-capture-ns")->value.int64 == 100);
     assert(motion_property("gpu-coarse-pass-ns")->value.int64 == 200);
     assert(motion_property("gpu-refinement-pass-ns")->value.int64 == 300);
+    assert(motion_property("gpu-evidence-pass-ns")->value.int64 == 600);
+    assert(motion_property("gpu-reconstruction-pass-ns")->value.int64 == 700);
     assert(motion_property("gpu-warp-pass-ns")->value.int64 == 400);
     assert(motion_property("gpu-synthesis-ns")->value.int64 == 500);
     assert(motion_property("last-analysis-width")->value.int_ == 480);
@@ -463,6 +466,8 @@ static void test_motion_info(void)
     assert(motion_property("synthesis-submissions")->value.int64 == 0);
     assert(motion_property("epoch-ns")->value.int64 == 0);
     assert(motion_property("gpu-synthesis-ns")->unavailable);
+    assert(motion_property("gpu-evidence-pass-ns")->unavailable);
+    assert(motion_property("gpu-reconstruction-pass-ns")->unavailable);
     assert(motion_property("last-synthesis-width")->unavailable);
     p.motion_fps = 60;
     p.motion_state = MOTION_UNSUPPORTED;

@@ -207,7 +207,8 @@ struct voctrl_motion_info {
     int64_t epoch_ns, timestamp_ns;
     uint64_t captured, analyzed, synthesized, repeated, submitted;
     // Rolling GPU means in ns; zero means no completed sample is available.
-    uint64_t capture_ns, coarse_ns, refinement_ns, warp_ns, synthesis_ns;
+    uint64_t capture_ns, coarse_ns, refinement_ns;
+    uint64_t evidence_ns, reconstruction_ns, warp_ns, synthesis_ns;
     int analysis_width, analysis_height;
     int synthesis_width, synthesis_height;
 };

@@ -249,15 +249,24 @@ static void diagonal_pixels(float *pixels, int width, int height, int scale,
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             float origin = variant == 1 ? 96 : variant == 2 ? 180 : 24;
-            float slope = variant == 2 ? -0.25f : 0.25f;
+            float slope = variant == 2 || (variant >= 20 && variant < 24)
+                        ? -0.25f : 0.25f;
             float center = (origin + shift) * scale + slope * (x + 0.5f);
             float edge = 2 * scale + 0.5f - fabsf(y + 0.5f - center);
+            if (variant >= 4) {
+                const int periods[] = {32, 40, 48, 64};
+                int index = variant < 20 ? (variant - 4) / 4
+                          : variant < 24 ? 0 : 2;
+                float period = periods[index];
+                float phase = remainderf(y + 0.5f - center - period * 0.5f, period);
+                edge = 1.5f - fabsf(phase);
+            }
             float coverage = fminf(1, fmaxf(0, edge));
             for (int c = 0; c < 3; c++) {
                 float base = bands ? background[x * 6 / width][c] : 0;
                 pixels[(y * width + x) * 4 + c] =
                     base + coverage * (1 - 2 * base);
-                if (variant == 3)
+                if (variant == 3 || variant >= 24)
                     pixels[(y * width + x) * 4 + c] =
                         0.45f + 0.1f * pixels[(y * width + x) * 4 + c];
             }
@@ -275,7 +284,9 @@ static void diagonal_edge(pl_gpu gpu, struct mp_motion *motion,
     float *expected = malloc(bytes);
     float *output = malloc(bytes);
     assert(pixels && expected && output);
-    float displacement = variant == 1 ? -16 : 16;
+    const float shifts[] = {1, -1, 2, -2};
+    float displacement = variant >= 4 ? shifts[(variant - 4) % 4]
+                       : variant == 1 ? -16 : 16;
     diagonal_pixels(pixels, width, height, scale, 0, bands, variant);
     pl_tex a = upload_size(gpu, pixels, width, height);
     diagonal_pixels(pixels, width, height, scale, displacement, bands, variant);
@@ -296,7 +307,7 @@ static void diagonal_edge(pl_gpu gpu, struct mp_motion *motion,
                     int index = (y * width + x) * 4 + c;
                     assert(isfinite(output[index]));
                     float difference = fabsf(output[index] - expected[index]);
-                    if (variant == 3)
+                    if (variant == 3 || variant >= 24)
                         difference /= 0.1f;
                     maximum = fmaxf(maximum, difference);
                     error += difference;
@@ -1258,6 +1269,80 @@ static void synthesis_sampling(pl_gpu gpu)
     assert(!failed);
 }
 
+static void evidence_bits(pl_gpu gpu)
+{
+    static const uint32_t values[] = {
+        0x00000000, 0x80000000, 0x00800000, 0x80800000,
+        0x358637bc, 0x358637bd, 0x358637be,
+        0x3dcccccc, 0x3dcccccd, 0x3dccccce,
+        0x3f7fffff, 0x3f800000, 0x3f800001,
+        0x7f7fffff, 0xff7fffff,
+    };
+    pl_fmt format = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 0,
+        PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR |
+        PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_STORABLE);
+    assert(format);
+    pl_tex encoded = pl_tex_create(gpu, pl_tex_params(
+        .w = 1, .h = 1, .format = format,
+        .sampleable = true, .renderable = true, .storable = true,
+    ));
+    format = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+        PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_STORABLE | PL_FMT_CAP_HOST_READABLE);
+    assert(format);
+    pl_tex decoded = pl_tex_create(gpu, pl_tex_params(
+        .w = 1, .h = 1, .format = format,
+        .renderable = true, .storable = true, .host_readable = true,
+    ));
+    assert(encoded && decoded);
+    pl_dispatch dispatch = pl_dispatch_create(gpu->log, gpu);
+    assert(dispatch);
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        union { uint32_t bits; float value; } input = {.bits = values[i]};
+        struct pl_shader_var variable = {
+            .var = pl_var_float("value"), .data = &input.value, .dynamic = true,
+        };
+        pl_shader shader = pl_dispatch_begin(dispatch);
+        assert(pl_shader_custom(shader, &(struct pl_custom_shader) {
+            .header = test_sample_header,
+        }));
+        assert(pl_shader_custom(shader, &(struct pl_custom_shader) {
+            .header = test_refine_header,
+            .body = "color = pack_evidence(value);",
+            .compute = true, .compute_group_size = {1, 1},
+            .output = PL_SHADER_SIG_COLOR,
+            .variables = &variable, .num_variables = 1,
+        }));
+        assert(pl_dispatch_finish(dispatch, pl_dispatch_params(
+            .shader = &shader, .target = encoded,
+        )));
+        struct pl_shader_desc descriptor = policy_sampled("encoded", encoded);
+        shader = pl_dispatch_begin(dispatch);
+        assert(pl_shader_custom(shader, &(struct pl_custom_shader) {
+            .header = test_sample_header,
+        }));
+        assert(pl_shader_custom(shader, &(struct pl_custom_shader) {
+            .header = test_refine_header,
+            .body = "color = vec4(unpack_evidence(texelFetch(encoded, ivec2(0), 0)));",
+            .compute = true, .compute_group_size = {1, 1},
+            .output = PL_SHADER_SIG_COLOR,
+            .descriptors = &descriptor, .num_descriptors = 1,
+        }));
+        assert(pl_dispatch_finish(dispatch, pl_dispatch_params(
+            .shader = &shader, .target = decoded,
+        )));
+        uint32_t actual[4];
+        assert(pl_tex_download(gpu, pl_tex_transfer_params(
+            .tex = decoded, .ptr = actual,
+        )));
+        for (int c = 0; c < 4; c++)
+            assert(actual[c] == values[i]);
+        printf("evidence bits input=%08x output=%08x\n", values[i], actual[0]);
+    }
+    pl_dispatch_destroy(&dispatch);
+    pl_tex_destroy(gpu, &encoded);
+    pl_tex_destroy(gpu, &decoded);
+}
+
 int main(void)
 {
     pl_log log = pl_log_create(PL_API_VER, pl_log_params(
@@ -1280,6 +1365,7 @@ int main(void)
     fflush(stdout);
     struct mp_motion *motion = mp_motion_create(vulkan->gpu, 128);
     capabilities(vulkan->gpu);
+    evidence_bits(vulkan->gpu);
     assert(motion);
     subpixel_matching(vulkan->gpu);
     pyramid_reuse(vulkan->gpu);
@@ -1307,7 +1393,7 @@ int main(void)
     assert(motion);
     affine_pair(vulkan->gpu, motion, 1920, 1080, 8);
     foreground_pair(vulkan->gpu, motion, 1920, 1080, 4);
-    for (int variant = 0; variant < 4; variant++) {
+    for (int variant = 0; variant < 28; variant++) {
         diagonal_edge(vulkan->gpu, motion, false, variant);
         diagonal_edge(vulkan->gpu, motion, true, variant);
     }
