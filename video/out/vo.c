@@ -181,10 +181,12 @@ struct vo_internal {
     int64_t num_total_vsync_samples;
     int64_t prev_vsync;
     double base_vsync;
+    double next_vsync_deadline;
     int drop_point;
     double estimated_vsync_interval;
     double estimated_vsync_jitter;
     bool expecting_vsync;
+    bool queue_display_time_only;
     int64_t num_successive_vsyncs;
 
     int64_t flip_queue_offset; // queue flip events at most this much in advance
@@ -508,6 +510,7 @@ static void reset_vsync_timings(struct vo *vo)
     struct vo_internal *in = vo->in;
     in->drop_point = 0;
     in->base_vsync = 0;
+    in->next_vsync_deadline = 0;
     in->expecting_vsync = false;
     in->num_successive_vsyncs = 0;
 }
@@ -618,15 +621,38 @@ static bool update_vsync_grid(struct vo_internal *in, int64_t vsync_time)
 
 // Always called locked.
 static void update_vsync_timing_after_swap(struct vo *vo, int64_t vsync_time, bool grid,
-                                           bool on_grid)
+                                           bool on_grid, bool queue_only)
 {
     struct vo_internal *in = vo->in;
+
+    if (in->queue_display_time_only != queue_only) {
+        in->queue_display_time_only = queue_only;
+        in->num_vsync_samples = 0;
+        in->num_total_vsync_samples = 0;
+        in->estimated_vsync_interval = 0;
+        in->estimated_vsync_jitter = -1;
+        in->num_successive_vsyncs = 0;
+        in->drop_point = 0;
+        in->prev_vsync = 0;
+        in->base_vsync = 0;
+        in->next_vsync_deadline = 0;
+        in->vsync_grid = 0;
+        in->shown_at_once = 0;
+        in->vsync_interval = MPMAX(in->nominal_vsync_interval, 1);
+    }
 
     int64_t prev_vsync = in->prev_vsync;
     in->prev_vsync = vsync_time;
 
     if (!in->expecting_vsync) {
         reset_vsync_timings(vo);
+        return;
+    }
+
+    if (in->queue_display_time_only) {
+        // Revised queue latency can move backwards without a missed vsync.
+        // Keep the latest completion estimate, but do not measure cadence.
+        in->base_vsync = vsync_time;
         return;
     }
 
@@ -715,6 +741,7 @@ static void update_display_fps(struct vo *vo)
         in->vsync_interval = MPMAX(in->nominal_vsync_interval, 1);
         in->vsync_grid = 0;
         in->shown_at_once = 0;
+        in->next_vsync_deadline = 0;
         in->display_fps = display_fps;
 
         MP_VERBOSE(vo, "Assuming %f FPS for display sync.\n", display_fps);
@@ -1252,6 +1279,68 @@ static void wait_until(int64_t target, bool exact)
     while (mp_time_ns() < target) {}
 }
 
+static void advance_vsyncs(struct vo_frame *frame, int count)
+{
+    // Retain the last phase for redraws after the frame has no slots left.
+    int steps = MPMIN(count, frame->num_vsyncs - 1);
+    if (frame->display_synced && steps > 0) {
+        frame->vsync_offset += steps * frame->vsync_interval;
+        frame->ideal_frame_vsync += steps * frame->ideal_frame_vsync_duration;
+    }
+    frame->num_vsyncs -= count;
+}
+
+// A backend reporting only queue latency cannot recover skipped refreshes
+// from swap timestamps. Pace its display-synced slots against the local clock.
+static int64_t schedule_vsync_slot(struct vo *vo, int64_t now,
+                                    int64_t sync_target)
+{
+    struct vo_internal *in = vo->in;
+    struct vo_frame *frame = in->current_frame;
+    // Pace flips by the display interval, independent of the interpolation step.
+    double interval = in->vsync_interval;
+    if (!in->queue_display_time_only || !frame->display_synced || frame->still ||
+        in->paused || !(interval > 1))
+    {
+        in->next_vsync_deadline = 0;
+        return 0;
+    }
+    if (frame->num_vsyncs < 1)
+        return 0;
+
+    if (sync_target)
+        in->next_vsync_deadline = sync_target + interval;
+    else if (!in->next_vsync_deadline)
+        in->next_vsync_deadline = now;
+    double late = now - in->next_vsync_deadline;
+    if (late >= interval) {
+        if (!frame->can_drop || !in->hasframe_rendered ||
+            now - in->prev_vsync >= MP_TIME_MS_TO_NS(100))
+        {
+            in->next_vsync_deadline = now;
+        } else if (frame->repeat) {
+            // Use repeats to catch up. Advancing before the first draw can
+            // replace a source frame with its more expensive interpolation.
+            double expired = floor(late / interval);
+            int missed = MPMIN(expired, frame->num_vsyncs);
+            advance_vsyncs(frame, missed);
+            // Elapsed refreshes can outnumber this frame's remaining repeats.
+            in->next_vsync_deadline += expired * interval;
+            in->delayed_count += missed;
+            MP_STATS(vo, "vo-delayed");
+        }
+    }
+
+    if (frame->num_vsyncs < 1)
+        return 0;
+    // Submit ahead of the intended display slot. The swapchain owns the
+    // actual refresh and can have the next frame queued while displaying
+    // the current one.
+    int64_t target = in->next_vsync_deadline - interval;
+    in->next_vsync_deadline += interval;
+    return target;
+}
+
 static bool render_frame(struct vo *vo)
 {
     struct vo_internal *in = vo->in;
@@ -1277,6 +1366,9 @@ static bool render_frame(struct vo *vo)
         goto done;
     }
 
+    int64_t now = mp_time_ns();
+    int64_t vsync_target = schedule_vsync_slot(vo, now, sync_target);
+
     frame = vo_frame_ref(in->current_frame);
     mp_assert(frame);
 
@@ -1285,13 +1377,13 @@ static bool render_frame(struct vo *vo)
         frame->duration = -1;
     }
 
-    int64_t now = mp_time_ns();
     int64_t pts = frame->pts;
     int64_t duration = frame->duration;
     int64_t end_time = pts + duration;
 
     // Time at which we should flip_page on the VO.
-    int64_t target = frame->display_synced ? sync_target : pts - in->flip_queue_offset;
+    int64_t target = frame->display_synced ? (sync_target ? sync_target : vsync_target)
+                                          : pts - in->flip_queue_offset;
 
     // A display with a variable refresh rate refreshes when a frame is
     // presented, below its maximum rate, and shows it after its lag alone. A
@@ -1377,18 +1469,10 @@ static bool render_frame(struct vo *vo)
     // Setup parameters for the next time this frame is drawn. ("frame" is the
     // frame currently drawn, while in->current_frame is the potentially next.)
     in->current_frame->repeat = true;
-    if (frame->display_synced) {
-        // Increment the offset only if it's not the last vsync. The current_frame
-        // can still be reused. This is mostly important for redraws that might
-        // overshoot the target vsync point.
-        if (in->current_frame->num_vsyncs > 1) {
-            in->current_frame->vsync_offset += in->current_frame->vsync_interval;
-            in->current_frame->ideal_frame_vsync += in->current_frame->ideal_frame_vsync_duration;
-        }
-        in->dropped_frame |= in->current_frame->num_vsyncs < 1;
-    }
-    if (in->current_frame->num_vsyncs > 0)
-        in->current_frame->num_vsyncs -= 1;
+    if (frame->display_synced)
+        in->dropped_frame |= frame->num_vsyncs < 1;
+    if (frame->num_vsyncs > 0)
+        advance_vsyncs(in->current_frame, 1);
 
     // Always render when paused (it's typically the last frame for a while).
     in->dropped_frame &= !in->paused;
@@ -1488,9 +1572,11 @@ static bool render_frame(struct vo *vo)
             bool at_once = vsync.displayed_time - shown->time < in->vsync_interval / 4;
             in->shown_at_once += (at_once - in->shown_at_once) / 16;
         }
-        bool grid = have_feedback && in->vsync_interval > 1 && !in->follows;
+        bool grid = have_feedback && !vsync.queue_display_time_only &&
+                    in->vsync_interval > 1 && !in->follows;
         bool on_grid = grid && update_vsync_grid(in, display_time);
-        update_vsync_timing_after_swap(vo, display_time, grid, on_grid);
+        update_vsync_timing_after_swap(vo, display_time, grid, on_grid,
+                                       vsync.queue_display_time_only);
     }
 
     if (vo->driver->caps & VO_CAP_NORETAIN) {
