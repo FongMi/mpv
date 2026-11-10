@@ -68,12 +68,13 @@ static const struct curl_scheme curl_schemes[] = {
     {bstr0_lit("ftps"), MP_CURL_PROTO_FTP},
 };
 
-// Special args for use by lavf. Matches lavf/http.c "offset"/"end_offset" opts.
+// Special arguments corresponding to lavf's HTTP options.
 // `offset` is the inclusive starting byte.
 // `end_offset` is the exclusive upper bound (0 = unbounded).
 struct curl_open_args {
     int64_t offset;
     int64_t end_offset;
+    int64_t initial_request_size;
 };
 
 struct curl_opts {
@@ -179,6 +180,7 @@ struct priv {
     uint64_t request_start;    // absolute byte position of next request
     uint64_t request_received; // bytes received in the current request
     uint64_t request_end;      // exclusive byte cap (0 = unbounded)
+    uint64_t initial_request_size;
     int retry_count;           // consecutive failed attempts at request_start
     bool request_uses_range;   // current request includes a Range header
     bool range_fallback_used;  // retried the initial request without Range
@@ -198,6 +200,7 @@ struct priv {
     size_t buffer_size;
     size_t head, tail, count;
     bool paused;         // write callback paused due to a full buffer
+    bool awaiting_read;  // initial range ended, waiting for the consumer
     bool stream_eof;     // producer has delivered all data
     bool stream_error;   // unrecoverable error
     atomic_bool aborted; // canceled by user (mp_cancel)
@@ -260,6 +263,7 @@ static void run_cmd(void *arg)
         if (c->drop)
             c->p->head = c->p->tail = c->p->count = 0;
         c->p->paused = false;
+        c->p->awaiting_read = false;
         c->p->stream_eof = false;
         c->p->stream_error = false;
         mp_cond_broadcast(&c->p->cond);
@@ -752,6 +756,9 @@ static bool should_retry_without_range(struct priv *p, CURLcode code,
 
 static void start_request(struct priv *p)
 {
+    if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
+        return;
+
     if (p->finished) {
         mp_mutex_lock(&p->mtx);
         p->stream_eof = true;
@@ -768,7 +775,11 @@ static void start_request(struct priv *p)
     uint64_t start = p->request_start;
 
     bool ranged = !p->probed || p->seekable;
-    bool chunked = ranged && p->opts->max_request_size > 0;
+    uint64_t request_size = p->opts->max_request_size;
+    if (p->initial_request_size &&
+        (!request_size || p->initial_request_size < request_size))
+        request_size = p->initial_request_size;
+    bool chunked = ranged && request_size > 0;
     bool capped = ranged && p->request_end > 0;
 
     bool past_size = p->seekable && p->content_size >= 0 && start >= p->content_size;
@@ -787,7 +798,7 @@ static void start_request(struct priv *p)
     if (chunked || capped) {
         uint64_t end = UINT64_MAX;
         if (chunked)
-            end = start + p->opts->max_request_size - 1;
+            end = start + request_size - 1;
         if (p->content_size > 0)
             end = MPMIN(end, p->content_size - 1);
         if (capped)
@@ -892,6 +903,16 @@ static void on_done(struct priv *p, CURLcode code)
                        p->request_start);
                 goto error;
             }
+            if (p->initial_request_size) {
+                // Leave the connection idle until the consumer reads past
+                // the header range or seeks.
+                p->initial_request_size = 0;
+                mp_mutex_lock(&p->mtx);
+                p->awaiting_read = true;
+                mp_cond_broadcast(&p->cond);
+                mp_mutex_unlock(&p->mtx);
+                return;
+            }
             start_request(p);
             return;
         }
@@ -993,7 +1014,8 @@ static bool setup_curl(struct priv *p)
     SETOPT(CURLOPT_DEBUGFUNCTION, debug_callback);
     SETOPT(CURLOPT_DEBUGDATA, p);
 
-    bool identity = p->start_offset > 0 || p->request_end > 0;
+    bool identity = p->start_offset > 0 || p->request_end > 0 ||
+                    p->initial_request_size > 0;
     SETOPT(CURLOPT_ACCEPT_ENCODING, identity ? "identity" : "");
     SETOPT(CURLOPT_FOLLOWLOCATION, 1L);
     SETOPT(CURLOPT_MAXREDIRS, (long)p->opts->max_redirects);
@@ -1071,6 +1093,13 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
     while (p->count == 0 && !p->stream_eof && !p->stream_error &&
            !atomic_load_explicit(&p->aborted, memory_order_relaxed))
     {
+        if (p->awaiting_read) {
+            p->awaiting_read = false;
+            mp_mutex_unlock(&p->mtx);
+            cmd_sync(p, CMD_ADD, 0, false);
+            mp_mutex_lock(&p->mtx);
+            continue;
+        }
         mp_cond_wait(&p->cond, &p->mtx);
     }
 
@@ -1205,6 +1234,8 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         }
         if (oa->end_offset > 0)
             p->request_end = oa->end_offset;
+        if (oa->initial_request_size > 0)
+            p->initial_request_size = oa->initial_request_size;
     }
 
     mp_mutex_init(&p->mtx);
@@ -1403,13 +1434,14 @@ static int open_curl_transport(struct demuxer *demuxer, AVIOContext **pb_out,
     struct curl_open_args oa = {0};
     if (options && *options) {
         AVDictionaryEntry *e;
-        // lavf's http demuxer exposes initial/final byte offsets as AVOptions
-        // Some demuxers, like lavf/hls.c assume it is always available, even for
-        // custom IO... Add support for this.
+        // DASH and HLS pass HTTP options through their nested AVIO opens.
         if ((e = av_dict_get(*options, "offset", NULL, 0)))
             oa.offset = strtoll(e->value, NULL, 10);
         if ((e = av_dict_get(*options, "end_offset", NULL, 0)))
             oa.end_offset = strtoll(e->value, NULL, 10);
+        if (cs->proto == MP_CURL_PROTO_HTTP &&
+            (e = av_dict_get(*options, "initial_request_size", NULL, 0)))
+            oa.initial_request_size = strtoll(e->value, NULL, 10);
     }
 
     if (!is_protocol_allowed(demuxer->log, cs->scheme, whitelist, blacklist))
@@ -1465,6 +1497,8 @@ static int open_curl_transport(struct demuxer *demuxer, AVIOContext **pb_out,
     pb->av_class = &curl_avio_class;
     pb->pos = oa.offset;
 
+    if (oa.initial_request_size > 0)
+        av_dict_set(options, "initial_request_size", NULL, 0);
     *pb_out = pb;
     *cookie_out = c;
     return 0;

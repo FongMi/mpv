@@ -88,6 +88,16 @@ player_video = executable('player-video', ['player_video.c', player_video_functi
                          dependencies: test_utils_deps)
 test('player-video', player_video)
 
+demux_track_refresh_functions = custom_target('demux-track-refresh-functions',
+    input: files('../demux/demux.c'), output: 'demux_track_refresh_functions.h',
+    depend_files: files('vo_android_frame.py'),
+    command: [python, files('demux_track_refresh.py'), '@INPUT@', '@OUTPUT@'])
+demux_track_refresh = executable('demux-track-refresh',
+    ['demux_track_refresh.c', demux_track_refresh_functions],
+    include_directories: incdir, link_with: test_utils,
+    dependencies: test_utils_deps)
+test('demux-track-refresh', demux_track_refresh)
+
 vo_vsync_functions = custom_target('vo-vsync-functions',
     input: files('../video/out/vo.c', '../video/out/vo.h'),
     output: 'vo_vsync_functions.h',
@@ -353,6 +363,16 @@ if features['libcurl']
                              objects: avio_crypto_objects,
                              link_with: test_utils)
     test('avio-crypto', avio_crypto)
+
+    if not meson.is_cross_build()
+        curl_range = executable('curl-initial-range', 'curl_initial_range.c',
+            include_directories: [incdir, incdir_public],
+            objects: libmpv.extract_all_objects(recursive: true),
+            dependencies: dependencies)
+        test('curl-initial-range', python,
+            args: [files('curl_initial_range.py'), curl_range],
+            env: ['no_proxy=127.0.0.1'])
+    endif
 endif
 
 if get_option('libmpv')
