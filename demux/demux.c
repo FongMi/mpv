@@ -2203,6 +2203,26 @@ static void record_packet(struct demux_internal *in, struct demux_packet *dp)
         write_dump_packet(in, dp);
 }
 
+static bool drop_refresh_packet(struct demux_stream *ds,
+                                const struct demux_packet *dp)
+{
+    struct demux_queue *queue = ds->queue;
+
+    // Drop packets already queued or consumed, then resume at the first new one.
+    if (queue->correct_dts) {
+        ds->refreshing = dp->dts < queue->last_dts;
+        return dp->dts <= queue->last_dts;
+    }
+    if (queue->correct_pos) {
+        ds->refreshing = dp->pos < queue->last_pos;
+        return dp->pos <= queue->last_pos;
+    }
+
+    ds->refreshing = false; // should not happen
+    MP_WARN(ds->in, "stream %d: demux refreshing failed\n", ds->index);
+    return true;
+}
+
 static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
 {
     struct demux_stream *ds = stream ? stream->ds : NULL;
@@ -2240,20 +2260,8 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
         queue->last_pos_fixup = dp->pos;
     }
 
-    if (!drop && ds->refreshing) {
-        // Resume reading once the old position was reached (i.e. we start
-        // returning packets where we left off before the refresh).
-        // If it's the same position, drop, but continue normally next time.
-        if (queue->correct_dts) {
-            ds->refreshing = dp->dts < queue->last_dts;
-        } else if (queue->correct_pos) {
-            ds->refreshing = dp->pos < queue->last_pos;
-        } else {
-            ds->refreshing = false; // should not happen
-            MP_WARN(in, "stream %d: demux refreshing failed\n", ds->index);
-        }
-        drop = true;
-    }
+    if (!drop && ds->refreshing)
+        drop = drop_refresh_packet(ds, dp);
 
     if (drop) {
         demux_packet_pool_push(in->packet_pool, dp);
@@ -4277,17 +4285,28 @@ static void initiate_refresh_seek(struct demux_internal *in,
             return;
         }
 
+        // Keep feeding the unchanged audio while opening the new video, but
+        // reserve at least half the forward cache for newly read packets.
+        uint64_t audio_budget = 0;
+        if (stream->type == STREAM_VIDEO && !in->back_demuxing && !in->recorder)
+            audio_budget = in->max_bytes / 2;
         for (int n = 0; n < in->num_streams; n++) {
             struct demux_stream *ds = in->streams[n]->ds;
+            uint64_t buffered = get_forward_buffered_bytes(ds);
+
+            if (ds->selected && ds->type == STREAM_AUDIO && buffered &&
+                buffered <= audio_budget)
+            {
+                audio_budget -= buffered;
+                // Drop reread packets through the tail of the retained queue.
+                ds->refreshing = true;
+                continue;
+            }
 
             bool correct_pos = ds->queue->correct_pos;
             bool correct_dts = ds->queue->correct_dts;
 
-            // We need to re-read all packets anyway, so discard the buffered
-            // data. (In theory, we could keep the packets, and be able to use
-            // it for seeking if partially read streams are deselected again,
-            // but this causes other problems like queue overflows when
-            // selecting a new stream.)
+            // Free space for packets from the newly selected stream.
             ds_clear_reader_queue_state(ds);
             clear_queue(ds->queue);
 
@@ -4302,9 +4321,8 @@ static void initiate_refresh_seek(struct demux_internal *in,
                 ds->queue->last_pos = ds->last_ret_pos;
                 ds->queue->last_dts = ds->last_ret_dts;
             }
-
-            update_seek_ranges(in->current_range);
         }
+        update_seek_ranges(in->current_range);
 
         start_ts -= 1.0; // small offset to get correct overlap
     }
