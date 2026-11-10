@@ -337,6 +337,12 @@ struct vo_vsync_info {
     // swap_buffers() for every physical vsync.
     // -1 if unset or unsupported.
     int64_t skipped_vsyncs;
+
+    // The queue display time is only a completion estimate, not a continuous
+    // cadence sample. Pace with the reported display interval instead of
+    // deriving cadence or skipped vsyncs from successive estimates. Set even
+    // when the estimate is temporarily unavailable. Unset by default.
+    bool queue_display_time_only;
 };
 
 struct vo_driver {

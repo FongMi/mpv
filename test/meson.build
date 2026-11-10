@@ -77,6 +77,33 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+player_video_functions = custom_target('player-video-functions',
+    input: files('../player/video.c', '../player/core.h'),
+    output: 'player_video_functions.h',
+    depend_files: files('vo_android_frame.py'),
+    command: [python, files('player_video.py'), '--source', '@INPUT0@',
+              '--header', '@INPUT1@', '--generate', '@OUTPUT@'])
+player_video = executable('player-video', ['player_video.c', player_video_functions],
+                         include_directories: incdir, link_with: test_utils,
+                         dependencies: test_utils_deps)
+test('player-video', player_video)
+
+vo_vsync_functions = custom_target('vo-vsync-functions',
+    input: files('../video/out/vo.c', '../video/out/vo.h'),
+    output: 'vo_vsync_functions.h',
+    depend_files: files('vo_android_frame.py'),
+    command: [python, files('vo_vsync.py'), '--source', '@INPUT0@',
+              '--header', '@INPUT1@', '--generate', '@OUTPUT@'])
+vo_vsync = executable('vo-vsync', ['vo_vsync.c', vo_vsync_functions],
+                      include_directories: incdir, dependencies: libm)
+test('vo-vsync', vo_vsync)
+
+if features['vulkan']
+    vulkan_present = executable('vulkan-present', 'vulkan_present.c',
+                                include_directories: incdir)
+    test('vulkan-present', vulkan_present)
+endif
+
 disc_still_header = custom_target('disc-still-functions',
     input: files('../demux/demux_disc.c', '../stream/stream_bluray.c'),
     depend_files: files('vo_android_frame.py'),

@@ -15,12 +15,16 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <time.h>
+
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_android.h>
 
+#include "osdep/timer.h"
 #include "video/out/android_common.h"
 #include "common.h"
 #include "context.h"
+#include "present.h"
 #include "utils.h"
 
 struct priv {
@@ -69,6 +73,48 @@ static bool android_check_visible(struct ra_ctx *ctx)
            ra_vk_ctx_has_surface(ctx);
 }
 
+#ifdef PL_HAVE_VULKAN_PRESENTATION_FEEDBACK
+static void android_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
+{
+    info->queue_display_time_only = true;
+    struct priv *p = ctx->priv;
+    struct pl_vulkan_presentation_feedback feedback;
+    if (!p->vk.swapchain ||
+        !pl_vulkan_get_presentation_feedback(p->vk.swapchain, &feedback)) {
+        return;
+    }
+    if (feedback.latest_submit_begin_ns > INT64_MAX ||
+        feedback.matched_submit_begin_ns > INT64_MAX ||
+        feedback.actual_present_ns > INT64_MAX) {
+        return;
+    }
+
+    struct timespec before, after;
+    if (clock_gettime(CLOCK_MONOTONIC, &before)) {
+        MP_ERR(ctx, "Failed reading presentation clock\n");
+        return;
+    }
+    int64_t now = mp_time_ns();
+    if (clock_gettime(CLOCK_MONOTONIC, &after)) {
+        MP_ERR(ctx, "Failed reading presentation clock\n");
+        return;
+    }
+    if (before.tv_sec < 0 || after.tv_sec < 0 ||
+        before.tv_sec > (INT64_MAX - before.tv_nsec) / 1000000000 ||
+        after.tv_sec > (INT64_MAX - after.tv_nsec) / 1000000000) {
+        return;
+    }
+
+    // Historical feedback estimates the latest accepted presentation. It is
+    // not a measurement of that frame, nor a count of physical vsyncs.
+    info->last_queue_display_time = mpvk_present_time(
+        feedback.latest_submit_begin_ns, feedback.matched_submit_begin_ns,
+        feedback.actual_present_ns,
+        MP_TIME_S_TO_NS(before.tv_sec) + before.tv_nsec, now,
+        MP_TIME_S_TO_NS(after.tv_sec) + after.tv_nsec);
+}
+#endif
+
 static bool android_init(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
@@ -83,6 +129,9 @@ static bool android_init(struct ra_ctx *ctx)
 
     struct ra_ctx_params params = {
         .check_visible = android_check_visible,
+#ifdef PL_HAVE_VULKAN_PRESENTATION_FEEDBACK
+        .get_vsync = android_get_vsync,
+#endif
         // Rotated SurfaceViews may stay suboptimal even after recreation.
         // surfaceChanged drives explicit resizes through android_reconfig.
         .allow_suboptimal = true,
