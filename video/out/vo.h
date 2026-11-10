@@ -352,6 +352,12 @@ struct vo_vsync_info {
     // Whether the display refreshes at its mode's rate or with the presents,
     // when the backend knows.
     enum vo_refresh_kind refresh_kind;
+
+    // The displayed time is only a queue completion estimate, not a continuous
+    // cadence sample. Pace with the reported display interval instead of
+    // deriving cadence or skipped vsyncs from successive estimates. Set even
+    // when the estimate is temporarily unavailable. Unset by default.
+    bool queue_display_time_only;
 };
 
 struct vo_driver {
