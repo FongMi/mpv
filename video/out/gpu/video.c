@@ -273,6 +273,7 @@ struct gl_video {
     struct ra_hwdec_mapper *hwdec_mapper;
     struct ra_hwdec *hwdec_overlay;
     bool hwdec_active;
+    bool hwdec_deferred;
 
     bool dsi_warned;
     bool broken_frame; // temporary error state
@@ -934,6 +935,18 @@ static enum plane_type merge_plane_types(enum plane_type a, enum plane_type b)
     return a;
 }
 
+static struct gl_transform hwdec_texture_transform(
+    const struct mp_image_params *params, int w, int h)
+{
+    struct mp_rect crop = mp_image_crop_valid(params)
+        ? params->crop : (struct mp_rect) {0, 0, params->w, params->h};
+    return (struct gl_transform) {
+        .m = {{(float)mp_rect_w(crop) / w, 0},
+              {0, (float)mp_rect_h(crop) / h}},
+        .t = {crop.x0, crop.y0},
+    };
+}
+
 // Places a video_image's image textures + associated metadata into img[]. The
 // number of textures is equal to p->plane_count. Any necessary plane offsets
 // are stored in off. (e.g. chroma position)
@@ -1018,6 +1031,10 @@ static void pass_get_images(struct gl_video *p, struct video_image *vimg,
 
         get_transform(img[n].w, img[n].h, p->image_params.rotate, t->flipped,
                       &img[n].transform);
+        if (p->hwdec_deferred) {
+            gl_transform_trans(hwdec_texture_transform(
+                &p->hwdec_mapper->dst_params, w, h), &img[n].transform);
+        }
         if (p->image_params.rotate % 180 == 90)
             MPSWAP(int, img[n].w, img[n].h);
 
@@ -1069,27 +1086,16 @@ static int find_comp(struct ra_imgfmt_desc *desc, int component)
     return -1;
 }
 
-static void init_video(struct gl_video *p)
+static void init_video_format(struct gl_video *p)
 {
     p->use_integer_conversion = false;
 
-    struct ra_hwdec *hwdec = ra_hwdec_get(&p->hwdec_ctx, p->image_params.imgfmt);
-    if (hwdec) {
-        if (hwdec->driver->overlay_frame) {
-            MP_WARN(p, "Using HW-overlay mode. No GL filtering is performed "
-                       "on the video!\n");
-            p->hwdec_overlay = hwdec;
-        } else {
-            p->hwdec_mapper = ra_hwdec_mapper_create(hwdec, &p->image_params);
-            if (!p->hwdec_mapper)
-                MP_ERR(p, "Initializing texture for hardware decoding failed.\n");
-        }
-        if (p->hwdec_mapper)
-            p->image_params = p->hwdec_mapper->dst_params;
-        const char **exts = hwdec->glsl_extensions;
-        for (int n = 0; exts && exts[n]; n++)
-            gl_sc_enable_extension(p->sc, (char *)exts[n]);
-        p->hwdec_active = true;
+    if (p->hwdec_mapper)
+        p->image_params = p->hwdec_mapper->dst_params;
+    if (p->hwdec_deferred) {
+        p->image_params.w = p->real_image_params.w;
+        p->image_params.h = p->real_image_params.h;
+        p->image_params.crop = p->real_image_params.crop;
     }
 
     p->ra_format = (struct ra_imgfmt_desc){0};
@@ -1162,6 +1168,29 @@ static void init_video(struct gl_video *p)
     check_gl_features(p);
 
     gl_video_setup_hooks(p);
+}
+
+static void init_video(struct gl_video *p)
+{
+    struct ra_hwdec *hwdec = ra_hwdec_get(&p->hwdec_ctx, p->image_params.imgfmt);
+    if (hwdec) {
+        if (hwdec->driver->overlay_frame) {
+            MP_WARN(p, "Using HW-overlay mode. No GL filtering is performed "
+                       "on the video!\n");
+            p->hwdec_overlay = hwdec;
+        } else {
+            p->hwdec_mapper = ra_hwdec_mapper_create(hwdec, &p->image_params);
+            if (!p->hwdec_mapper)
+                MP_ERR(p, "Initializing texture for hardware decoding failed.\n");
+        }
+        const char **exts = hwdec->glsl_extensions;
+        for (int n = 0; exts && exts[n]; n++)
+            gl_sc_enable_extension(p->sc, (char *)exts[n]);
+        p->hwdec_active = true;
+        p->hwdec_deferred = p->hwdec_mapper && !p->hwdec_mapper->dst_params_ready;
+    }
+    if (!p->hwdec_deferred)
+        init_video_format(p);
 }
 
 static struct dr_buffer *gl_find_dr_buffer(struct gl_video *p, uint8_t *ptr)
@@ -1251,7 +1280,9 @@ static void uninit_video(struct gl_video *p)
     // init_video() on uninitialized gl_video.
     p->real_image_params = (struct mp_image_params){0};
     p->image_params = p->real_image_params;
+    p->plane_count = 0;
     p->hwdec_active = false;
+    p->hwdec_deferred = false;
     p->hwdec_overlay = NULL;
     ra_hwdec_mapper_free(&p->hwdec_mapper);
 }
@@ -3318,9 +3349,7 @@ static void pass_render_frame_dumb(struct gl_video *p)
 static bool pass_render_frame(struct gl_video *p, struct mp_image *mpi,
                               uint64_t id, int flags)
 {
-    // initialize the texture parameters and temporary variables
-    p->texture_w = p->image_params.w;
-    p->texture_h = p->image_params.h;
+    // Initialize the temporary variables.
     p->texture_offset = identity_trans;
     p->components = 0;
     p->num_saved_imgs = 0;
@@ -3331,6 +3360,8 @@ static bool pass_render_frame(struct gl_video *p, struct mp_image *mpi,
     if (!pass_upload_image(p, mpi, id))
         return false;
 
+    p->texture_w = p->image_params.w;
+    p->texture_h = p->image_params.h;
     if (p->image_params.rotate % 180 == 90)
         MPSWAP(int, p->texture_w, p->texture_h);
 
@@ -3996,11 +4027,15 @@ static bool pass_upload_image(struct gl_video *p, struct mp_image *mpi, uint64_t
         pass_record(p, &perf);
 
         if (ok) {
+            if (p->hwdec_deferred && !p->plane_count)
+                init_video_format(p);
             struct ra_tex **tex = p->hwdec_mapper->tex;
             for (int n = 0; n < p->plane_count; n++) {
+                int w = p->hwdec_deferred ? p->image_params.w : tex[n]->params.w;
+                int h = p->hwdec_deferred ? p->image_params.h : tex[n]->params.h;
                 vimg->planes[n] = (struct texplane){
-                    .w = tex[n]->params.w,
-                    .h = tex[n]->params.h,
+                    .w = w,
+                    .h = h,
                     .tex = tex[n],
                     .flipped = p->image_params.vflip,
                 };
@@ -4385,15 +4420,7 @@ bool gl_video_check_format(struct gl_video *p, int mp_format)
     if (ra_get_imgfmt_desc(p->ra, mp_format, &desc) &&
         is_imgfmt_desc_supported(p, &desc))
         return true;
-    struct ra_hwdec *hwdec = ra_hwdec_get(&p->hwdec_ctx, mp_format);
-    if (hwdec) {
-        const struct ra_hwdec_mapper_driver *mapper = hwdec->driver->mapper;
-        if (mapper && mapper->needs_dst_params_probe &&
-            mapper->needs_dst_params_probe(p->ra))
-            return false;
-        return true;
-    }
-    return false;
+    return ra_hwdec_get(&p->hwdec_ctx, mp_format) != NULL;
 }
 
 void gl_video_config(struct gl_video *p, struct mp_image_params *params)

@@ -1,5 +1,6 @@
 #include "common/common.h"
 #include "common/msg.h"
+#include "config.h"
 
 #include "ra_pl.h"
 #include "utils.h"
@@ -172,6 +173,9 @@ bool mppl_wrap_tex(struct ra *ra, pl_tex pltex, struct ra_tex *out_tex)
             .src_linear = pltex->params.format->caps & PL_FMT_CAP_LINEAR,
             .src_repeat = false,
         },
+#if HAVE_LIBPLACEBO_VULKAN_YCBCR
+        .sampler_signature = pltex->sampler_signature,
+#endif
         .priv = (void *) pltex,
     };
 
@@ -454,6 +458,12 @@ static struct ra_renderpass *renderpass_create_pl(struct ra *ra,
                 .name = inp->name,
                 .type = desc_type[inp->type],
                 .binding = inp->binding,
+#if HAVE_LIBPLACEBO_VULKAN_YCBCR
+                .sampler_signature = inp->sampler_signature,
+                .address_mode = PL_TEX_ADDRESS_CLAMP,
+                .sample_mode = inp->sampler_linear ? PL_TEX_SAMPLE_LINEAR
+                                                   : PL_TEX_SAMPLE_NEAREST,
+#endif
                 .access = inp->type == RA_VARTYPE_IMG_W ? PL_DESC_ACCESS_WRITEONLY
                         : inp->type == RA_VARTYPE_BUF_RW ? PL_DESC_ACCESS_READWRITE
                         : PL_DESC_ACCESS_READONLY,

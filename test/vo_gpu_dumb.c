@@ -9,6 +9,8 @@
 
 #define mp_assert assert
 #define MPMIN(a, b) ((a) < (b) ? (a) : (b))
+#define mp_rect_w(r) ((r).x1 - (r).x0)
+#define mp_rect_h(r) ((r).y1 - (r).y0)
 #define MPSWAP(type, a, b) do { type tmp = (a); (a) = (b); (b) = tmp; } while (0)
 
 enum {
@@ -24,6 +26,13 @@ struct ra_tex {
 };
 struct mp_image { int unused; };
 struct mp_rect { int x0, y0, x1, y1; };
+struct mp_image_params {
+    int w, h;
+    struct mp_rect crop;
+};
+struct ra_hwdec_mapper {
+    struct mp_image_params dst_params;
+};
 
 #include "vo_gpu_dumb_types.h"
 
@@ -43,6 +52,8 @@ struct gl_video {
     struct gl_transform texture_offset;
     struct mp_rect src_rect;
     bool dumb_mode;
+    bool hwdec_deferred;
+    struct ra_hwdec_mapper *hwdec_mapper;
     struct image sampled[4];
     int conversions;
 };
@@ -229,6 +240,39 @@ static void test_full_renderer_keeps_physical_views(void)
     assert(img[0].tex == &tex[0] && img[1].tex == &tex[1]);
 }
 
+static void test_mapped_crop(void)
+{
+    for (int rotate = 0; rotate < 360; rotate += 90) {
+        for (int flip = 0; flip < 2; flip++) {
+            struct gl_video p;
+            struct ra_tex tex[4];
+            struct ra_hwdec_mapper mapper = {
+                .dst_params = {
+                    .w = 1344,
+                    .h = 576,
+                    .crop = {20, 12, 1312, 552},
+                },
+            };
+            setup(&p, tex, 1280, 536, 1344, 576, rotate, flip, 1);
+            p.hwdec_deferred = true;
+            p.hwdec_mapper = &mapper;
+            p.image.planes[0].w = p.image_params.w;
+            p.image.planes[0].h = p.image_params.h;
+
+            p.dumb_mode = false;
+            struct gl_transform off[4];
+            pass_get_images(&p, &p.image, p.sampled, off);
+            assert(p.sampled[0].w == p.texture_w);
+            assert(p.sampled[0].h == p.texture_h);
+            assert_corners(&p, 0, 20, 12, 1312, 552, rotate, flip);
+
+            p.dumb_mode = true;
+            pass_render_frame_dumb(&p);
+            assert_corners(&p, 0, 20, 12, 1312, 552, rotate, flip);
+        }
+    }
+}
+
 int main(void)
 {
     test_reported_buffer();
@@ -239,6 +283,7 @@ int main(void)
     test_odd_chroma(false);
     test_odd_chroma(true);
     test_full_renderer_keeps_physical_views();
+    test_mapped_crop();
     puts("Minimal GPU crop sampling contracts passed");
     return 0;
 }

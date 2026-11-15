@@ -163,6 +163,8 @@ struct ra_tex_params {
 struct ra_tex {
     // All fields are read-only after creation.
     struct ra_tex_params params;
+    // Identity of a backend-owned immutable sampler, or zero.
+    uint64_t sampler_signature;
     void *priv;
 };
 
@@ -243,6 +245,9 @@ size_t ra_vartype_size(enum ra_vartype type);
 struct ra_renderpass_input {
     const char *name;       // name as used in the shader
     enum ra_vartype type;
+    // Immutable sampled-texture state fixed at render pass creation.
+    uint64_t sampler_signature;
+    bool sampler_linear;
     // The total number of values is given by dim_v * dim_m.
     int dim_v;              // vector dimension (1 for non-vector and non-matrix)
     int dim_m;              // additional matrix dimension (dim_v x dim_m)

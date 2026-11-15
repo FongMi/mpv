@@ -261,13 +261,22 @@ test('gl-video', gl_video)
 
 gpu_dumb_headers = custom_target('gpu-dumb-headers',
     input: files('../video/out/gpu/video.c', '../video/out/gpu/utils.c',
-                 '../video/out/gpu/utils.h'),
+                 '../video/out/gpu/utils.h', '../video/mp_image.c'),
     depend_files: files('vo_android_frame.py'),
     output: ['vo_gpu_dumb_functions.h', 'vo_gpu_dumb_types.h'],
     command: [python, files('vo_gpu_dumb.py'), '--generate', '@OUTPUT0@'])
 gpu_dumb = executable('gpu-dumb', ['vo_gpu_dumb.c', gpu_dumb_headers],
                       dependencies: libm)
 test('gpu-dumb', gpu_dumb)
+
+gpu_osd_source = custom_target('gpu-osd-source',
+    input: files('../video/out/gpu/ra.h', '../video/out/gpu/osd.c',
+                 '../video/out/gpu/shader_cache.c'),
+    depend_files: files('vo_android_frame.py', 'vo_gpu_dumb.py'),
+    output: 'vo_gpu_osd.c',
+    command: [python, files('vo_gpu_osd.py'), '--generate', '@OUTPUT@'])
+gpu_osd = executable('gpu-osd', gpu_osd_source)
+test('gpu-osd', gpu_osd)
 
 gpu_next_headers = custom_target('gpu-next-mapping-headers',
     input: files('../video/mp_image.h', '../video/out/gpu/hwdec.h',

@@ -1396,7 +1396,14 @@ if features['vulkan']
                        dependencies: [libplacebo, vulkan]) and
         cc.has_members('struct pl_vulkan_wrap_params', ['ycbcr'],
                        prefix: '#include <libplacebo/vulkan.h>',
-                       dependencies: [libplacebo, vulkan])
+                       dependencies: [libplacebo, vulkan]) and
+        cc.has_members('struct pl_tex_t', ['sampler_signature'],
+                       prefix: '#include <libplacebo/gpu.h>',
+                       dependencies: libplacebo) and
+        cc.has_members('struct pl_desc',
+                       ['sampler_signature', 'address_mode', 'sample_mode'],
+                       prefix: '#include <libplacebo/gpu.h>',
+                       dependencies: libplacebo)
     )
     dependencies += vulkan
     sources += files('video/out/hwdec/hwdec_vulkan.c',
