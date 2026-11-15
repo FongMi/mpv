@@ -109,7 +109,7 @@ struct ra_hwdec_mapper_driver {
     bool consumes_source;
 
     // Whether this mapper needs the first source frame to determine dst_params
-    // for the current rendering API. Legacy vo=gpu cannot defer that decision.
+    // for the current rendering API.
     bool (*needs_dst_params_probe)(struct ra *ra);
 
     // Init the mapper implementation. At this point, the field src_params,

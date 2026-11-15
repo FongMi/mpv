@@ -42,9 +42,12 @@ struct vertex {
 };
 
 static const struct ra_renderpass_input vertex_vao[] = {
-    {"position",  RA_VARTYPE_FLOAT,      2, 1, offsetof(struct vertex, position)},
-    {"texcoord" , RA_VARTYPE_FLOAT,      2, 1, offsetof(struct vertex, texcoord)},
-    {"ass_color", RA_VARTYPE_BYTE_UNORM, 4, 1, offsetof(struct vertex, ass_color)},
+    {.name = "position", .type = RA_VARTYPE_FLOAT, .dim_v = 2, .dim_m = 1,
+     .offset = offsetof(struct vertex, position)},
+    {.name = "texcoord", .type = RA_VARTYPE_FLOAT, .dim_v = 2, .dim_m = 1,
+     .offset = offsetof(struct vertex, texcoord)},
+    {.name = "ass_color", .type = RA_VARTYPE_BYTE_UNORM, .dim_v = 4, .dim_m = 1,
+     .offset = offsetof(struct vertex, ass_color)},
 };
 
 struct mpgl_osd_part {

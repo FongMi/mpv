@@ -37,8 +37,11 @@ def generate(root, output):
     source = function(utils, "gl_transform_vec")
     utils = (root / "video/out/gpu/utils.c").read_text(encoding="utf-8")
     source += function(utils, "gl_transform_trans")
+    image = (root / "video/mp_image.c").read_text(encoding="utf-8")
+    source += function(image, "mp_image_crop_valid")
     for name in ("get_transform", "chroma_upsize", "merge_plane_types",
-                 "pass_get_images", "compute_src_transform", "chroma_realign",
+                 "hwdec_texture_transform", "pass_get_images",
+                 "compute_src_transform", "chroma_realign",
                  "pass_render_frame_dumb"):
         source += function(video, name)
     output.write_text(source, encoding="utf-8")

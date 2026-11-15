@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -327,6 +328,8 @@ void gl_sc_uniform_texture(struct gl_shader_cache *sc, char *name,
 
     struct sc_uniform *u = find_uniform(sc, bstr0(name));
     u->input.type = RA_VARTYPE_TEX;
+    u->input.sampler_signature = tex->sampler_signature;
+    u->input.sampler_linear = tex->sampler_signature && tex->params.src_linear;
     u->glsl_type = glsl_type;
     u->input.binding = gl_sc_next_binding(sc, u->input.type);
     u->v.tex = tex;
@@ -915,6 +918,14 @@ static void gl_sc_generate(struct gl_shader_cache *sc,
 
     if (sc->params.target_format)
         ADD(hash_total, "format %s\n", sc->params.target_format->name);
+
+    for (int n = 0; n < sc->num_uniforms; n++) {
+        const struct ra_renderpass_input *inp = &sc->uniforms[n].input;
+        if (inp->sampler_signature) {
+            ADD(hash_total, "sampler %d %" PRIx64 " %d\n", n,
+                inp->sampler_signature, inp->sampler_linear);
+        }
+    }
 
     struct sc_entry *entry = NULL;
     for (int n = 0; n < sc->num_entries; n++) {
