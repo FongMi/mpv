@@ -379,6 +379,15 @@ static void dealloc_vo(struct vo *vo)
     talloc_free(vo);
 }
 
+// Carry the submitted buffer across a VO change on the same Surface.
+static void inherit_video_frame(struct vo *vo, int64_t wid)
+{
+    if (wid && vo->opts->android_keep_video_frame && vo->opts->WinID == wid) {
+        vo->in->video_wid = wid;
+        vo->in->has_video_frame = true;
+    }
+}
+
 static struct vo *vo_create(bool probing, struct mpv_global *global,
                             struct vo_extra *ex, char *name)
 {
@@ -421,6 +430,7 @@ static struct vo *vo_create(bool probing, struct mpv_global *global,
 
     vo->opts_cache = m_config_cache_alloc(NULL, global, &vo_sub_opts);
     vo->opts = vo->opts_cache->opts;
+    inherit_video_frame(vo, ex->retained_video_wid);
 
     m_config_cache_set_dispatch_change_cb(vo->opts_cache, vo->in->dispatch,
                                           update_opts, vo);
@@ -1908,6 +1918,16 @@ bool vo_has_video_frame(struct vo *vo)
     bool r = in->has_video_frame;
     mp_mutex_unlock(&in->lock);
     return r;
+}
+
+// Returns the window ID of the submitted video buffer, or zero.
+int64_t vo_get_video_frame_wid(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    int64_t wid = in->has_video_frame ? in->video_wid : 0;
+    mp_mutex_unlock(&in->lock);
+    return wid;
 }
 
 static void run_query_format(void *p)

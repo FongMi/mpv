@@ -19,8 +19,14 @@ def generate(root, output):
     for name in ("android_direct_output_surfaces_ready", "is_android_direct_output_forced",
                  "wants_android_direct_output", "should_use_android_direct_output"):
         source += function(video, name)
+    direct_output = video.index("bool should_use_android_dolby_vision_direct_output(")
+    source += function(video[direct_output:], "should_use_android_dolby_vision_direct_output")
+    for name in ("is_android_dolby_vision_direct_output_active",
+                 "android_video_output_changed", "init_video_out_for_track"):
+        source += function(video, name)
     source += function(video, "android_video_output_needs_surface")
     source += function(video, "is_android_video_output_waiting_for_surface")
+    source += function(video, "get_android_retained_video_wid")
     source += function(video, "reset_video_state")
     source += function(video, "uninit_video_chain")
     source += function(video, "uninit_video_out")
@@ -30,11 +36,15 @@ def generate(root, output):
     source += "    test_force_window_init(mpctx);\n    return 0;\n}\n"
     source += function(playloop, "handle_playback_restart")
     source += function(playloop, "handle_eof")
-    # The remaining init path owns real VO/decoder resources. Observe entry
-    # through the production Surface prerequisite before substituting that tail.
-    entry = function(video, "reinit_video_chain_src")
-    source += entry.split("    bool use_dovi_direct =", 1)[0]
-    source += "    test_video_output_init(mpctx, track);\n}\n"
+    # Keep the actual Surface and VO replacement sequence. Exercise HDR
+    # precision separately and substitute allocation of the VO and decoder.
+    entry = function(video, "reinit_video_chain_internal")
+    hdr_start = entry.index("    bool prefer_hdr_output =")
+    hdr_end = entry.index("    if (replace_video_out)", hdr_start)
+    alloc = entry.index("    if (!mpctx->video_out) {")
+    source += entry[:hdr_start] + entry[hdr_end:alloc]
+    source += "    test_video_output_init(mpctx, track);\n    return true;\n}\n"
+    source += function(video, "reinit_video_chain_src")
     loadfile = (root / "player/loadfile.c").read_text(encoding="utf-8")
     start = loadfile.index("    reinit_video_chain(mpctx);", loadfile.index("static void play_current_file"))
     end = loadfile.index("    // For lavfi-complex mode", start)

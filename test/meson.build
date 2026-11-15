@@ -364,7 +364,7 @@ android_frame_functions = custom_target('android-frame-contracts-functions',
     output: 'vo_android_frame_functions.h',
     command: [python, files('vo_android_frame.py'), '--generate', '@OUTPUT@'])
 android_frame = executable('android-frame-contracts',
-                          ['vo_android_frame.c', android_frame_functions])
+    ['vo_android_frame.c', android_frame_functions], dependencies: libm)
 test('android-frame-contracts', android_frame)
 
 json = executable('json', 'json.c', include_directories: [incdir, incdir_public], link_with: test_utils)

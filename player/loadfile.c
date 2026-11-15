@@ -1730,7 +1730,7 @@ void update_vo_chain_el_state(struct MPContext *mpctx)
     struct sh_stream *el =
         track ? sh_stream_dependent_sibling(track->stream) : NULL;
     bool use_el = el && !track_uses_dovi_p7_hdr10_fallback(track) &&
-                  !is_android_dolby_vision_direct_output_active(mpctx);
+                  !is_android_direct_output_active(mpctx);
     char *hwdec = NULL;
     // Android zero-copy MediaCodec decoders share the VO's single output
     // surface. Keep the dependent EL decoder off that surface.
