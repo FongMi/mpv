@@ -25,8 +25,11 @@
 #define MPSEEK_EXACT 1
 #define MPSEEK_FLAG_DELAY 1
 #define AT_END_OF_FILE 1
+#define PT_CURRENT_ENTRY 3
 #define MP_VERBOSE(ctx, ...) ((void)(ctx))
 #define MP_DBG(ctx, ...) ((void)(ctx))
+#define MP_INFO(ctx, ...) ((void)(ctx))
+#define MP_WARN(ctx, ...) ((void)(ctx))
 #define MPV_EVENT_VIDEO_RECONFIG 1
 #define MPV_EVENT_PLAYBACK_RESTART 2
 #define MPCLAMP(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
@@ -47,6 +50,7 @@ struct m_obj_settings { char *name; };
 struct mp_vo_opts {
     int64_t WinID, android_osd_wid;
     int android_dolby_vision_output;
+    bool android_keep_video_frame;
     struct m_obj_settings *video_driver_list;
 };
 struct ra_ctx_opts { struct m_obj_settings *context_list; };
@@ -60,7 +64,8 @@ struct MPOpts {
     int osd_duration;
     int osd_playing_msg_duration;
 };
-struct vo { bool config_ok; };
+struct vo_extra { bool native_dovi_sink; };
+struct vo { struct vo_extra extra; bool config_ok; };
 struct mp_pin { struct mp_pin *connection; };
 struct mp_filter { struct mp_pin *pins[1]; };
 struct mp_output_chain { struct mp_filter *f; };
@@ -106,6 +111,7 @@ struct MPContext {
     void *global;
 };
 static struct vo output;
+static struct vo dovi_output;
 static struct ao_chain audio_output;
 static struct mp_pin filter_input;
 static struct mp_filter filter = {.pins = {&filter_input}};
@@ -119,6 +125,7 @@ static double last_seek_pts;
 static int audio_starts;
 static int executed_seeks, restart_events;
 static bool output_init_failed;
+static bool dovi_output_init_failed;
 static int filter_connections;
 
 #if HAVE_ANDROID
@@ -131,12 +138,31 @@ static bool pl_color_transfer_is_hdr(int transfer)
 static bool wants_android_dolby_vision_direct_output(struct MPContext *ctx,
                                                     struct track *track)
 {
-    return direct_wanted;
+    return direct_wanted && track &&
+           ctx->android_dolby_vision_direct_failed_track != track;
 }
-static bool is_android_dolby_vision_direct_output_active(struct MPContext *ctx)
+static bool is_android_direct_output_active(struct MPContext *ctx)
 {
-    return simulated_direct_active;
+    return ctx->video_out && simulated_direct_active;
 }
+
+static struct vo *init_video_out_by_name(void *global, struct vo_extra *extra,
+                                        const char *name)
+{
+    assert(strcmp(name, "mediacodec_embed") == 0);
+    assert(extra->native_dovi_sink);
+    dovi_output.extra = *extra;
+    return dovi_output_init_failed ? NULL : &dovi_output;
+}
+
+static struct vo *init_best_video_out(void *global, struct vo_extra *extra)
+{
+    output.extra = *extra;
+    return &output;
+}
+
+bool should_use_android_dolby_vision_direct_output(struct MPContext *ctx,
+                                                   struct track *track);
 void reinit_video_chain_src(struct MPContext *ctx, struct track *track);
 static void test_video_output_init(struct MPContext *ctx, struct track *track)
 {
@@ -147,14 +173,30 @@ static void test_video_output_init(struct MPContext *ctx, struct track *track)
     chain.track = track;
     chain.filter_src = NULL;
     chain.filter = &output_filter;
+    output.extra.native_dovi_sink =
+        should_use_android_dolby_vision_direct_output(ctx, track);
     ctx->video_out = &output;
     ctx->vo_chain = &chain;
 }
+static int64_t captured_video_wid, restored_video_wid;
+
+static int64_t vo_get_video_frame_wid(struct vo *vo)
+{
+    return captured_video_wid;
+}
+
 static void reinit_video_chain(struct MPContext *ctx)
 {
     if (ctx->current_track[0][STREAM_VIDEO])
         reinit_video_chain_src(ctx, ctx->current_track[0][STREAM_VIDEO]);
 }
+static void reinit_video_chain_with_retained_frame(struct MPContext *ctx,
+                                                    int64_t wid)
+{
+    restored_video_wid = wid;
+    reinit_video_chain(ctx);
+}
+
 static void reinit_audio_chain(struct MPContext *ctx)
 {
     if (ctx->current_track[0][STREAM_AUDIO])
@@ -674,6 +716,186 @@ static void test_lazy_stream_eof(void)
     demux_eof = true;
 }
 
+static void test_dolby_vision_output_retains_surface(void)
+{
+    struct mp_vo_opts vo_opts = {.WinID = 10, .android_osd_wid = 20};
+    struct MPOpts opts = {.vo = &vo_opts};
+    struct track track = {0};
+    struct MPContext ctx = {
+        .opts = &opts, .current_track = {{&track}},
+        .video_out = &output, .vo_chain = &chain,
+    };
+    int old_initialized = initialized;
+    captured_video_wid = vo_opts.WinID;
+    direct_wanted = true;
+    assert(update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    assert(restored_video_wid == vo_opts.WinID);
+    assert(initialized == old_initialized + 1);
+
+    simulated_direct_active = true;
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    assert(initialized == old_initialized + 1);
+
+    direct_wanted = simulated_direct_active = false;
+    captured_video_wid = restored_video_wid = 0;
+}
+
+static void test_dolby_vision_policy_changes_on_embed(void)
+{
+    struct m_obj_settings forced[] = {{"mediacodec_embed"}, {NULL}};
+    struct mp_vo_opts vo_opts = {
+        .WinID = 10, .android_osd_wid = 20, .video_driver_list = forced,
+    };
+    struct MPOpts opts = {.vo = &vo_opts};
+    struct track track = {0};
+    struct MPContext ctx = {
+        .opts = &opts, .current_track = {{&track}},
+        .video_out = &output, .vo_chain = &chain,
+    };
+
+    simulated_direct_active = true;
+    output.extra.native_dovi_sink = false;
+    direct_wanted = true;
+    int old_destroyed = destroyed;
+    vo_opts.android_osd_wid = 0;
+    assert(!update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    assert(ctx.video_out == &output && ctx.vo_chain == &chain);
+    assert(destroyed == old_destroyed && !output.extra.native_dovi_sink);
+
+    vo_opts.android_osd_wid = 20;
+    assert(update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(ctx.video_out->extra.native_dovi_sink);
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+
+    old_destroyed = destroyed;
+    vo_opts.android_osd_wid = 0;
+    assert(!update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    direct_wanted = false;
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    assert(ctx.video_out == &output && ctx.vo_chain == &chain);
+    assert(destroyed == old_destroyed && output.extra.native_dovi_sink);
+
+    vo_opts.android_osd_wid = 20;
+    assert(update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(!ctx.video_out->extra.native_dovi_sink);
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    simulated_direct_active = false;
+}
+
+static void test_embed_track_switch_waits_for_osd_surface(void)
+{
+    struct m_obj_settings forced[] = {{"mediacodec_embed"}, {NULL}};
+    struct mp_vo_opts vo_opts = {.WinID = 10, .video_driver_list = forced};
+    struct MPOpts opts = {.vo = &vo_opts};
+    struct track track = {.selected = true};
+    struct MPContext ctx = {
+        .opts = &opts, .current_track = {{&track}}, .video_out = &output,
+    };
+
+    int old_initialized = initialized;
+    int old_destroyed = destroyed;
+    output.extra.native_dovi_sink = false;
+    simulated_direct_active = direct_wanted = true;
+    reinit_video_chain_src(&ctx, &track);
+    assert(destroyed == old_destroyed + 1 && initialized == old_initialized);
+    assert(!ctx.video_out && !ctx.vo_chain);
+    assert(track.selected && is_android_video_output_waiting_for_surface(&ctx));
+
+    vo_opts.android_osd_wid = 20;
+    assert(update_video_output(&ctx, &vo_opts.android_osd_wid, false));
+    assert(ctx.video_out->extra.native_dovi_sink);
+    assert(initialized == old_initialized + 1);
+    simulated_direct_active = direct_wanted = false;
+}
+
+static void test_dolby_vision_sink_after_fallback(void)
+{
+    struct m_obj_settings forced[] = {{"mediacodec_embed"}, {NULL}};
+    struct mp_vo_opts vo_opts = {
+        .WinID = 10, .android_osd_wid = 20, .video_driver_list = forced,
+    };
+    struct MPOpts opts = {.vo = &vo_opts};
+    struct track track = {0};
+    struct MPContext ctx = {.opts = &opts};
+    struct vo_extra extra = {0};
+
+    assert(init_video_out_for_track(&ctx, &track, &extra) == &output);
+    assert(!output.extra.native_dovi_sink);
+    direct_wanted = true;
+    assert(init_video_out_for_track(&ctx, &track, &extra) == &dovi_output);
+    assert(dovi_output.extra.native_dovi_sink && !extra.native_dovi_sink);
+
+    dovi_output_init_failed = true;
+    assert(init_video_out_for_track(&ctx, &track, &extra) == &output);
+    assert(!output.extra.native_dovi_sink);
+    assert(ctx.android_dolby_vision_direct_failed_track == &track);
+    simulated_direct_active = true;
+    ctx.video_out = &output;
+    assert(!android_video_output_changed(&ctx, &track));
+    assert(!is_android_dolby_vision_direct_output_active(&ctx));
+    dovi_output_init_failed = direct_wanted = simulated_direct_active = false;
+}
+
+static void test_output_policy_keeps_frame_without_video_track(void)
+{
+    struct mp_vo_opts vo_opts = {
+        .WinID = 10, .android_osd_wid = 20, .android_keep_video_frame = true,
+    };
+    struct MPOpts opts = {.vo = &vo_opts, .force_vo = 1};
+    struct MPContext ctx = {
+        .opts = &opts, .video_out = &output, .stop_play = PT_CURRENT_ENTRY,
+    };
+    int old_destroyed = destroyed;
+
+    captured_video_wid = vo_opts.WinID;
+    simulated_direct_active = true;
+    assert(get_android_retained_video_wid(&ctx) == vo_opts.WinID);
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    assert(!update_video_output(&ctx, NULL, true));
+    assert(ctx.video_out == &output && destroyed == old_destroyed);
+
+    ctx.stop_play = 0;
+    assert(!update_video_output(&ctx, NULL, true));
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    assert(ctx.video_out == &output && destroyed == old_destroyed);
+
+    ctx.ao_chain = &audio_output;
+    ctx.playback_initialized = true;
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    assert(destroyed == old_destroyed && ctx.ao_chain == &audio_output);
+
+    vo_opts.android_keep_video_frame = false;
+    assert(!get_android_retained_video_wid(&ctx));
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    assert(destroyed == old_destroyed + 1);
+    ctx.video_out = &output;
+    vo_opts.android_keep_video_frame = true;
+
+    opts.force_vo = 0;
+    assert(!get_android_retained_video_wid(&ctx));
+    opts.force_vo = 1;
+
+    assert(!update_video_output(&ctx, &vo_opts.video_driver_list, false));
+    assert(destroyed == old_destroyed + 2);
+    ctx.video_out = &output;
+
+    captured_video_wid++;
+    assert(!get_android_retained_video_wid(&ctx));
+    assert(!update_video_output(&ctx, &vo_opts.android_dolby_vision_output, false));
+    assert(destroyed == old_destroyed + 3);
+    ctx.video_out = &output;
+
+    vo_opts.WinID = 0;
+    assert(!get_android_retained_video_wid(&ctx));
+    assert(!update_video_output(&ctx, &vo_opts.WinID, false));
+    assert(ctx.video_out == NULL);
+    assert(destroyed == old_destroyed + 4);
+
+    simulated_direct_active = false;
+    captured_video_wid = 0;
+}
+
 int main(void)
 {
     test_lazy_stream_eof();
@@ -782,6 +1004,11 @@ int main(void)
     test_blank_output_contract();
     test_lavfi_output_reinit();
     test_queued_seek_before_restart();
+    test_dolby_vision_output_retains_surface();
+    test_dolby_vision_policy_changes_on_embed();
+    test_embed_track_switch_waits_for_osd_surface();
+    test_dolby_vision_sink_after_fallback();
+    test_output_policy_keeps_frame_without_video_track();
     test_hdr_output_policy();
     puts("Android OSD routing, Surface detach/restore and output policy contracts passed");
     return 0;

@@ -7402,8 +7402,9 @@ them.
     The old media and audio stop normally, including source and decoder
     teardown. The embedding application covers the output when it wants a
     blank reset. Redrawing video and overlays is suspended during the reset.
-    Replacing or detaching the video Surface, or recreating the video output,
-    ends retention. This does not acknowledge compositor presentation.
+    Replacing or detaching the video Surface ends retention. A video output
+    replacement can retain the buffer on the same Surface.
+    This does not acknowledge compositor presentation.
 
     Android only.
 

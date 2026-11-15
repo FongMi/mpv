@@ -3178,6 +3178,13 @@ static int mp_property_android_video_surface_transform(void *ctx,
 }
 
 #if HAVE_ANDROID
+static int mp_property_android_gpu_output_switch(void *ctx,
+                                                 struct m_property *prop,
+                                                 int action, void *arg)
+{
+    return m_property_bool_ro(action, arg, true);
+}
+
 static int mp_property_android_surface_frame(void *ctx, struct m_property *prop,
                                              int action, void *arg)
 {
@@ -5035,6 +5042,7 @@ static const struct m_property mp_properties_base[] = {
         mp_property_android_video_surface_transform},
 #if HAVE_ANDROID
     {"android-video-surface-frame", mp_property_android_surface_frame},
+    {"android-gpu-output-switch-supported", mp_property_android_gpu_output_switch},
 #endif
     {"vo-passes", mp_property_vo_passes},
     {"motion-interpolation-info", mp_property_motion_info},
@@ -7803,6 +7811,126 @@ static void cmd_android_video_geometry_clear(void *p)
         bstr0("android-video-geometry"), &empty, 0) >= 0;
 }
 
+struct gpu_output_option {
+    struct m_config_option *option;
+    union m_option_value old;
+    union m_option_value target;
+};
+
+static void set_gpu_output_options(struct m_config *config,
+                                   struct gpu_output_option *options,
+                                   int count, bool restore)
+{
+    for (int n = 0; n < count; n++) {
+        struct gpu_output_option *entry = &options[n];
+        struct m_config_option *co = entry->option;
+        m_option_copy(co->opt, co->data, restore ? &entry->old : &entry->target);
+        // The command owns the single VO rebuild after all options are set.
+        m_config_notify_change_opt_ptr(config, co->data);
+    }
+}
+
+static bool init_android_gpu_video_output(struct MPContext *mpctx,
+                                          struct track *track,
+                                          struct mp_image_params *params,
+                                          int64_t retained_video_wid)
+{
+    if (!try_reinit_video_chain(mpctx, track, retained_video_wid))
+        return false;
+    if (vo_reconfig(mpctx->video_out, params) < 0) {
+        uninit_video_out(mpctx);
+        return false;
+    }
+    mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
+    return true;
+}
+
+static void cmd_android_set_gpu_output(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct MPContext *mpctx = cmd->mpctx;
+    bool gpu_next = cmd->args[0].v.b;
+    bool vulkan = cmd->args[1].v.b;
+    const char *names[] = {"vo", "gpu-api", "gpu-context"};
+    const char *values[] = {
+        gpu_next ? "gpu-next" : "gpu",
+        vulkan ? "vulkan" : "opengl",
+        vulkan ? "androidvk" : "android",
+    };
+    struct gpu_output_option options[MP_ARRAY_SIZE(names)] = {0};
+    struct m_config *config = mpctx->mconfig;
+
+    cmd->success = false;
+    handle_option_callbacks(mpctx);
+    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    struct vo *vo = mpctx->video_out;
+    if (mpctx->stop_play || !mpctx->playback_initialized || !mpctx->vo_chain ||
+        !track || track->attached_picture || mpctx->vo_chain->track != track ||
+        !vo || !vo->context_name || mpctx->opts->vo->WinID == 0 ||
+        mpctx->opts->vo->WinID == -1 ||
+        (strcmp(vo->driver->name, "gpu") != 0 &&
+         strcmp(vo->driver->name, "gpu-next") != 0) ||
+        (strcmp(vo->context_name, "android") != 0 &&
+         strcmp(vo->context_name, "androidvk") != 0))
+        return;
+
+    if (strcmp(vo->driver->name, values[0]) == 0 &&
+        strcmp(vo->context_name, values[2]) == 0)
+    {
+        cmd->success = true;
+        return;
+    }
+
+    struct mp_image_params params = vo_get_current_params(vo);
+    if (!params.imgfmt)
+        return;
+    // The previous VO owns the frames backing its dynamic Dolby Vision data.
+    params.repr.dovi = NULL;
+
+    for (int n = 0; n < MP_ARRAY_SIZE(options); n++) {
+        struct m_config_option *co = m_config_get_co(config, bstr0(names[n]));
+        if (!co || !co->data)
+            goto done;
+        options[n].option = co;
+        m_option_copy(co->opt, &options[n].old, co->data);
+        m_option_copy(co->opt, &options[n].target, co->data);
+        if (m_option_parse(mpctx->log, co->opt, bstr0(names[n]),
+                           bstr0(values[n]), &options[n].target) < 0)
+            goto done;
+    }
+
+    double pts = get_current_time(mpctx);
+    int64_t retained_video_wid = vo_get_video_frame_wid(vo);
+    uninit_video_out(mpctx);
+    set_gpu_output_options(config, options, MP_ARRAY_SIZE(options), false);
+    cmd->success = init_android_gpu_video_output(mpctx, track, &params,
+                                                 retained_video_wid);
+    if (!cmd->success) {
+        set_gpu_output_options(config, options, MP_ARRAY_SIZE(options), true);
+        if (!init_android_gpu_video_output(mpctx, track, &params,
+                                           retained_video_wid)) {
+            MP_ERR(mpctx, "Failed to restore the previous GPU video output.\n");
+            mpctx->error_playing = MPV_ERROR_VO_INIT_FAILED;
+            error_on_track(mpctx, track);
+            handle_force_window(mpctx, true);
+        }
+    }
+    if (mpctx->vo_chain && !mpctx->seek.type && pts != MP_NOPTS_VALUE) {
+        queue_seek(mpctx, MPSEEK_ABSOLUTE, pts, MPSEEK_EXACT, 0);
+        execute_queued_seek(mpctx);
+    }
+    mp_wakeup_core(mpctx);
+
+done:
+    for (int n = 0; n < MP_ARRAY_SIZE(options); n++) {
+        struct m_config_option *co = options[n].option;
+        if (co) {
+            m_option_free(co->opt, &options[n].target);
+            m_option_free(co->opt, &options[n].old);
+        }
+    }
+}
+
 static void cmd_android_surface_frame(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -8514,6 +8642,8 @@ const struct mp_cmd_def mp_cmds[] = {
           {"right", OPT_INT(v.i)}, {"bottom", OPT_INT(v.i)},
           {"subtitle-aspect", OPT_DOUBLE(v.d), OPTDEF_DOUBLE(0)} } },
     { "android-video-geometry-clear", cmd_android_video_geometry_clear },
+    { "android-set-gpu-output", cmd_android_set_gpu_output,
+        { {"gpu-next", OPT_BOOL(v.b)}, {"vulkan", OPT_BOOL(v.b)} } },
     { "android-surface-frame", cmd_android_surface_frame,
         { {"token", OPT_INT64(v.i64)}, {"width", OPT_INT(v.i)},
           {"height", OPT_INT(v.i)} } },
@@ -8810,7 +8940,7 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
         should_use_direct ||
         wants_android_direct_output(mpctx, video_track);
     bool direct_active =
-        is_android_dolby_vision_direct_output_active(mpctx);
+        is_android_direct_output_active(mpctx);
     bool video_surface_ready =
         opts->vo->WinID != 0 && opts->vo->WinID != -1;
     bool osd_surface_ready =
@@ -8856,13 +8986,21 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
 
     bool update_vo_in_place =
         update_window || update_android_osd;
+    bool update_direct_policy = update_dovi_output || hwdec_changed;
+    // A live direct VO can keep drawing without OSD, but its replacement
+    // needs the OSD Surface during preinit.
     bool reselect_direct_output =
-        (update_window || update_android_osd || update_dovi_output ||
-         hwdec_changed) &&
-        direct_active != should_use_direct;
+        (update_vo_in_place || update_direct_policy) &&
+        (!should_use_direct || osd_surface_ready) &&
+        android_video_output_changed(mpctx, video_track);
+    if (reselect_direct_output && update_direct_policy && !update_vo_in_place &&
+        !video_track && !mpctx->vo_chain && get_android_retained_video_wid(mpctx))
+    {
+        // Apply the routing policy when a track can select its output.
+        return false;
+    }
     bool direct_output_unchanged =
-        update_dovi_output &&
-        direct_active == should_use_direct;
+        update_dovi_output && !reselect_direct_output;
     bool rebuild_video_out =
         reselect_direct_output ||
         (!hwdec_changed &&
@@ -8890,6 +9028,10 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
         }
         struct mp_pin *filter_src =
             mpctx->vo_chain ? mpctx->vo_chain->filter_src : NULL;
+        int64_t retained_video_wid = 0;
+        if (update_dovi_output && !wait_for_surfaces &&
+            video_track && !filter_src)
+            retained_video_wid = vo_get_video_frame_wid(mpctx->video_out);
         uninit_video_out(mpctx);
         if (!wait_for_surfaces) {
             if (filter_src) {
@@ -8902,7 +9044,8 @@ static bool update_video_output(struct MPContext *mpctx, void *opt_ptr,
                 }
                 queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
             } else if (video_track) {
-                reinit_video_chain(mpctx);
+                reinit_video_chain_with_retained_frame(mpctx,
+                                                       retained_video_wid);
             } else {
                 handle_force_window(mpctx, true);
             }

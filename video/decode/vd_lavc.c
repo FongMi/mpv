@@ -661,8 +661,8 @@ static void select_and_set_hwdec(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
     const char *codec = ctx->codec->codec;
-    bool native_dovi_sink =
-        ctx->vo && (ctx->vo->driver->caps & VO_CAP_NATIVE_DOVI);
+    bool direct_mediacodec =
+        ctx->vo && (ctx->vo->driver->caps & VO_CAP_MEDIACODEC_DIRECT);
 
     update_hwdec_options(ctx);
 
@@ -708,8 +708,8 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                 if (already_attempted)
                     continue;
 
-                if (native_dovi_sink && hwdec->copying) {
-                    MP_VERBOSE(vd, "Native Dolby Vision output cannot use a "
+                if (direct_mediacodec && hwdec->copying) {
+                    MP_VERBOSE(vd, "Direct MediaCodec output cannot use a "
                                    "copying hardware decoder.\n");
                     continue;
                 }
@@ -798,10 +798,8 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     } else {
         // If software fallback is disabled and we get here, all hwdec must
         // have failed. Tell the ctx to always force an eof.
-        if (native_dovi_sink) {
-            MP_WARN(ctx, "Native Dolby Vision output requires hardware "
-                         "decoding; retrying with the configured video "
-                         "output.\n");
+        if (direct_mediacodec) {
+            MP_WARN(ctx, "Direct MediaCodec output requires hardware decoding.\n");
             ctx->force_eof = true;
         } else if (ctx->hwdec_opts->software_fallback == INT_MAX) {
             MP_WARN(ctx, "Software decoding fallback is disabled.\n");
@@ -1023,8 +1021,7 @@ static void init_avctx(struct mp_filter *vd)
         break;
     }
 
-    bool native_dovi_sink =
-        ctx->vo && (ctx->vo->driver->caps & VO_CAP_NATIVE_DOVI);
+    bool native_dovi_sink = ctx->vo && ctx->vo->extra.native_dovi_sink;
     bool gpu_dovi_mapping = supports_gpu_dovi_mapping(ctx);
     set_decoder_avopts(vd->log, avctx, lavc_param->avopts,
                        native_dovi_sink, gpu_dovi_mapping);

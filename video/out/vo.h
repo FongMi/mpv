@@ -246,8 +246,8 @@ enum {
     VO_CAP_VFLIP        = 1 << 6,
     // VO_CAP_NORETAIN backend can redraw overlays without a retained frame.
     VO_CAP_NORETAIN_REDRAW = 1 << 7,
-    // VO is a native Dolby Vision sink rather than a GPU-rendered output.
-    VO_CAP_NATIVE_DOVI  = 1 << 8,
+    // VO requires MediaCodec frames rendered directly to its Surface.
+    VO_CAP_MEDIACODEC_DIRECT = 1 << 8,
     // VO can apply Dolby Vision metadata to raw GPU-mapped decoder output.
     VO_CAP_GPU_DOVI     = 1 << 9,
 };
@@ -272,6 +272,8 @@ struct vo_extra {
     void (*wakeup_cb)(void *ctx);
     void *wakeup_ctx;
     bool prefer_hdr_output;
+    bool native_dovi_sink; // This output was selected for native Dolby Vision.
+    int64_t retained_video_wid; // Surface with a buffer from the previous VO
 };
 
 struct vo_frame {
@@ -621,6 +623,7 @@ bool vo_query_backend_error(struct vo *vo);
 bool vo_has_frame(struct vo *vo);
 bool vo_has_rendered_frame(struct vo *vo);
 bool vo_has_video_frame(struct vo *vo);
+int64_t vo_get_video_frame_wid(struct vo *vo);
 void vo_redraw(struct vo *vo);
 bool vo_want_redraw(struct vo *vo);
 // Wait for rendering and retire decoder outputs invalidated by a flush.
