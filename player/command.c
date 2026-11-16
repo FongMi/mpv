@@ -9180,6 +9180,9 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
 
     if (flags & UPDATE_AD && mpctx->ao_chain) {
         uninit_audio_chain(mpctx);
+        // An encoded-output policy change must negotiate a fresh AO format.
+        if (co && strcmp(co->name, "audio-spdif") == 0)
+            uninit_audio_out(mpctx);
         reinit_audio_chain(mpctx);
     }
 
