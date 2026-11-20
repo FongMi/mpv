@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <limits.h>
 #include <math.h>
+#include <ass/ass.h>
 
 #include "config.h"
 
@@ -348,6 +349,9 @@ const struct m_sub_options mp_subtitle_sub_opts = {
         {"image-subs-color", OPT_COLOR(image_subs_color)},
         {"sub-ass", OPT_BOOL(ass_enabled), .flags = UPDATE_SUB_HARD},
         {"sub-scale-signs", OPT_BOOL(sub_scale_signs)},
+#ifdef LIBASS_HAS_FONT_SIZE_EM
+        {"sub-font-size-em", OPT_FLOAT(sub_font_size_em), M_RANGE(0, 9000)},
+#endif
         {"sub-line-spacing", OPT_FLOAT(sub_line_spacing), M_RANGE(-1000, 1000)},
         {"sub-ass-line-spacing", OPT_REPLACED("sub-line-spacing")},
         {"sub-use-margins", OPT_BOOL(sub_use_margins)},

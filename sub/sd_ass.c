@@ -549,6 +549,7 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
     struct mp_subtitle_shared_opts *shared_opts = sd->shared_opts;
     struct sd_ass_priv *ctx = sd->priv;
     ASS_Renderer *priv = ctx->ass_renderer;
+    bool ttml = ctx->is_converted && strcmp(sd->codec->codec, "ttml") == 0;
 
     ass_set_frame_size(priv, dim->w, dim->h);
     ass_set_margins(priv, dim->mt, dim->mb, dim->ml, dim->mr);
@@ -616,20 +617,37 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
         set_force_flags |= ASS_OVERRIDE_BIT_JUSTIFY;
 #endif
     ass_set_selective_style_override_enabled(priv, set_force_flags);
+    struct osd_style_opts style_opts = *opts->sub_style;
+#ifdef LIBASS_HAS_FONT_SIZE_EM
+    bool use_em_size = opts->sub_font_size_em > 0 && (converted || ttml);
+    ass_track_set_feature(track, ASS_FEATURE_FONT_SIZE_EM, use_em_size);
+    if (use_em_size)
+        style_opts.font_size = opts->sub_font_size_em;
+#endif
     ASS_Style style = {0};
-    mp_ass_set_style(&style, MP_ASS_FONT_PLAYRESY, opts->sub_style);
+    mp_ass_set_style(&style, MP_ASS_FONT_PLAYRESY, &style_opts);
     ass_set_selective_style_override(priv, &style);
     free(style.FontName);
-    if (converted && track->default_style < track->n_styles) {
-        mp_ass_set_style(track->styles + track->default_style,
-                         track->PlayResY, opts->sub_style);
+    if ((converted || ttml) && track->default_style < track->n_styles) {
+        ASS_Style *default_style = track->styles + track->default_style;
+        mp_ass_set_style(default_style, track->PlayResY, &style_opts);
+        if (ttml && !converted) {
+            // The converter writes authored layout and text styling as event
+            // tags. Only the fallback style uses player defaults. Keep the
+            // script resolution used by the authored coordinates.
+            double scale = (track->PlayResX / (double)MP_ASS_FONT_PLAYRESX) /
+                           (track->PlayResY / (double)MP_ASS_FONT_PLAYRESY);
+            default_style->MarginL = lrint(default_style->MarginL * scale);
+            default_style->MarginR = lrint(default_style->MarginR * scale);
+        }
     }
     ass_set_font_scale(priv, set_font_scale);
     ass_set_hinting(priv, set_hinting);
     ass_set_line_spacing(priv, set_line_spacing);
 #if LIBASS_VERSION >= 0x01600010
-    if (converted) {
+    if (converted || ttml)
         ass_track_set_feature(track, ASS_FEATURE_WRAP_UNICODE, 1);
+    if (converted) {
         if (!opts->sub_vsfilter_bidi_compat) {
             for (int n = 0; n < track->n_styles; n++) {
                 track->styles[n].Encoding = -1;

@@ -3145,6 +3145,12 @@ Subtitles
 
     Default: 38
 
+``--sub-font-size-em=<size>``
+    Set the default font size for converted plain text subtitles and TTML in
+    em pixels at a window height of 720. Native ASS styles keep their original
+    font-size unit. This option requires libass with em sizing support. Set it
+    to 0 (the default) to use ``--sub-font-size`` instead.
+
 ``--sub-blur=<0..20.0>``
     Gaussian blur factor applied to the sub font border.
     0 means no blur applied (default).
