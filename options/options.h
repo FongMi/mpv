@@ -129,6 +129,7 @@ struct mp_subtitle_opts {
     bool sub_stretch_durations;
     bool sub_scale_by_window;
     bool sub_scale_with_window;
+    float sub_font_size_em;
     bool ass_scale_with_window;
     struct osd_style_opts *sub_style;
     bool sub_scale_signs;

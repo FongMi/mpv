@@ -77,6 +77,7 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+
 player_video_functions = custom_target('player-video-functions',
     input: files('../player/video.c', '../player/core.h'),
     output: 'player_video_functions.h',
