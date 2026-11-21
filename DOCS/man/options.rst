@@ -853,6 +853,12 @@ Program Behavior
 
     Note that the ``--no-config`` option takes precedence over this option.
 
+``--config-ignore-options=<option1,option2,...>``
+    Ignore the listed options in configuration files and profiles. The list
+    uses option names without the leading ``--``. Explicit command line and
+    client API settings still take effect. Set this option before loading
+    configuration files.
+
 ``--dump-stats=<filename>``
     Write certain statistics to the given file. The file is truncated on
     opening. The file will contain raw samples, each with a timestamp. To

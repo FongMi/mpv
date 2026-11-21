@@ -77,6 +77,10 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
 
 # The actual tests.
+config_ignore_options = executable('config-ignore-options', 'config_ignore_options.c',
+                                   include_directories: incdir, link_with: [img_utils, test_utils],
+                                   dependencies: test_utils_deps)
+test('config-ignore-options', config_ignore_options)
 
 player_video_functions = custom_target('player-video-functions',
     input: files('../player/video.c', '../player/core.h'),
