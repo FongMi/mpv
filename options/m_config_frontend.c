@@ -421,6 +421,15 @@ static int handle_set_opt_flags(struct m_config *config,
                co->name);
         return M_OPT_INVALID;
     }
+    if (flags & M_SETOPT_FROM_CONFIG_FILE) {
+        struct m_config_option *ignore =
+            m_config_get_co_raw(config, bstr0("config-ignore-options"));
+        char **names = ignore && ignore->data ? *(char ***)ignore->data : NULL;
+        for (; names && *names; names++) {
+            if (strcmp(*names, co->name) == 0)
+                return 0;
+        }
+    }
     if ((flags & M_SETOPT_BACKUP) && set)
         ensure_backup(&config->backup_opts, BACKUP_LOCAL, co);
 
@@ -987,7 +996,7 @@ int m_config_set_profile_option(struct m_config *config, struct m_profile *p,
     int i = m_config_set_option_cli(config, name, val,
                                     M_SETOPT_CHECK_ONLY |
                                     M_SETOPT_FROM_CONFIG_FILE);
-    if (i < 0)
+    if (i <= 0)
         return i;
     p->opts = talloc_realloc(p, p->opts, char *, 2 * (p->num_opts + 2));
     p->opts[p->num_opts * 2] = bstrto0(p, name);
