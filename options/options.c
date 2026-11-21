@@ -1163,6 +1163,7 @@ static const struct MPOpts mp_default_opts = {
 
     .sub_auto_exts = (char *[]){
         "ass",
+        "dfxp",
         "idx",
         "lrc",
         "mks",
@@ -1176,6 +1177,7 @@ static const struct MPOpts mp_default_opts = {
         "ssa",
         "sub",
         "sup",
+        "ttml",
         "utf",
         "utf-8",
         "utf8",
