@@ -17,9 +17,11 @@
 
 #include <stdlib.h>
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <errno.h>
 
 #include <libavutil/common.h>
 #include <ass/ass.h>
@@ -48,6 +50,11 @@ struct sd_ass_priv {
     struct ass_track *ass_track;
     struct ass_track *shadow_track; // for --sub-ass=no rendering
     bool ass_configured;
+    struct {
+        char *path;
+        char *family;
+        int index;
+    } font_file;
     bool color_mangle_changed;
     bool transform_layout;
     bool layout_change_pending;
@@ -120,6 +127,45 @@ static const struct sd_filter_functions *const filters[] = {
     NULL,
 };
 
+static struct osd_style_opts subtitle_style(struct sd *sd)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    struct osd_style_opts style = *sd->opts->sub_style;
+    if (ctx->font_file.family)
+        style.font = ctx->font_file.family;
+    return style;
+}
+
+#ifdef LIBASS_HAS_FONT_FILE
+static void configure_font_file(struct sd *sd)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    char **args = sd->opts->sub_font_file;
+    if (!args || !args[0] || !args[0][0])
+        return;
+
+    long index = 0;
+    const char *family = sd->opts->sub_style->font;
+    if (args[1]) {
+        char *end;
+        errno = 0;
+        index = strtol(args[1], &end, 10);
+        if (errno || end == args[1] || *end || index < 0 || index > UINT16_MAX ||
+            (args[2] && (args[3] || !args[2][0])))
+        {
+            MP_WARN(sd, "Invalid sub-font-file face index or family.\n");
+            return;
+        }
+        if (args[2])
+            family = args[2];
+    }
+
+    ctx->font_file.path = mp_get_user_path(ctx, sd->global, args[0]);
+    ctx->font_file.family = talloc_strdup(ctx, family);
+    ctx->font_file.index = index;
+}
+#endif
+
 // Add default styles, if the track does not have any styles yet.
 // Apply style overrides if the user provides any.
 static void mp_ass_add_default_styles(struct sd *sd, ASS_Track *track, struct mp_subtitle_opts *opts,
@@ -141,7 +187,8 @@ static void mp_ass_add_default_styles(struct sd *sd, ASS_Track *track, struct mp
         track->default_style = sid;
         ASS_Style *style = track->styles + sid;
         style->Name = strdup("Default");
-        mp_ass_set_style(style, track->PlayResY, opts->sub_style);
+        struct osd_style_opts renderer_style = subtitle_style(sd);
+        mp_ass_set_style(style, track->PlayResY, &renderer_style);
     }
 
     if (shared_opts->ass_style_override[sd->order])
@@ -248,8 +295,15 @@ static void enable_output(struct sd *sd, bool enable)
     } else {
         ctx->ass_renderer = ass_renderer_init(ctx->ass_library);
 
-        mp_ass_configure_fonts(ctx->ass_renderer, sd->opts->sub_style,
-                               sd->global, sd->log);
+        struct osd_style_opts style = subtitle_style(sd);
+        mp_ass_configure_fonts(ctx->ass_renderer, &style, sd->global, sd->log);
+#ifdef LIBASS_HAS_FONT_FILE
+        if (ctx->font_file.path &&
+            !ass_set_font_file(ctx->ass_renderer, ctx->font_file.path,
+                               ctx->font_file.index, style.font))
+            MP_WARN(sd, "Could not load subtitle font file '%s' at index %d.\n",
+                    ctx->font_file.path, ctx->font_file.index);
+#endif
     }
 }
 
@@ -263,6 +317,9 @@ static void assobjects_init(struct sd *sd)
     ass_set_extract_fonts(ctx->ass_library, opts->use_embedded_fonts);
 
     add_subtitle_fonts(sd);
+#ifdef LIBASS_HAS_FONT_FILE
+    configure_font_file(sd);
+#endif
 
     if (shared_opts->ass_style_override[sd->order])
         ass_set_style_overrides(ctx->ass_library, opts->ass_style_override_list);
@@ -305,6 +362,8 @@ static void assobjects_destroy(struct sd *sd)
     ass_free_track(ctx->ass_track);
     ass_free_track(ctx->shadow_track);
     enable_output(sd, false);
+    TA_FREEP(&ctx->font_file.path);
+    TA_FREEP(&ctx->font_file.family);
     ass_library_done(ctx->ass_library);
 }
 
@@ -616,8 +675,10 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
     if ((converted || shared_opts->ass_style_override[sd->order]) && opts->ass_justify)
         set_force_flags |= ASS_OVERRIDE_BIT_JUSTIFY;
 #endif
+    if (ctx->font_file.family && shared_opts->ass_style_override[sd->order])
+        set_force_flags |= ASS_OVERRIDE_BIT_FONT_NAME;
     ass_set_selective_style_override_enabled(priv, set_force_flags);
-    struct osd_style_opts style_opts = *opts->sub_style;
+    struct osd_style_opts style_opts = subtitle_style(sd);
 #ifdef LIBASS_HAS_FONT_SIZE_EM
     bool use_em_size = opts->sub_font_size_em > 0 && (converted || ttml);
     ass_track_set_feature(track, ASS_FEATURE_FONT_SIZE_EM, use_em_size);

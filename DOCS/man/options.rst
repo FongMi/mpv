@@ -3143,6 +3143,12 @@ Subtitles
         options) are ignored when ASS-subtitles are rendered, unless
         ``--sub-ass=no`` is specified.
 
+``--sub-font-file=<path>[,<index>[,<family>]]``
+    Prefer the specified font file for the default subtitle style and font
+    overrides. The face index defaults to 0 and the family defaults to
+    ``--sub-font``. Other families and missing glyphs use the usual font
+    providers. Requires libass with single-file font selection support.
+
 ``--sub-font-size=<size>``
     Specify the sub font size. The unit is the size in scaled pixels at a
     window height of 720. The actual pixel size is scaled with the window
