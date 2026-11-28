@@ -1773,6 +1773,49 @@ MPV_EXPORT void mpv_wakeup(mpv_handle *ctx);
 MPV_EXPORT void mpv_set_wakeup_callback(mpv_handle *ctx, void (*cb)(void *d), void *d);
 
 /**
+ * Decoded audio copied by an opt-in observer of the active audio output.
+ * The sample pointers are only valid until the callback returns. For planar
+ * audio, there is one plane per channel. Packed audio uses one plane.
+ * Timestamps are in microseconds on the same timeline as time-pos.
+ */
+typedef enum mpv_audio_pcm_format {
+    MPV_AUDIO_PCM_U8 = 1,
+    MPV_AUDIO_PCM_S16,
+    MPV_AUDIO_PCM_S32,
+    MPV_AUDIO_PCM_S64,
+    MPV_AUDIO_PCM_F32,
+    MPV_AUDIO_PCM_F64,
+} mpv_audio_pcm_format;
+
+typedef struct mpv_audio_pcm_frame {
+    const uint8_t *const *planes;
+    int plane_count;
+    int sample_count;
+    int channel_count;
+    int sample_rate;
+    mpv_audio_pcm_format format;
+    int64_t start_us;
+    int64_t end_us;
+} mpv_audio_pcm_frame;
+
+typedef void (*mpv_audio_pcm_callback)(void *context,
+                                       const mpv_audio_pcm_frame *frame);
+
+/**
+ * Register the sole decoded audio observer for this player. A NULL frame
+ * signals a flush, track change, or output reset. At natural EOF no reset is
+ * sent during teardown, so the client can drain its own queue after END_FILE.
+ * The callback runs on the player thread and must not block or call libmpv.
+ * Passing NULL unregisters the caller's observer and waits for any outstanding
+ * callback to return.
+ * Destroying the owning client unregisters it automatically. Encoded audio
+ * passthrough and reverse playback do not produce decoded audio.
+ */
+MPV_EXPORT int mpv_set_audio_pcm_callback(mpv_handle *ctx,
+                                         mpv_audio_pcm_callback callback,
+                                         void *context);
+
+/**
  * Block until all asynchronous requests are done. This affects functions like
  * mpv_command_async(), which return immediately and return their result as
  * events.

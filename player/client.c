@@ -140,6 +140,7 @@ struct mpv_handle {
     size_t async_counter;   // pending other async events
     bool choked;            // recovering from queue overflow
     bool destroying;        // pending destruction; no API accesses allowed
+    bool audio_pcm_registered;
     bool hook_pending;      // hook events are returned after draining properties
 
     struct observe_property **properties;
@@ -394,6 +395,24 @@ static void unlock_core(mpv_handle *ctx)
     mp_dispatch_unlock(ctx->mpctx->dispatch);
 }
 
+int mpv_set_audio_pcm_callback(mpv_handle *ctx,
+                               mpv_audio_pcm_callback callback, void *context)
+{
+    lock_core(ctx);
+    struct MPContext *mpctx = ctx->mpctx;
+    int result = 0;
+    if (mpctx->audio_pcm_observer && mpctx->audio_pcm_observer != ctx) {
+        result = MPV_ERROR_INVALID_PARAMETER;
+    } else {
+        mpctx->audio_pcm_observer = callback ? ctx : NULL;
+        mpctx->audio_pcm_callback = callback;
+        ctx->audio_pcm_registered = callback != NULL;
+        mpctx->audio_pcm_context = callback ? context : NULL;
+    }
+    unlock_core(ctx);
+    return result;
+}
+
 void mpv_wait_async_requests(mpv_handle *ctx)
 {
     mp_mutex_lock(&ctx->lock);
@@ -435,6 +454,9 @@ static void mp_destroy_client(mpv_handle *ctx, bool terminate)
     struct mp_client_api *clients = ctx->clients;
 
     MP_DBG(ctx, "Destroying client handle...\n");
+
+    if (ctx->audio_pcm_registered)
+        mpv_set_audio_pcm_callback(ctx, NULL, NULL);
 
     if (terminate)
         mpv_command(ctx, (const char*[]){"quit", NULL});

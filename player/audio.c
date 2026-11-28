@@ -227,8 +227,15 @@ static void ao_chain_reset_state(struct ao_chain *ao_c)
     ao_c->delaying_audio_start = false;
 }
 
+static void reset_audio_pcm_observer(struct MPContext *mpctx)
+{
+    if (mpctx->audio_pcm_callback)
+        mpctx->audio_pcm_callback(mpctx->audio_pcm_context, NULL);
+}
+
 void reset_audio_state(struct MPContext *mpctx)
 {
+    reset_audio_pcm_observer(mpctx);
     if (mpctx->ao_chain) {
         ao_chain_reset_state(mpctx->ao_chain);
         struct track *t = mpctx->ao_chain->track;
@@ -241,6 +248,8 @@ void reset_audio_state(struct MPContext *mpctx)
 
 void uninit_audio_out(struct MPContext *mpctx)
 {
+    if (mpctx->stop_play != AT_END_OF_FILE)
+        reset_audio_pcm_observer(mpctx);
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (ao_c) {
         ao_c->ao_queue = NULL;
@@ -288,6 +297,8 @@ static void ao_chain_uninit(struct ao_chain *ao_c)
 void uninit_audio_chain(struct MPContext *mpctx)
 {
     if (mpctx->ao_chain) {
+        if (mpctx->stop_play != AT_END_OF_FILE)
+            reset_audio_pcm_observer(mpctx);
         ao_chain_uninit(mpctx->ao_chain);
         mpctx->ao_chain = NULL;
 
@@ -697,6 +708,49 @@ static void update_throttle(struct MPContext *mpctx)
     }
 }
 
+static mpv_audio_pcm_format audio_pcm_format(int format)
+{
+    switch (af_fmt_from_planar(format)) {
+    case AF_FORMAT_U8: return MPV_AUDIO_PCM_U8;
+    case AF_FORMAT_S16: return MPV_AUDIO_PCM_S16;
+    case AF_FORMAT_S32: return MPV_AUDIO_PCM_S32;
+    case AF_FORMAT_S64: return MPV_AUDIO_PCM_S64;
+    case AF_FORMAT_FLOAT: return MPV_AUDIO_PCM_F32;
+    case AF_FORMAT_DOUBLE: return MPV_AUDIO_PCM_F64;
+    default: return 0;
+    }
+}
+
+static void notify_audio_pcm(struct MPContext *mpctx, struct mp_aframe *frame,
+                             int af_format)
+{
+    if (!mpctx->audio_pcm_callback || mpctx->play_dir < 0)
+        return;
+
+    mpv_audio_pcm_format format = audio_pcm_format(af_format);
+    if (!format)
+        return;
+
+    double start = mp_aframe_get_pts(frame);
+    double end = mp_aframe_end_pts(frame);
+    if (start == MP_NOPTS_VALUE || end == MP_NOPTS_VALUE ||
+        !isfinite(start) || !isfinite(end) || end <= start)
+        return;
+
+    mpv_audio_pcm_frame pcm = {
+        .planes = (const uint8_t *const *)mp_aframe_get_data_ro(frame),
+        .plane_count = mp_aframe_get_planes(frame),
+        .sample_count = mp_aframe_get_size(frame),
+        .channel_count = mp_aframe_get_channels(frame),
+        .sample_rate = mp_aframe_get_rate(frame),
+        .format = format,
+        .start_us = llrint(start * 1000000),
+        .end_us = llrint(end * 1000000),
+    };
+    if (pcm.planes && pcm.plane_count > 0)
+        mpctx->audio_pcm_callback(mpctx->audio_pcm_context, &pcm);
+}
+
 static void ao_process(struct mp_filter *f)
 {
     struct ao_chain *ao_c = f->priv;
@@ -799,9 +853,12 @@ static void ao_process(struct mp_filter *f)
             MP_VERBOSE(mpctx, "previous audio still playing; continuing\n");
         }
 
-        if (!af_fmt_is_pcm(mp_aframe_get_format(af)) &&
-            ao_c->track && ao_c->track->dec)
+        int format = mp_aframe_get_format(af);
+        if (af_fmt_is_pcm(format)) {
+            notify_audio_pcm(mpctx, af, format);
+        } else if (ao_c->track && ao_c->track->dec) {
             mp_decoder_wrapper_accept_passthrough(ao_c->track->dec, af);
+        }
         mp_pin_in_write(ao_c->queue_filter->pins[0], frame);
     } else if (frame.type == MP_FRAME_EOF) {
         MP_VERBOSE(mpctx, "audio filter EOF\n");

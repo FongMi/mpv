@@ -21,6 +21,8 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 
+#include <mpv/client.h>
+
 #include "audio/aframe.h"
 #include "clipboard/clipboard.h"
 #include "common/common.h"
@@ -340,6 +342,9 @@ typedef struct MPContext {
     struct ao *ao;
     struct mp_aframe *ao_filter_fmt; // for weak gapless audio check
     struct ao_chain *ao_chain;
+    mpv_handle *audio_pcm_observer;
+    mpv_audio_pcm_callback audio_pcm_callback;
+    void *audio_pcm_context;
 
     struct vo_chain *vo_chain;
 
